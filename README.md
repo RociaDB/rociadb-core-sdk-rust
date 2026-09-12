@@ -906,11 +906,13 @@ cover the same 23 RPCs against the same server, and are maintained to the
 same standard: **every capability available in one is available in the
 other.**
 
-> **Temporarily out of parity.** `GetEdge` is new in the upstream
-> `.proto`. It is wrapped here as `get_edge`/`get_edge_as`; the TypeScript
-> SDK does not expose it yet. This is a gap to close in
-> [`rociadb-core-sdk-ts`](https://github.com/RociaDB/rociadb-core-sdk-ts),
-> not a deliberate difference — remove this note once it ships there.
+> **Parity unverified for `GetEdge`.** It is new in the upstream `.proto`
+> and is wrapped here as `get_edge`/`get_edge_as`. Whether
+> [`rociadb-core-sdk-ts`](https://github.com/RociaDB/rociadb-core-sdk-ts)
+> already carries it has **not** been checked from this repository — treat
+> the parity claim above as unconfirmed for this one RPC. Per `AGENTS.md`
+> the `.proto` change has to be mirrored there as well; confirm both, then
+> remove this note.
 
 Neither imitates the other's syntax — this crate stays
 snake_case/`Result`-idiomatic Rust, the TypeScript package stays
