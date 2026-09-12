@@ -109,13 +109,14 @@ use crate::pb::upstream::v1::graph_service_client::GraphServiceClient;
 use crate::pb::upstream::v1::tenant_service_client::TenantServiceClient;
 use crate::pb::upstream::v1::{
     AddEdgeRequest, FindByFieldRequest, GetDocRequest, GetNodeRequest, ListCollectionsRequest,
-    ListDocRequest, PageRequest, PutDocRequest, PutNodeRequest, QueryDocRequest, QueryFilter,
-    QueryOperator, QuerySort, SortDirection,
+    ListDocRequest, PageRequest, PageResponse, PutDocRequest, PutNodeRequest, QueryDocRequest,
+    QueryFilter, QueryOperator, QuerySort, SortDirection,
 };
 use auth::{BearerInterceptor, TokenManager, TokenRefreshGuard};
 use futures::{TryStreamExt, stream};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
@@ -141,6 +142,16 @@ enum BuilderAuthConfig {
     Enabled {
         token_url: Option<String>,
         client_id: Option<String>,
+        /// Never printed by this crate's own instrumentation (see
+        /// `BuilderAuthConfig`'s manual `Debug` impl below), but it is
+        /// still held as a plain `String` for as long as this builder (or
+        /// the `TokenManagerInner` it is handed to at `build()`) is alive,
+        /// so a core dump, an attached debugger, or plaintext left behind
+        /// in swapped-out memory could still recover it. Closing that gap
+        /// would need a `zeroize`- or `secrecy`-backed secret type, which
+        /// is a dependency call for this crate's maintainer to make on a
+        /// published 1.0 crate rather than something to add unilaterally
+        /// here.
         client_secret: Option<String>,
     },
     Disabled,
@@ -271,6 +282,41 @@ pub(crate) fn non_empty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Decode one page of raw per-item JSON payloads into `T`, and map the
+/// page's cursor with [`non_empty`]. Shared by
+/// [`RociaDbClient::list_documents`], [`RociaDbClient::search_documents`]
+/// and [`RociaDbClient::query_documents`] — the three RPCs whose response
+/// shape is "a list of JSON blobs plus an optional `PageResponse`" — so
+/// the extraction rule is defined, and unit-tested, in exactly one place
+/// against a synthetic response instead of being copy-pasted three times
+/// and only ever exercised through a live gRPC call.
+///
+/// Decoding still stops at the first bad item: `collect` short-circuits, so
+/// a caller never receives a partial page alongside an error. What changes
+/// is the diagnostic — the returned `serde_json::Error`'s message is
+/// rewritten to lead with `"item <index>: "`, naming the zero-based
+/// position of the offending item within the page, because a page can hold
+/// dozens of items and "one of them failed to parse" leaves the caller
+/// nothing to act on.
+fn decode_document_page<T>(
+    json: Vec<Vec<u8>>,
+    page: Option<PageResponse>,
+) -> std::result::Result<(Vec<T>, Option<String>), serde_json::Error>
+where
+    T: DeserializeOwned,
+{
+    let items = json
+        .into_iter()
+        .enumerate()
+        .map(|(index, data)| {
+            serde_json::from_slice::<T>(&data).map_err(|error| {
+                <serde_json::Error as serde::de::Error>::custom(format!("item {index}: {error}"))
+            })
+        })
+        .collect::<std::result::Result<Vec<T>, serde_json::Error>>()?;
+    Ok((items, page.and_then(|page| non_empty(page.next_cursor))))
+}
+
 /// Validate that `node_label` and `node_graph` are either both set or both
 /// absent, before any network call. Pulled out of
 /// [`RociaDbClient::create_document`] as a pure function so the rule is
@@ -285,9 +331,69 @@ fn validate_node_binding(node_label: &Option<String>, node_graph: &Option<String
     Ok(())
 }
 
+/// A document's graph node binding, the named-field alternative to the
+/// `node_label`/`node_graph` parameter pair on
+/// [`RociaDbClient::create_document`] and
+/// [`RociaDbClient::create_document_with_request_id`].
+///
+/// Those two parameters are adjacent, identically-typed (`Option<String>`)
+/// positional arguments in a six- and seven-argument call respectively, and
+/// the internal validation this SDK runs on them only checks that both are
+/// present or both are absent — never that they weren't swapped. A
+/// transposed call therefore compiles, passes that check, and silently
+/// writes the graph node under the wrong `node_id`/`graph` pairing, with no
+/// error anywhere. Passing a single `Option<NodeBinding>` to
+/// [`RociaDbClient::create_document_with_node_binding`] or
+/// [`RociaDbClient::create_document_with_node_binding_and_request_id`]
+/// instead closes that gap two ways: `label` and `graph` are no longer two
+/// of several same-typed arguments sitting next to each other in a long
+/// call, and "label without graph" or "graph without label" stops being
+/// representable at all — there is exactly one `Option` to be `Some` or
+/// `None`, not two that must be kept in sync by hand.
+///
+/// [`NodeBinding::new`] still takes `label` then `graph` positionally, the
+/// same shape [`NodeInput::new`] and [`EdgeInput::new`] already use for
+/// their own constructors, so this does not make a `label`/`graph`
+/// transposition impossible — it narrows where one can happen down to this
+/// one dedicated two-argument call, out from among the other four
+/// arguments `create_document` takes alongside it.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeBinding {
+    pub label: String,
+    pub graph: String,
+}
+
+impl NodeBinding {
+    /// Bind to `label` within `graph`. See [`NodeBinding`] for why passing
+    /// this instead of the equivalent `node_label`/`node_graph` pair guards
+    /// against a transposed call.
+    pub fn new(label: impl Into<String>, graph: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            graph: graph.into(),
+        }
+    }
+}
+
+/// Decompose a [`NodeBinding`] option into the `(node_label, node_graph)`
+/// pair [`RociaDbClient::create_document_with_request_id`] expects. Pulled
+/// out as a pure function, the same way [`validate_node_binding`] is pulled
+/// out of [`RociaDbClient::create_document`], so this mapping is
+/// unit-testable without a live client: `label` and `graph` are the same
+/// two `String`s [`validate_node_binding`] guards, just carried as one
+/// value instead of two, and a future edit that swapped which field feeds
+/// which side of the pair would still compile clean.
+fn node_binding_to_pair(node_binding: Option<NodeBinding>) -> (Option<String>, Option<String>) {
+    match node_binding {
+        Some(NodeBinding { label, graph }) => (Some(label), Some(graph)),
+        None => (None, None),
+    }
+}
+
 /// Supported document query operators exposed by the SDK.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentQueryOperator {
     Eq,
     In,
@@ -306,7 +412,7 @@ impl DocumentQueryOperator {
 
 /// Supported document sort directions exposed by the SDK.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentQuerySortDirection {
     Asc,
     Desc,
@@ -323,7 +429,7 @@ impl DocumentQuerySortDirection {
 
 /// Filter definition for `QueryDoc`.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DocumentQueryFilter {
     pub field: String,
     pub operator: DocumentQueryOperator,
@@ -349,7 +455,7 @@ impl DocumentQueryFilter {
 
 /// Sort definition for `QueryDoc`.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DocumentQuerySort {
     pub field: String,
     pub direction: DocumentQuerySortDirection,
@@ -407,7 +513,8 @@ impl NodeInput {
     }
 }
 
-/// One edge to upsert, used by [`RociaDbClient::add_edges`].
+/// One edge to upsert, used by [`RociaDbClient::add_edges`] and
+/// [`RociaDbClient::add_edge_with_input`].
 ///
 /// `edge_id` is raw and must not be prefixed with `label`.
 #[non_exhaustive]
@@ -524,6 +631,26 @@ fn build_add_edge_requests(
         .collect()
 }
 
+/// Split an ordered batch into groups sharing the same `key`, preserving
+/// each group's internal order (the order `items` were given in). Used by
+/// [`RociaDbClient::put_nodes`] and [`RociaDbClient::add_edges`] to let
+/// items with different keys (`node_id`/`edge_id`) fan out fully
+/// concurrently while items sharing a key are dispatched strictly one after
+/// another — see those methods' doc comments for why that matters for a
+/// batch carrying a duplicate id. Which group runs before which is
+/// unconstrained (a `HashMap` is used, so that order is arbitrary): only
+/// the order *within* a group is a guarantee, because only that order is
+/// one the caller can actually observe (items with different ids are
+/// applied to unrelated server-side state, so nothing distinguishes one
+/// interleaving of them from another).
+fn group_preserving_order<T>(items: Vec<T>, key: impl Fn(&T) -> &str) -> Vec<Vec<T>> {
+    let mut groups: HashMap<String, Vec<T>> = HashMap::new();
+    for item in items {
+        groups.entry(key(&item).to_string()).or_default().push(item);
+    }
+    groups.into_values().collect()
+}
+
 /// Default idempotency key for the `PutDoc` write issued by
 /// [`RociaDbClient::create_document`] when the caller does not use
 /// [`RociaDbClient::create_document_with_request_id`] directly. Pulled out
@@ -536,21 +663,39 @@ fn default_document_request_id(collection_name: &str) -> String {
     format!("put_document:{}:{}", collection_name, Uuid::new_v4())
 }
 
-/// Reject a `host` URL whose path is neither empty nor `"/"`, before any
-/// connection attempt: a mistyped host carrying a leftover path (for
-/// example `http://127.0.0.1:50051/v1` pasted from somewhere else) would
-/// otherwise be silently accepted by tonic, which simply ignores the path
-/// component when dialing.
+/// Reject a `host` URL that carries anything beyond a hostname and port,
+/// before any connection attempt: a mistyped host with a leftover path (for
+/// example `http://127.0.0.1:50051/v1` pasted from somewhere else), a query
+/// string (`http://127.0.0.1:50051?debug=1`), or a fragment
+/// (`http://127.0.0.1:50051#note`) would otherwise be silently accepted by
+/// tonic, which only reads the authority when dialing and drops everything
+/// else on the floor with no error — including a query string a caller
+/// might expect to reach the server.
 ///
 /// `http::Uri::path()` already returns `"/"` for a URI with no explicit
-/// path component (verified against `http` 1.x), so this rejects strictly
-/// more than "path is exactly absent".
+/// path component (verified against `http` 1.x), so the path check rejects
+/// strictly more than "path is exactly absent". The fragment check runs
+/// against the raw string before any parsing happens: `http::Uri` itself
+/// scans off and silently discards a fragment while building the `Uri`
+/// value (see its `PathAndQuery` parser), so by the time a `Uri` exists
+/// there is no `fragment()` accessor left to consult here — the fragment
+/// has already vanished.
 fn validate_host_path(host: &str) -> Result<()> {
+    if host.contains('#') {
+        return Err(RociaDbError::connection(format!(
+            "RociaDB host must contain only a hostname and port, got a fragment in {host:?}"
+        )));
+    }
     let uri: http::Uri = host.parse().connection_context("invalid upstream host")?;
     let path = uri.path();
     if !path.is_empty() && path != "/" {
         return Err(RociaDbError::connection(format!(
             "RociaDB host must contain only a hostname and port, got path {path:?}"
+        )));
+    }
+    if let Some(query) = uri.query() {
+        return Err(RociaDbError::connection(format!(
+            "RociaDB host must contain only a hostname and port, got query {query:?}"
         )));
     }
     Ok(())
@@ -775,6 +920,14 @@ impl RociaDbClient {
     /// `node_label` and `node_graph` must be provided together: if only one
     /// of them is set, this returns an error before any network call.
     ///
+    /// `node_label` and `node_graph` are adjacent, same-typed parameters, so
+    /// a call that transposes them compiles and passes that check while
+    /// writing the graph node under the wrong `node_id`/`graph` pairing —
+    /// see [`NodeBinding`] for the full risk. When that matters more than
+    /// the extra type, prefer
+    /// [`RociaDbClient::create_document_with_node_binding`], which takes the
+    /// pair as one [`NodeBinding`] value instead.
+    ///
     /// This call is **not atomic**: the document is written first, and the
     /// graph node binding (when requested) is written second. If the node
     /// write fails, the document is left in place without its node
@@ -816,6 +969,12 @@ impl RociaDbClient {
     /// [`RociaDbClient::put_node_with_request_id`], and
     /// [`RociaDbClient::add_edge_with_request_id`] — rather than requiring
     /// the caller to pre-serialize into `serde_json::Value` first.
+    ///
+    /// `node_label` and `node_graph` carry the same transposition risk here
+    /// as on [`RociaDbClient::create_document`] — see [`NodeBinding`].
+    /// Prefer
+    /// [`RociaDbClient::create_document_with_node_binding_and_request_id`]
+    /// when that risk matters more than the extra type.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_document_with_request_id<T: Serialize + ?Sized>(
         &self,
@@ -933,6 +1092,58 @@ impl RociaDbClient {
         Ok(())
     }
 
+    /// Same as [`RociaDbClient::create_document`], but takes the node
+    /// binding as a single [`NodeBinding`] instead of the adjacent
+    /// `node_label`/`node_graph` parameters — see [`NodeBinding`] for why
+    /// that removes the risk of a transposed call silently writing the
+    /// graph node under the wrong pairing.
+    pub async fn create_document_with_node_binding(
+        &self,
+        tenant_id: &str,
+        collection_name: &str,
+        document_id: &str,
+        value: Value,
+        node_binding: Option<NodeBinding>,
+    ) -> Result<()> {
+        let request_id = default_document_request_id(collection_name);
+        self.create_document_with_node_binding_and_request_id(
+            tenant_id,
+            collection_name,
+            document_id,
+            &value,
+            node_binding,
+            request_id,
+        )
+        .await
+    }
+
+    /// Same as [`RociaDbClient::create_document_with_request_id`], but takes
+    /// the node binding as a single [`NodeBinding`] instead of the adjacent
+    /// `node_label`/`node_graph` parameters — see [`NodeBinding`] for why
+    /// that removes the risk of a transposed call silently writing the
+    /// graph node under the wrong pairing.
+    pub async fn create_document_with_node_binding_and_request_id<T: Serialize + ?Sized>(
+        &self,
+        tenant_id: &str,
+        collection_name: &str,
+        document_id: &str,
+        value: &T,
+        node_binding: Option<NodeBinding>,
+        request_id: impl Into<String>,
+    ) -> Result<()> {
+        let (node_label, node_graph) = node_binding_to_pair(node_binding);
+        self.create_document_with_request_id(
+            tenant_id,
+            collection_name,
+            document_id,
+            value,
+            node_label,
+            node_graph,
+            request_id,
+        )
+        .await
+    }
+
     /// Find documents whose `search_field` equals `value` (`FindByField`).
     ///
     /// `total_count` on the returned [`DocumentPage`] is a count over the
@@ -944,7 +1155,7 @@ impl RociaDbClient {
         tenant_id: &str,
         collection_name: &str,
         search_field: &str,
-        value: &impl Serialize,
+        value: &(impl Serialize + ?Sized),
         limit: Option<u32>,
         cursor: Option<&str>,
     ) -> Result<DocumentPage<T>>
@@ -995,11 +1206,7 @@ impl RociaDbClient {
             .status_context("failed to search documents")?
             .into_inner();
 
-        let resp = result
-            .json
-            .into_iter()
-            .map(|data| serde_json::from_slice::<T>(&data))
-            .collect::<std::result::Result<Vec<T>, serde_json::Error>>()
+        let (resp, next_cursor) = decode_document_page::<T>(result.json, result.page)
             .inspect_err(|error| {
                 error!(
                     tenant_id = tenant_id,
@@ -1011,9 +1218,6 @@ impl RociaDbClient {
             })
             .decode_context("search results")?;
 
-        let next_cursor = result
-            .page
-            .and_then(|page| (!page.next_cursor.is_empty()).then_some(page.next_cursor));
         debug!(
             tenant_id = tenant_id,
             collection = collection_name,
@@ -1077,11 +1281,7 @@ impl RociaDbClient {
             .status_context("failed to list documents")?
             .into_inner();
 
-        let resp = result
-            .json
-            .into_iter()
-            .map(|data| serde_json::from_slice::<T>(&data))
-            .collect::<std::result::Result<Vec<T>, serde_json::Error>>()
+        let (resp, next_cursor) = decode_document_page::<T>(result.json, result.page)
             .inspect_err(|error| {
                 error!(
                     tenant_id = tenant_id,
@@ -1092,9 +1292,6 @@ impl RociaDbClient {
             })
             .decode_context("listed documents")?;
 
-        let next_cursor = result
-            .page
-            .and_then(|page| (!page.next_cursor.is_empty()).then_some(page.next_cursor));
         debug!(
             tenant_id = tenant_id,
             collection = collection_name,
@@ -1239,11 +1436,7 @@ impl RociaDbClient {
             .status_context("failed to query documents")?
             .into_inner();
 
-        let resp = result
-            .json
-            .into_iter()
-            .map(|data| serde_json::from_slice::<T>(&data))
-            .collect::<std::result::Result<Vec<T>, serde_json::Error>>()
+        let (resp, next_cursor) = decode_document_page::<T>(result.json, result.page)
             .inspect_err(|error| {
                 error!(
                     tenant_id = tenant_id,
@@ -1254,9 +1447,6 @@ impl RociaDbClient {
             })
             .decode_context("queried documents")?;
 
-        let next_cursor = result
-            .page
-            .and_then(|page| (!page.next_cursor.is_empty()).then_some(page.next_cursor));
         debug!(
             tenant_id = tenant_id,
             collection = collection_name,
@@ -1340,7 +1530,15 @@ impl RociaDbClient {
     /// Upsert a batch of nodes in a graph with bounded concurrency (at most
     /// 10 `PutNode` calls in flight at once). `nodes` is consumed in the
     /// order the caller provides — duplicate `node_id`s are **not** merged,
-    /// both are sent, in order.
+    /// both are sent. Items with different `node_id`s run fully
+    /// concurrently against each other (up to the 10-in-flight bound), but
+    /// items sharing a `node_id` are dispatched strictly one after another,
+    /// in the order given: the next `PutNode` call for that id is not sent
+    /// until the previous one's response comes back. That makes
+    /// last-item-wins genuinely true for a duplicate id — the caller's last
+    /// write really is the last one the server applies — rather than a race
+    /// between two in-flight calls whose completion order the network, not
+    /// the caller, decides.
     ///
     /// **This batch is not atomic and stops at the first error**: on
     /// failure, in-flight requests are cancelled and the error does not say
@@ -1364,25 +1562,27 @@ impl RociaDbClient {
             "upserting graph nodes batch"
         );
         let requests = build_put_node_requests(tenant_id, graph_name, nodes)?;
-        stream::iter(requests.into_iter().map(Ok::<_, RociaDbError>))
-            .try_for_each_concurrent(CONCURRENT_REQUESTS, |node| {
+        let groups = group_preserving_order(requests, |request| request.node_id.as_str());
+        stream::iter(groups.into_iter().map(Ok::<_, RociaDbError>))
+            .try_for_each_concurrent(CONCURRENT_REQUESTS, |group| {
                 let mut upstream = self.upstream_graph.clone();
                 async move {
-                    let graph = node.graph.clone();
-                    let node_id = node.node_id.clone();
-                    upstream
-                        .put_node(node)
-                        .await
-                        .status_context("failed to upsert node")
-                        .map_err(|error| {
-                            error!(
-                                graph = graph,
-                                node_id = node_id,
-                                error = %error,
-                                "failed to upsert graph node"
-                            );
-                            error
-                        })?;
+                    for node in group {
+                        let node_id = node.node_id.clone();
+                        upstream
+                            .put_node(node)
+                            .await
+                            .status_context("failed to upsert node")
+                            .map_err(|error| {
+                                error!(
+                                    graph = graph_name,
+                                    node_id = node_id,
+                                    error = %error,
+                                    "failed to upsert graph node"
+                                );
+                                error
+                            })?;
+                    }
                     Ok(())
                 }
             })
@@ -1490,7 +1690,15 @@ impl RociaDbClient {
     /// Upsert a batch of edges with bounded concurrency (at most 10
     /// `AddEdge` calls in flight at once). `edges` is consumed in the order
     /// the caller provides — duplicate `edge_id`s are **not** merged, both
-    /// are sent, in order.
+    /// are sent. Items with different `edge_id`s run fully concurrently
+    /// against each other (up to the 10-in-flight bound), but items sharing
+    /// an `edge_id` are dispatched strictly one after another, in the order
+    /// given: the next `AddEdge` call for that id is not sent until the
+    /// previous one's response comes back. That makes last-item-wins
+    /// genuinely true for a duplicate id — the caller's last write really is
+    /// the last one the server applies — rather than a race between two
+    /// in-flight calls whose completion order the network, not the caller,
+    /// decides.
     ///
     /// The server returns `NOT_FOUND` for any edge whose `from` or `to`
     /// node does not already exist in `graph_name`: create both endpoint
@@ -1521,31 +1729,33 @@ impl RociaDbClient {
             "upserting graph edges batch"
         );
         let requests = build_add_edge_requests(tenant_id, graph_name, edges)?;
-        stream::iter(requests.into_iter().map(Ok::<_, RociaDbError>))
-            .try_for_each_concurrent(CONCURRENT_REQUESTS, |edge| {
+        let groups = group_preserving_order(requests, |request| request.edge_id.as_str());
+        stream::iter(groups.into_iter().map(Ok::<_, RociaDbError>))
+            .try_for_each_concurrent(CONCURRENT_REQUESTS, |group| {
                 let mut upstream = self.upstream_graph.clone();
                 async move {
-                    let graph = edge.graph.clone();
-                    let edge_id = edge.edge_id.clone();
-                    let from = edge.from.clone();
-                    let to = edge.to.clone();
-                    let label = edge.label.clone();
-                    upstream
-                        .add_edge(edge)
-                        .await
-                        .status_context("failed to add edge")
-                        .map_err(|error| {
-                            error!(
-                                graph = graph,
-                                edge_id = edge_id,
-                                from = from,
-                                to = to,
-                                label = label,
-                                error = %error,
-                                "failed to upsert graph edge"
-                            );
-                            error
-                        })?;
+                    for edge in group {
+                        let edge_id = edge.edge_id.clone();
+                        let from = edge.from.clone();
+                        let to = edge.to.clone();
+                        let label = edge.label.clone();
+                        upstream
+                            .add_edge(edge)
+                            .await
+                            .status_context("failed to add edge")
+                            .map_err(|error| {
+                                error!(
+                                    graph = graph_name,
+                                    edge_id = edge_id,
+                                    from = from,
+                                    to = to,
+                                    label = label,
+                                    error = %error,
+                                    "failed to upsert graph edge"
+                                );
+                                error
+                            })?;
+                    }
                     Ok(())
                 }
             })
@@ -1597,10 +1807,13 @@ impl RociaDbClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        BearerInterceptor, DEFAULT_CONNECT_TIMEOUT, DocumentPage, DocumentServiceClient, EdgeInput,
-        FileServiceClient, GraphServiceClient, NodeInput, RociaDbBuilder, RociaDbClient,
+        BearerInterceptor, DEFAULT_CONNECT_TIMEOUT, DocumentPage, DocumentQueryFilter,
+        DocumentQueryOperator, DocumentQuerySort, DocumentQuerySortDirection,
+        DocumentServiceClient, EdgeInput, FileServiceClient, GraphServiceClient, NodeBinding,
+        NodeInput, PageResponse, QueryOperator, RociaDbBuilder, RociaDbClient, SortDirection,
         TenantServiceClient, build_add_edge_requests, build_put_node_requests,
-        default_document_request_id, resolve_connect_timeout, validate_host_path,
+        decode_document_page, default_document_request_id, group_preserving_order,
+        node_binding_to_pair, page_request, resolve_connect_timeout, validate_host_path,
         validate_node_binding,
     };
     use crate::{FileStreamUploadOptions, RociaDbError};
@@ -1667,6 +1880,23 @@ mod tests {
     }
 
     #[test]
+    fn node_binding_to_pair_keeps_label_and_graph_apart() {
+        // Asserting each side of the pair individually (rather than just
+        // that the call compiles) is the point: `label` and `graph` are
+        // both `String`, so a future edit that swapped which field feeds
+        // which side of the returned tuple would still type-check and pass
+        // a test that only checked shape, not value.
+        let (label, graph) = node_binding_to_pair(Some(NodeBinding::new("product", "catalog")));
+        assert_eq!(label.as_deref(), Some("product"));
+        assert_eq!(graph.as_deref(), Some("catalog"));
+    }
+
+    #[test]
+    fn node_binding_to_pair_maps_absent_to_both_absent() {
+        assert_eq!(node_binding_to_pair(None), (None, None));
+    }
+
+    #[test]
     fn client_is_send_sync_so_an_arc_needs_no_mutex() {
         // `RociaDbClient` methods take `&self`, not `&mut self` (each call
         // clones the cheap, Arc-backed inner service client before issuing
@@ -1677,6 +1907,79 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<RociaDbClient>();
         assert_send_sync::<std::sync::Arc<RociaDbClient>>();
+    }
+
+    // `page_request`'s None-defaults case and its zero-limit rejection are
+    // exercised elsewhere (`graph::tests`), but neither covers the common
+    // case of a caller-supplied limit and cursor actually reaching the
+    // `PageRequest` unchanged — the one behavior every paginated RPC in this
+    // crate depends on.
+    #[test]
+    fn page_request_passes_through_an_explicit_limit_and_cursor_unchanged() {
+        let page = page_request(Some(75), Some("cursor-x"))
+            .expect("a positive limit with a cursor must be accepted")
+            .expect("a page request must always be produced");
+        assert_eq!(page.limit, Some(75));
+        assert_eq!(page.cursor, "cursor-x");
+    }
+
+    #[test]
+    fn document_query_operator_as_proto_maps_every_variant_to_the_generated_constant() {
+        // A swapped match arm here would silently send the wrong filter
+        // semantics to the server with no client-side error, so each
+        // variant is checked against the exact generated constant rather
+        // than just checking that `as_proto` returns *something*.
+        assert_eq!(
+            DocumentQueryOperator::Eq.as_proto(),
+            QueryOperator::Eq as i32
+        );
+        assert_eq!(
+            DocumentQueryOperator::In.as_proto(),
+            QueryOperator::In as i32
+        );
+        assert_eq!(
+            DocumentQueryOperator::Contains.as_proto(),
+            QueryOperator::Contains as i32
+        );
+    }
+
+    #[test]
+    fn document_query_sort_direction_as_proto_maps_every_variant_to_the_generated_constant() {
+        assert_eq!(
+            DocumentQuerySortDirection::Asc.as_proto(),
+            SortDirection::Asc as i32
+        );
+        assert_eq!(
+            DocumentQuerySortDirection::Desc.as_proto(),
+            SortDirection::Desc as i32
+        );
+    }
+
+    #[test]
+    fn document_query_filter_and_sort_support_equality_comparison() {
+        let filter_a = DocumentQueryFilter::new(
+            "sku",
+            DocumentQueryOperator::Eq,
+            vec![serde_json::json!("sku-1")],
+        );
+        let filter_b = DocumentQueryFilter::new(
+            "sku",
+            DocumentQueryOperator::Eq,
+            vec![serde_json::json!("sku-1")],
+        );
+        let filter_c = DocumentQueryFilter::new(
+            "sku",
+            DocumentQueryOperator::Eq,
+            vec![serde_json::json!("sku-2")],
+        );
+        assert_eq!(filter_a, filter_b);
+        assert_ne!(filter_a, filter_c);
+
+        let sort_a = DocumentQuerySort::new("sku", DocumentQuerySortDirection::Asc);
+        let sort_b = DocumentQuerySort::new("sku", DocumentQuerySortDirection::Asc);
+        let sort_c = DocumentQuerySort::new("sku", DocumentQuerySortDirection::Desc);
+        assert_eq!(sort_a, sort_b);
+        assert_ne!(sort_a, sort_c);
     }
 
     // `build_put_node_requests` / `build_add_edge_requests` are the pure,
@@ -1917,6 +2220,98 @@ mod tests {
     }
 
     #[test]
+    fn group_preserving_order_keeps_each_groups_relative_order() {
+        // `put_nodes`/`add_edges` rely on this: different keys may come back
+        // in any order (backed by a `HashMap`), but the items sharing one
+        // key must stay in the exact order they were given in, since that
+        // order becomes the order the batch dispatch applies them in.
+        let items = vec![("a", 1), ("b", 1), ("a", 2), ("a", 3), ("b", 2)];
+        let groups = group_preserving_order(items, |item| item.0);
+
+        let values_for = |key: &str| -> Vec<i32> {
+            groups
+                .iter()
+                .find(|group| group.first().is_some_and(|item| item.0 == key))
+                .map(|group| group.iter().map(|item| item.1).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(values_for("a"), vec![1, 2, 3]);
+        assert_eq!(values_for("b"), vec![1, 2]);
+        assert_eq!(
+            groups.iter().map(Vec::len).sum::<usize>(),
+            5,
+            "every item must land in exactly one group"
+        );
+    }
+
+    // `decode_document_page` is the shared, network-free core of
+    // `list_documents`, `search_documents` and `query_documents`'s response
+    // handling (see its doc comment). Feeding it a synthetic response shape
+    // directly exercises the real extraction logic those three RPCs run,
+    // rather than only re-checking Rust's own field-access semantics on a
+    // hand-built `DocumentPage`.
+
+    #[test]
+    fn decode_document_page_decodes_items_and_extracts_the_cursor() {
+        let json = vec![
+            serde_json::to_vec(&serde_json::json!({"n": 1})).expect("encode must succeed"),
+            serde_json::to_vec(&serde_json::json!({"n": 2})).expect("encode must succeed"),
+        ];
+        let page = Some(PageResponse {
+            next_cursor: "cursor-2".to_string(),
+        });
+        let (items, next_cursor) = decode_document_page::<serde_json::Value>(json, page)
+            .expect("well-formed items must decode");
+        assert_eq!(
+            items,
+            vec![serde_json::json!({"n": 1}), serde_json::json!({"n": 2})]
+        );
+        assert_eq!(next_cursor.as_deref(), Some("cursor-2"));
+    }
+
+    #[test]
+    fn decode_document_page_maps_the_servers_empty_cursor_convention_to_none() {
+        let page = Some(PageResponse {
+            next_cursor: String::new(),
+        });
+        let (items, next_cursor) = decode_document_page::<serde_json::Value>(vec![], page)
+            .expect("an empty page must still decode");
+        assert!(items.is_empty());
+        assert!(
+            next_cursor.is_none(),
+            "an empty next_cursor means \"no further page\" and must map to None — \
+             the same rule list_documents/search_documents/query_documents depend on \
+             to know when to stop paginating"
+        );
+    }
+
+    #[test]
+    fn decode_document_page_with_no_page_message_has_no_cursor() {
+        let (items, next_cursor) = decode_document_page::<serde_json::Value>(vec![], None)
+            .expect("a missing page message must still decode");
+        assert!(items.is_empty());
+        assert!(next_cursor.is_none());
+    }
+
+    #[test]
+    fn decode_document_page_names_the_failing_items_position() {
+        // `collect` still short-circuits on the first bad item — this only
+        // checks that the resulting error names *which* item broke, instead
+        // of just saying that something in the page failed to parse.
+        let json = vec![
+            serde_json::to_vec(&serde_json::json!({"n": 1})).expect("encode must succeed"),
+            b"{ not valid json".to_vec(),
+            serde_json::to_vec(&serde_json::json!({"n": 3})).expect("encode must succeed"),
+        ];
+        let error = decode_document_page::<serde_json::Value>(json, None)
+            .expect_err("a malformed item must fail to decode");
+        assert!(
+            error.to_string().contains("item 1"),
+            "the error must name the zero-based index of the item that failed, got: {error}"
+        );
+    }
+
+    #[test]
     fn document_page_exposes_items_next_cursor_and_total_count() {
         let page = DocumentPage {
             items: vec!["a", "b"],
@@ -1974,6 +2369,31 @@ mod tests {
         assert!(
             error.to_string().contains("/v1"),
             "the error should name the offending path, got: {error}"
+        );
+    }
+
+    #[test]
+    fn host_path_validation_rejects_a_host_carrying_a_leftover_query_string() {
+        // A query string parses with `path() == "/"`, so without a
+        // dedicated check it would sail through the path-only validation
+        // and tonic would silently drop it when dialing.
+        let error = validate_host_path("http://127.0.0.1:50051?debug=1")
+            .expect_err("a host with a query string must be rejected");
+        assert!(matches!(error, RociaDbError::Connection { .. }));
+        assert!(
+            error.to_string().contains("debug=1"),
+            "the error should name the offending query, got: {error}"
+        );
+    }
+
+    #[test]
+    fn host_path_validation_rejects_a_host_carrying_a_leftover_fragment() {
+        let error = validate_host_path("http://127.0.0.1:50051#note")
+            .expect_err("a host with a fragment must be rejected");
+        assert!(matches!(error, RociaDbError::Connection { .. }));
+        assert!(
+            error.to_string().contains('#'),
+            "the error should mention the fragment, got: {error}"
         );
     }
 

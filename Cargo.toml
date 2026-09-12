@@ -25,15 +25,29 @@ exclude = ["AGENTS.md", "mise.toml"]
 [dependencies]
 futures = "0.3.31"
 http = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `rustls-tls-native-roots` (not the default `rustls-tls`, which bundles the
+# webpki/Mozilla root set) so reqwest trusts the same certificates as tonic's
+# `tls-native-roots` below. If these two ever disagree, a self-hosted
+# deployment whose gRPC and OAuth2 token endpoints both present a certificate
+# from an internally-installed CA gets a channel that connects fine and a
+# token fetch that fails TLS verification against that same CA — `build()`
+# then surfaces a confusing auth error even though the CA was provisioned
+# correctly at the OS level. Keep both crates reading from the OS trust store.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 pbjson-types = "0.8.0"
 prost = "0.14.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time"] }
-tonic = { version = "0.14.2", features = ["transport", "tls-native-roots"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+# `default-features = false` drops tonic's default `router` and `server`
+# feature stack (axum, matchit, hyper's server support, hyper-util's
+# server-auto) — this SDK is a gRPC client only, build.rs disables server
+# codegen, and nothing in src/ uses a server API. `tls-native-roots` already
+# pulls in `channel`, which is all `tonic::transport::{Channel, Endpoint,
+# ClientTlsConfig}` need.
+tonic = { version = "0.14.2", default-features = false, features = ["codegen", "tls-native-roots"] }
 tonic-prost = "0.14.2"
 tracing = "0.1"
 uuid = { version = "1.19.0", features = ["v4"] }

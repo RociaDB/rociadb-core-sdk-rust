@@ -311,6 +311,36 @@ client.delete_document("tenant-1", "products", "sku-123").await?;
 succeeds rather than returning `NOT_FOUND`. So are `delete_edge` and
 `delete_file` — no deletion in this API reports a missing target.
 
+### A safer way to pass the node binding
+
+`node_label` and `node_graph` above are two adjacent, identically-typed
+`Option<String>` parameters, so a call that swaps them compiles and passes
+the "both or neither" check with no error — it just writes the graph node
+under the wrong pairing. `create_document_with_node_binding`/
+`create_document_with_node_binding_and_request_id` take the same pair as a
+single `Option<NodeBinding>` instead, which also makes "one without the
+other" impossible to construct in the first place, not merely rejected at
+runtime:
+
+```rust
+use rociadb_sdk::NodeBinding;
+use serde_json::json;
+
+client
+    .create_document_with_node_binding(
+        "tenant-1",
+        "products",
+        "sku-123",
+        json!({"sku": "sku-123", "label": "Widget"}),
+        Some(NodeBinding::new("product", "products")),
+    )
+    .await?;
+```
+
+`NodeBinding::new(label, graph)` still takes both arguments positionally,
+so this narrows the risk of a transposition down to that one dedicated
+call — it does not make one impossible.
+
 ### Reading, listing, and querying
 
 - `get_document::<T>` deserializes directly into the requested type.
@@ -381,6 +411,37 @@ first, and see [Document Query Rules](#document-query-rules) for the
 `ALREADY_EXISTS` a duplicate `(from, label, to)` triplet produces. Like
 `delete_document` and `delete_file`, `delete_edge` is **idempotent**:
 deleting an edge that is not there succeeds and touches nothing.
+
+### A safer way to add a single edge
+
+`from` and `to` above are two of six consecutive, identically-typed `&str`
+arguments to `add_edge`, so a call that transposes them compiles cleanly
+and — whenever both endpoint nodes already exist, the normal case —
+silently persists the edge in the reversed direction. `add_edge_with_input`
+takes the same write as a single [`EdgeInput`](#batch-operations) instead,
+the same struct `add_edges` already batches:
+
+```rust
+use rociadb_sdk::EdgeInput;
+use serde_json::json;
+
+client
+    .add_edge_with_input(
+        "tenant-1",
+        "products",
+        EdgeInput::new("1", "product:sku-1", "group:grp-1", "belongs_to", json!({"weight": 1})),
+    )
+    .await?;
+```
+
+This removes the risk from the `add_edge_with_input` call itself, not from
+building the `EdgeInput` passed to it — `EdgeInput::new` still takes `from`
+and `to` positionally. It pays off most clearly when an `EdgeInput` already
+exists rather than being built fresh right before the call: assembled once
+for `add_edges` and also written individually, for example, since then
+there is no positional call left to transpose. `edge.request_id` is used
+as-is when set, and auto-generated (a bare UUID, no prefix, matching
+`add_edge`'s own default) when `None`.
 
 ### Reading an edge back
 
@@ -460,9 +521,12 @@ batch might need to be replayed (see below).
 requests are cancelled, and the error does not say which items had already
 succeeded. The correct way to resume is to replay the same items with the
 same `request_id` values used on the first attempt — the server
-deduplicates on `(tenant, operation, request_id)`, so already-applied
-writes are recognized and skipped rather than reapplied, and only the
-writes that never landed actually happen.
+deduplicates on `(tenant, operation, target, request_id)`, so
+already-applied writes are recognized and skipped rather than reapplied,
+and only the writes that never landed actually happen. The target — the
+node id or the edge id here — is part of that key, so two different items
+in the same batch are never confused with each other even if they somehow
+shared a `request_id`; each is applied independently.
 
 ### Neighbors
 
@@ -479,6 +543,15 @@ for neighbor in &page.neighbors {
     println!("edge {} -> node {}", neighbor.edge_id, neighbor.node_id);
 }
 ```
+
+A cursor returned here is scoped to the exact `(tenant, graph, node,
+label, direction)` it was issued for — direction meaning `neighbors_out`
+versus `neighbors_in`, which walk two distinct indexes and never accept
+each other's cursor. Passing it back after changing the node, the label,
+or the direction is rejected with `INVALID_ARGUMENT` rather than silently
+served against the new combination. Switching any one of those
+mid-traversal means restarting from the first page — call again with
+`cursor = None`, not with the cursor you already have.
 
 `get_outgoing_neighbor_nodes`/`get_incoming_neighbor_nodes` paginate to
 completion internally and additionally fetch each neighbor's node payload,
@@ -680,8 +753,14 @@ loop {
 ```
 
 `list_tenants` is the only method not scoped to a tenant: it enumerates the
-whole deployment from a dedicated service, so expect `PERMISSION_DENIED`
-when the credentials are limited to a single tenant.
+whole deployment from a dedicated service. Any authenticated data-plane
+token can call it — read-only and read-write credentials both work, since
+no tenant-scoped credential exists that would need excluding. If it
+returns `PERMISSION_DENIED`, the cause is not a narrower credential scope:
+it is an admin-scoped token (`rocia-idp`'s account-management credential)
+presented against the data plane, the same cause documented for every
+other RPC in
+[Tenancy and Authorization Scopes](#tenancy-and-authorization-scopes).
 
 ## Pagination
 
@@ -736,6 +815,7 @@ re-checked client-side (except where noted), so they surface as
 
 | RPC / method | Rule |
 |---|---|
+| All RPCs (identifier fields) | Every field that becomes a storage-key segment — `tenant_id`, `collection`, `id`, `field`, `graph`, `node_id`, `edge_id`, `from`, `to`, `label`, `bucket`, `file_id`, `request_id` — is rejected beyond **256 UTF-8 bytes** with `INVALID_ARGUMENT`, naming the offending field and the limit. Length is counted in bytes of the value as sent, not characters, so a multi-byte identifier is capped sooner than its character count suggests; the check runs at the boundary, before any key is built, so an oversized identifier surfaces as `INVALID_ARGUMENT`, never as `INTERNAL` from storage. |
 | `search_documents` (`FindByField`) | `value` must serialize to a JSON **scalar** (a string, number, bool, or null) — `"active"`, `42`, `true`, `null`. An object or array is rejected with `INVALID_ARGUMENT`. |
 | `put_node`/`put_nodes` (`PutNode`) | `value` must serialize to a JSON **object**, never a scalar or an array. |
 | `add_edge`/`add_edges` (`AddEdge`) | Fails with `NOT_FOUND` if either `from` or `to` does not already exist as a node in the graph. Create both endpoint nodes first. |
@@ -792,12 +872,19 @@ directly instead of downcasting:
   lost compared to calling the generated client directly. `.code()`
   returns the `tonic::Code`; `.reason()` returns the server's `reason`
   trailing-metadata value (`invalid_argument`, `not_found`,
-  `already_exists`, `permission_denied`, `unauthenticated`, `internal`) —
-  finer-grained than the code alone; `.status()` returns the raw
-  `tonic::Status` for anything not covered by the two accessors above.
+  `already_exists`, `permission_denied`, `unauthenticated`, `conflict`,
+  `internal`) — finer-grained than the code alone; `.status()` returns the
+  raw `tonic::Status` for anything not covered by the two accessors above.
   `.is_unauthenticated()` and `.is_permission_denied()` are shorthands for
   the two codes that matter most for retry logic (see
   [`UNAUTHENTICATED` vs `PERMISSION_DENIED`](#unauthenticated-vs-permission_denied)).
+  `.is_already_exists()` shortcuts the `ALREADY_EXISTS` a duplicate
+  `(from, label, to)` triplet produces on `add_edge`/`add_edges` (see
+  [Document Query Rules](#document-query-rules)). `.is_aborted()`
+  shortcuts `ABORTED`, which behaves differently enough from every other
+  code to need its own explanation — see
+  [`ABORTED`: the code every caller must replay](#aborted-the-code-every-caller-must-replay)
+  below.
 - `Connection { .. }` — failed to connect to, or configure, the upstream
   endpoint (invalid host, TLS setup, connection refused, missing builder
   configuration).
@@ -809,6 +896,63 @@ directly instead of downcasting:
   network call (a zero page limit, a checksum of the wrong length, an
   incomplete `node_label`/`node_graph` pair, a file size out of bounds,
   etc).
+
+### `ABORTED`: the code every caller must replay
+
+`ABORTED` is the one status in this API a caller must retry
+automatically, not merely may. It reports a transient storage conflict,
+never a terminal refusal — the call was safe, the identical request would
+very likely succeed moments later, and the SDK does not retry it for you,
+so that responsibility falls on the caller. Retry the same call again,
+reusing the same `request_id` if you supplied one; that persistence across
+retries is exactly what `request_id` is for.
+
+**It is not limited to writes.** On the `tikv` storage backend, a write
+conflict is only one of three causes of `ABORTED` — a lock held by a
+concurrent transaction and a region error are the other two — and both of
+those can surface on *any* call, reads included: `get_document`,
+`list_documents`, `query_documents`, `search_documents`,
+`list_collections`, and `download_file` can all return it. A retry policy
+that wraps only mutating calls will be caught out by one on a plain read.
+
+`put_document`/`delete_document` (`PutDoc`/`DeleteDoc`) absorb transient
+conflicts with up to 5 internal server-side retries before giving up and
+surfacing `ABORTED` to the caller; every other write
+(`put_node`/`put_nodes`, `add_edge`/`add_edges`, `delete_edge`,
+`upload_file`/`upload_file_stream`, `delete_file`) and every read has no
+such internal retry and can return it on the very first conflict. The
+retry the caller has to perform is identical either way — the internal
+retries only raise how much contention it takes to see one, not what to
+do about it.
+
+**"Transient" does not mean "nothing was written."** A document write,
+its index entries, its collection counter, and its idempotency marker
+commit inside one transaction, so a conflict on that transaction really
+does leave nothing behind. But confirming the idempotency marker is a
+separate step that happens *after* that commit — so an `ABORTED` raised by
+that particular step arrives on a document that is already durably
+written. This is harmless to retry: the replay, with the same
+`request_id`, is recognized as a duplicate of an already-applied write and
+short-circuits to `Ok` instead of writing again — but it does mean
+`ABORTED` must never be read as proof that a write did not happen.
+
+A genuinely concurrent duplicate — a second call sharing a `request_id`
+with one still in flight — also gets `ABORTED` rather than `Ok`, for the
+same reason: the original call has not finished, so the server cannot yet
+claim success on its behalf. Replaying with that same `request_id`
+afterward finds the now-finished write and returns `Ok` without executing
+it again. The same holds if the in-flight call itself is interrupted — a
+dropped connection, an expired client deadline, or the server dying
+between the write and the marker confirmation: the pending reservation
+holds for `gc.request_lease_secs` (300 seconds by default), and every
+replay attempted before that lease expires gets `ABORTED` too. Nothing is
+corrupted or lost in either case: a reservation never returns `Ok`, so
+none of these `ABORTED`s is masking a write that silently failed to
+happen. Once the lease expires, ordinary service resumes and the next
+replay actually re-executes the write. Space retries out under sustained
+contention rather than looping tightly — several minutes of `ABORTED` on
+a call whose deadline already expired client-side is expected there, not
+a sign of an outage.
 
 Every variant implements `std::error::Error`, so `RociaDbError` composes
 normally with `?` inside a function returning `anyhow::Result<...>` (or any
@@ -862,11 +1006,17 @@ client
     .await?;
 ```
 
-Idempotency is scoped to `(tenant, operation, request_id)`: the same
-`request_id` reused across two *different* operations (a `put_document`
-then a `delete_document`, say) does not cancel or dedupe against each
-other. Idempotency markers expire after the server's `gc.request_ttl_secs`,
-**24 hours by default** — a replay after that window re-executes.
+Idempotency is scoped to `(tenant, operation, target, request_id)`: the
+same `request_id` reused across two *different* operations (a
+`put_document` then a `delete_document`, say) does not cancel or dedupe
+against each other. The target is part of that same key — `collection` +
+`id` for a document, `graph` + `node_id` or `edge_id` for a node or edge,
+`bucket` + `file_id` for a file — so reusing one `request_id` across two
+different targets (a batch or business-transaction identifier, for
+example) performs both writes independently rather than deduping the
+second against the first. Idempotency markers expire after the server's
+`gc.request_ttl_secs`, **24 hours by default** — a replay after that
+window re-executes.
 
 ### `Page`, `DocumentPage`, `NeighborPage`, and `Edge`
 

@@ -48,7 +48,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .file_descriptor_set_path(&descriptor_path)
         .compile_with_config(config, &["proto/upstream/v1/upstream.proto"], &includes)?;
 
+    // Emitting any rerun-if-changed line switches Cargo off its default
+    // "watch the whole package" heuristic, so every path the build depends on
+    // has to be listed explicitly from here on. `proto/google/protobuf` holds
+    // the vendored well-known-type `.proto` files (`empty.proto`,
+    // `struct.proto`, `timestamp.proto`) that `upstream.proto` imports and
+    // that `compile_with_config` resolves through the `proto` include path
+    // above; watching the directory covers edits to any of them, and to any
+    // added later, without relying on a full `cargo clean`.
     println!("cargo:rerun-if-changed=proto/upstream/v1/upstream.proto");
+    println!("cargo:rerun-if-changed=proto/google/protobuf");
     println!("cargo:rerun-if-changed=build.rs");
     Ok(())
 }

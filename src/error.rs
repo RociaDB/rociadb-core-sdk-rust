@@ -14,14 +14,19 @@ pub type Result<T> = std::result::Result<T, RociaDbError>;
 /// gRPC call: it carries the raw [`tonic::Status`], so nothing is lost
 /// compared to calling the generated client directly. Beyond the standard
 /// gRPC `code`, the upstream server always attaches a `reason` trailing
-/// metadata value that is finer-grained than the code alone — see
-/// [`RociaDbError::reason`]. In particular the server treats
-/// `UNAUTHENTICATED` as a signal to refresh the auth token and retry (see
-/// [`RociaDbError::is_unauthenticated`] and
+/// metadata value — see [`RociaDbError::reason`], which also documents the
+/// one code whose `reason` does not simply name it. In particular the
+/// server treats `UNAUTHENTICATED` as a signal to refresh the auth token
+/// and retry (see [`RociaDbError::is_unauthenticated`] and
 /// [`crate::RociaDbClient::refresh_auth_token`]), whereas
 /// `PERMISSION_DENIED` is final — the token is valid but lacks the required
 /// scope, and retrying after a refresh will not help (see
-/// [`RociaDbError::is_permission_denied`]).
+/// [`RociaDbError::is_permission_denied`]). Two more codes carry meaning
+/// beyond `code()`/`reason()` alone: `ALREADY_EXISTS`, the one non-auth
+/// code this SDK's own docs treat as an expected outcome to branch on (see
+/// [`RociaDbError::is_already_exists`]), and `ABORTED`, the one code every
+/// caller is expected to retry automatically — on any call, reads included
+/// (see [`RociaDbError::is_aborted`]).
 /// New variants may be added in a minor release: match on this enum with a
 /// wildcard arm to stay forward-compatible.
 #[non_exhaustive]
@@ -40,7 +45,17 @@ pub enum RociaDbError {
     /// Failed to connect to, or configure, the upstream endpoint: invalid
     /// host, TLS setup, connection refused, or missing builder
     /// configuration (host, token URL, client id/secret).
-    #[error("{message}")]
+    ///
+    /// [`Display`](std::fmt::Display) folds in the underlying cause
+    /// whenever one is present, so a bare `.to_string()` (or a `%err`
+    /// tracing field built from it, as the background token-refresh task
+    /// does) already distinguishes a DNS failure from a TLS mismatch from a
+    /// refused connection, instead of rendering the same message for all
+    /// three. The cause is absent only for the handful of internal call
+    /// sites that build this variant from a validation failure with no I/O
+    /// involved; call [`std::error::Error::source`] directly when you need
+    /// to match on the cause's concrete type rather than read it.
+    #[error("{message}{}", source_suffix(.source))]
     Connection {
         message: String,
         #[source]
@@ -48,7 +63,12 @@ pub enum RociaDbError {
     },
 
     /// Failed to obtain or refresh the upstream auth token.
-    #[error("{message}")]
+    ///
+    /// As with [`RociaDbError::Connection`], [`Display`](std::fmt::Display)
+    /// folds in the underlying cause when one is present, rather than
+    /// collapsing every I/O error, poisoned-lock failure, or nested
+    /// [`RociaDbError`] into the same fixed string.
+    #[error("{message}{}", source_suffix(.source))]
     Auth {
         message: String,
         #[source]
@@ -56,7 +76,7 @@ pub enum RociaDbError {
     },
 
     /// Failed to encode a value as JSON before sending it upstream.
-    #[error("failed to encode {context}")]
+    #[error("failed to encode {context}: {source}")]
     Encode {
         context: &'static str,
         #[source]
@@ -64,7 +84,7 @@ pub enum RociaDbError {
     },
 
     /// Failed to decode a JSON payload received from upstream.
-    #[error("failed to decode {context}")]
+    #[error("failed to decode {context}: {source}")]
     Decode {
         context: &'static str,
         #[source]
@@ -79,6 +99,18 @@ pub enum RociaDbError {
     Validation(String),
 }
 
+/// Renders `": {source}"` when a cause is present, or an empty string when
+/// it is not, so [`RociaDbError::Connection`] and [`RociaDbError::Auth`]
+/// can interpolate an optional `#[source]` into their `Display` output
+/// without printing a stray `: ` for the internal call sites that build
+/// either variant with no cause attached.
+fn source_suffix(source: &Option<Box<dyn std::error::Error + Send + Sync>>) -> String {
+    match source {
+        Some(source) => format!(": {source}"),
+        None => String::new(),
+    }
+}
+
 impl RociaDbError {
     /// The gRPC status code, present only for [`RociaDbError::Status`].
     pub fn code(&self) -> Option<tonic::Code> {
@@ -88,10 +120,22 @@ impl RociaDbError {
         }
     }
 
-    /// The server's `reason` trailing metadata — one of `invalid_argument`,
-    /// `not_found`, `already_exists`, `permission_denied`,
-    /// `unauthenticated`, `internal` — present only for
-    /// [`RociaDbError::Status`]. Finer-grained than [`Self::code`] alone.
+    /// The server's `reason` trailing metadata, present only for
+    /// [`RociaDbError::Status`]. Six of its seven values are exactly the
+    /// snake_case name of the gRPC code returned alongside them —
+    /// `invalid_argument`, `not_found`, `already_exists`,
+    /// `permission_denied`, `unauthenticated`, `internal` — so branching on
+    /// `reason()` partitions errors no differently than branching on
+    /// [`Self::code`] (or the `is_*` predicates) already does; prefer those
+    /// for control flow and reach for `reason()` only when you need a
+    /// stable string to log or forward rather than to match on.
+    ///
+    /// The exception is [`tonic::Code::Aborted`]: its `reason` is
+    /// `"conflict"`, not the `"aborted"` the pattern above would predict.
+    /// The naming does not carry a different meaning — see
+    /// [`Self::is_aborted`] for what the code itself signals — but it is
+    /// the one place `reason()` and `code()` genuinely diverge rather than
+    /// mirroring each other under two names.
     pub fn reason(&self) -> Option<&str> {
         match self {
             Self::Status { status, .. } => status
@@ -123,6 +167,70 @@ impl RociaDbError {
     pub fn is_permission_denied(&self) -> bool {
         self.code() == Some(tonic::Code::PermissionDenied)
     }
+
+    /// True when the server rejected the call because it would violate a
+    /// uniqueness constraint. The one call in this SDK that can produce
+    /// `ALREADY_EXISTS` is [`crate::RociaDbClient::add_edge`] (and
+    /// [`crate::RociaDbClient::add_edges`]): a `(from, label, to)` triplet
+    /// names at most one edge, since the adjacency index is keyed by the
+    /// triplet rather than by `edge_id`, so adding a second edge over a
+    /// triplet another edge already holds fails this way. This is expected
+    /// to happen in normal use, not only under misuse: retry with a fresh
+    /// `edge_id`, or a different `label`/`to`, rather than the same
+    /// arguments, which will fail identically every time. Reusing the
+    /// *same* `edge_id` on its own triplet is not a conflict — it replaces
+    /// that edge's properties instead, which is what makes replaying an
+    /// already-successful `add_edge` harmless.
+    pub fn is_already_exists(&self) -> bool {
+        self.code() == Some(tonic::Code::AlreadyExists)
+    }
+
+    /// True when the server reports a transient storage conflict that the
+    /// caller is expected to retry. Unlike [`Self::is_unauthenticated`] and
+    /// [`Self::is_permission_denied`], which callers may reasonably leave
+    /// unhandled, `ABORTED` is the one code every caller of this API must
+    /// handle: it is safe, and expected, to resend the exact same call
+    /// (with the same `request_id`, if one was supplied) rather than
+    /// surface the error.
+    ///
+    /// It can arrive on any call, reads included, not only on writes: a
+    /// `tikv` write conflict, a lock held by a concurrent transaction, or a
+    /// region error can surface it on [`crate::RociaDbClient::get_document`],
+    /// [`crate::RociaDbClient::list_documents`],
+    /// [`crate::RociaDbClient::query_documents`], or
+    /// [`crate::RociaDbClient::search_documents`] just as it can on a
+    /// write. On [`crate::RociaDbClient::put_document`] and
+    /// [`crate::RociaDbClient::delete_document`] it surfaces only after the
+    /// server's own five internal retries are exhausted; every other write
+    /// — [`crate::RociaDbClient::put_node`],
+    /// [`crate::RociaDbClient::add_edge`],
+    /// [`crate::RociaDbClient::delete_edge`],
+    /// [`crate::RociaDbClient::upload_file`],
+    /// [`crate::RociaDbClient::delete_file`] — has no such cushion and can
+    /// return it on the very first conflict.
+    ///
+    /// The same code also covers a concurrent duplicate of a call carrying
+    /// a `request_id` that is still in flight: the server cannot yet say
+    /// whether the original succeeded and refuses to guess. Retry, and
+    /// that retry finds the original either finished — returning `Ok`
+    /// without re-executing — or, if the caller's connection dropped or
+    /// the server died mid-call, still reserved for up to the server's
+    /// request lease (300 seconds by default); retries during that window
+    /// keep returning `ABORTED`, and the first one after the lease expires
+    /// replays the call and succeeds.
+    ///
+    /// Either way, **`ABORTED` never proves nothing was written.** On
+    /// `put_document`/`delete_document`, the document, its index entries,
+    /// and the idempotency marker share one transaction, but the marker's
+    /// own commit — which can itself collide — happens after that
+    /// transaction lands, so an `ABORTED` surfaced by that step arrives on
+    /// a document already committed. None of this changes what to do:
+    /// retry the same call, with backoff rather than a tight loop, since
+    /// server-side contention absorbs conflicts in latency rather than
+    /// making them disappear.
+    pub fn is_aborted(&self) -> bool {
+        self.code() == Some(tonic::Code::Aborted)
+    }
 }
 
 impl RociaDbError {
@@ -132,13 +240,6 @@ impl RociaDbError {
 
     pub(crate) fn connection(message: impl Into<String>) -> Self {
         Self::Connection {
-            message: message.into(),
-            source: None,
-        }
-    }
-
-    pub(crate) fn auth(message: impl Into<String>) -> Self {
-        Self::Auth {
             message: message.into(),
             source: None,
         }
@@ -233,8 +334,8 @@ mod tests {
     #[test]
     fn status_error_exposes_code_and_server_reason() {
         // The server always attaches a `reason` trailing metadata value
-        // finer-grained than the gRPC code; both must survive the trip
-        // into `RociaDbError::Status` unchanged.
+        // alongside the gRPC code; both must survive the trip into
+        // `RociaDbError::Status` unchanged.
         let status = status_with_reason(Code::NotFound, "document not found", "not_found");
         let error = RociaDbError::Status {
             operation: "failed to get document",
@@ -304,6 +405,32 @@ mod tests {
     }
 
     #[test]
+    fn is_already_exists_true_only_for_already_exists_status() {
+        let conflict = RociaDbError::Status {
+            operation: "failed to add edge",
+            status: Status::already_exists("triplet already taken by another edge"),
+        };
+        assert!(conflict.is_already_exists());
+        assert!(
+            !conflict.is_aborted(),
+            "already_exists must not also read as aborted"
+        );
+    }
+
+    #[test]
+    fn is_aborted_true_only_for_aborted_status() {
+        let aborted = RociaDbError::Status {
+            operation: "failed to get document",
+            status: Status::aborted("write conflict, retry"),
+        };
+        assert!(aborted.is_aborted());
+        assert!(
+            !aborted.is_already_exists(),
+            "aborted must not also read as already_exists"
+        );
+    }
+
+    #[test]
     fn is_unauthenticated_and_is_permission_denied_are_false_for_other_status_codes() {
         let not_found = RociaDbError::Status {
             operation: "failed to get node",
@@ -311,19 +438,23 @@ mod tests {
         };
         assert!(!not_found.is_unauthenticated());
         assert!(!not_found.is_permission_denied());
+        assert!(!not_found.is_already_exists());
+        assert!(!not_found.is_aborted());
     }
 
     #[test]
     fn non_status_variants_carry_no_grpc_code_reason_or_status() {
-        // `code`/`reason`/`status`/the two auth predicates only make sense
-        // for a failed gRPC call; every other variant must report "absent"
-        // rather than panicking or fabricating a value.
+        // `code`/`reason`/`status`/the four `is_*` predicates only make
+        // sense for a failed gRPC call; every other variant must report
+        // "absent" rather than panicking or fabricating a value.
         let validation = RociaDbError::validation("page limit must be greater than zero");
         assert_eq!(validation.code(), None);
         assert_eq!(validation.reason(), None);
         assert!(validation.status().is_none());
         assert!(!validation.is_unauthenticated());
         assert!(!validation.is_permission_denied());
+        assert!(!validation.is_already_exists());
+        assert!(!validation.is_aborted());
     }
 
     #[test]
@@ -337,16 +468,11 @@ mod tests {
     }
 
     #[test]
-    fn connection_and_auth_constructors_produce_their_own_variants() {
+    fn connection_constructor_produces_its_own_variant() {
         let connection = RociaDbError::connection("invalid host URL");
         assert!(matches!(connection, RociaDbError::Connection { .. }));
         assert_eq!(connection.to_string(), "invalid host URL");
         assert_eq!(connection.code(), None);
-
-        let auth = RociaDbError::auth("token header lock poisoned");
-        assert!(matches!(auth, RociaDbError::Auth { .. }));
-        assert_eq!(auth.to_string(), "token header lock poisoned");
-        assert_eq!(auth.code(), None);
     }
 
     #[test]
@@ -424,7 +550,20 @@ mod tests {
             .connection_context("failed to connect to upstream")
             .expect_err("io error must map to Connection");
         assert!(matches!(wrapped, RociaDbError::Connection { .. }));
-        assert_eq!(wrapped.to_string(), "failed to connect to upstream");
+        // Display must carry the underlying cause, not just the fixed
+        // label: a bare `.to_string()` (or a `%err` tracing field) is the
+        // only way most call sites ever see this error, and "connection
+        // refused" is what tells it apart from a DNS failure or a TLS
+        // mismatch that would otherwise render identically.
+        let message = wrapped.to_string();
+        assert!(
+            message.contains("failed to connect to upstream"),
+            "message should name the failed step, got: {message}"
+        );
+        assert!(
+            message.contains("connection refused"),
+            "message should carry the underlying cause, got: {message}"
+        );
         assert!(
             std::error::Error::source(&wrapped).is_some(),
             "the underlying io::Error must be preserved as the source"
@@ -438,7 +577,15 @@ mod tests {
             .connection_context("failed to initialize client")
             .expect_err("nested RociaDbError must map to Connection");
         assert!(matches!(nested, RociaDbError::Connection { .. }));
-        assert_eq!(nested.to_string(), "failed to initialize client");
+        let message = nested.to_string();
+        assert!(
+            message.contains("failed to initialize client"),
+            "message should name the failed step, got: {message}"
+        );
+        assert!(
+            message.contains("host must not be empty"),
+            "message should carry the nested cause, got: {message}"
+        );
         let source = std::error::Error::source(&nested).expect("source must be preserved");
         assert_eq!(source.to_string(), "host must not be empty");
     }
@@ -451,7 +598,15 @@ mod tests {
             .auth_context("failed to read cached token")
             .expect_err("a poisoned lock must map to Auth");
         assert!(matches!(error, RociaDbError::Auth { .. }));
-        assert_eq!(error.to_string(), "failed to read cached token");
+        let message = error.to_string();
+        assert!(
+            message.contains("failed to read cached token"),
+            "message should name the failed step, got: {message}"
+        );
+        assert!(
+            message.contains("lock poisoned"),
+            "message should carry the underlying cause, got: {message}"
+        );
         assert!(
             std::error::Error::source(&error).is_some(),
             "the underlying error must be preserved as the source"

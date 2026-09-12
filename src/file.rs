@@ -6,11 +6,12 @@
 //! collected `size_bytes` bytes in total, without assuming any particular
 //! chunk size.
 //!
-//! [`RociaDbClient::upload_file`] and [`RociaDbClient::upload_file_chunked`]
-//! both emit exactly-1-MiB chunks (the last one may be shorter): that is
-//! the largest message the server allows, so it is also the fewest
-//! possible messages for a given file, and it remains the only chunk size
-//! that is safe against a server older than `1.0.0-rc.16`.
+//! [`RociaDbClient::upload_file`], [`RociaDbClient::upload_file_owned`] and
+//! [`RociaDbClient::upload_file_chunked`] all emit exactly-1-MiB chunks (the
+//! last one may be shorter): that is the largest message the server allows,
+//! so it is also the fewest possible messages for a given file, and it
+//! remains the only chunk size that is safe against a server older than
+//! `1.0.0-rc.16`.
 //!
 //! Only reach for [`RociaDbClient::upload_file_stream`] directly if you
 //! understand and reproduce the wire contract yourself; see its own docs
@@ -144,6 +145,15 @@ impl RociaDbClient {
     /// network call. Files over 5 GiB (`limits.max_file_bytes`, the server
     /// default) are rejected client-side with a clear error instead of
     /// failing partway through the upload.
+    ///
+    /// `bytes` is only ever read here, never consumed, so this necessarily
+    /// copies it once to build the owned buffer the chunking step and the
+    /// underlying `'static` upload stream require. If you already own a
+    /// `Vec<u8>` — the common case for a file freshly read off disk or
+    /// assembled in memory — call [`RociaDbClient::upload_file_owned`]
+    /// instead: it accepts that `Vec<u8>` directly and moves it straight
+    /// into the chunking step with no copy, which matters as file size
+    /// approaches the 5 GiB ceiling above.
     pub async fn upload_file(
         &self,
         tenant_id: &str,
@@ -152,12 +162,44 @@ impl RociaDbClient {
         bytes: impl AsRef<[u8]>,
         options: FileUploadOptions,
     ) -> Result<()> {
-        let bytes = bytes.as_ref();
+        self.upload_file_owned(tenant_id, bucket, file_id, bytes.as_ref().to_vec(), options)
+            .await
+    }
+
+    /// Upload an in-memory byte buffer you already own, split into gRPC
+    /// messages of the server's largest allowed chunk size.
+    ///
+    /// Identical to [`RociaDbClient::upload_file`] in every respect —
+    /// chunking, automatic checksum computation, the 5 GiB size limit —
+    /// except that `bytes` is taken by value instead of by reference: a
+    /// `Vec<u8>` passed here is moved straight into the chunking step with
+    /// no intermediate copy, whereas `upload_file` must always copy its
+    /// borrowed buffer to build the owned `Vec<u8>` the chunking step and
+    /// the underlying `'static` upload stream require. For a caller who
+    /// already holds the file as an owned `Vec<u8>` — read off disk,
+    /// assembled in memory, or received from another API — that copy is
+    /// pure waste: it doubles peak memory for the whole upload, and Rust's
+    /// drop-scope rules keep the original buffer alive until the upload
+    /// finishes, so the doubled memory persists for the entire duration,
+    /// not just briefly. That waste becomes significant as file size
+    /// approaches the 5 GiB ceiling documented above. Prefer
+    /// [`RociaDbClient::upload_file`] only when you have a borrowed
+    /// `&[u8]` (or another type implementing `AsRef<[u8]>`) and no owned
+    /// buffer to give up — there, the copy is unavoidable regardless of
+    /// which method you call.
+    pub async fn upload_file_owned(
+        &self,
+        tenant_id: &str,
+        bucket: &str,
+        file_id: &str,
+        bytes: Vec<u8>,
+        options: FileUploadOptions,
+    ) -> Result<()> {
         let size_bytes = u64::try_from(bytes.len())
             .map_err(|_| RociaDbError::validation("file is too large"))?;
         validate_file_size(size_bytes)?;
 
-        let checksum = resolve_checksum(options.checksum, bytes)?;
+        let checksum = resolve_checksum(options.checksum, &bytes)?;
         let request_id = options
             .request_id
             .unwrap_or_else(|| format!("upload_file:{}", Uuid::new_v4()));
@@ -166,7 +208,7 @@ impl RociaDbClient {
             tenant_id.to_string(),
             bucket.to_string(),
             file_id.to_string(),
-            bytes.to_vec(),
+            bytes,
             options.content_type,
             checksum,
             request_id,
@@ -261,6 +303,24 @@ impl RociaDbClient {
     }
 
     /// Start a server-streaming download without buffering the complete file.
+    ///
+    /// This performs no integrity verification of its own — it is a thin
+    /// wrapper that opens the raw gRPC download stream and hands it back
+    /// as-is. That is a real asymmetry with the upload path: every upload
+    /// method on this client validates a SHA-256 checksum before (or, for
+    /// [`RociaDbClient::upload_file`]/[`RociaDbClient::upload_file_owned`],
+    /// as part of) sending any bytes, and [`StatResponse::checksum`]
+    /// exposes the checksum recorded for a stored file — but nothing on
+    /// the download side ever computes or checks a checksum against the
+    /// chunks the server sends back, and the server does not send one on
+    /// download for this method to check. The only protection you get is
+    /// whatever the transport itself already provides (TLS and HTTP/2
+    /// framing catch corruption or truncation in transit), which says
+    /// nothing about whether the bytes stored on the server still match
+    /// what was originally uploaded. If you need that end-to-end
+    /// guarantee, call [`RociaDbClient::stat_file`] yourself and compare
+    /// its `checksum` against a SHA-256 digest you compute over the
+    /// downloaded bytes — this crate does not do that comparison for you.
     pub async fn download_file_stream(
         &self,
         tenant_id: &str,
@@ -280,6 +340,15 @@ impl RociaDbClient {
     }
 
     /// Download a complete file into memory.
+    ///
+    /// Collects every chunk from [`RociaDbClient::download_file_stream`]
+    /// into one buffer via `extend_from_slice` and nothing else — see that
+    /// method's docs for the full asymmetry with the upload path: no
+    /// checksum is computed or checked here either, so a file that was
+    /// corrupted or truncated in storage is still returned successfully,
+    /// with its bad bytes intact and no error raised. Verify integrity
+    /// yourself with [`RociaDbClient::stat_file`] if that matters for your
+    /// use case.
     pub async fn download_file(
         &self,
         tenant_id: &str,
@@ -513,7 +582,27 @@ struct UploadMetadata {
 /// itself stays a plain, non-generic type.
 struct RechunkState {
     source: Pin<Box<dyn Stream<Item = Vec<u8>> + Send>>,
+    /// Bytes accumulated toward the next outgoing chunk. Never allowed to
+    /// grow past [`DEFAULT_CHUNK_SIZE`]: every place that adds to it copies
+    /// in at most the space remaining before that cap (see
+    /// [`RechunkState::ingest`] and [`RechunkState::drain_pending`]), so a
+    /// source that yields one huge item — a whole file handed over as a
+    /// single `Vec<u8>`, say — still only ever grows this buffer one
+    /// bounded slice at a time, never in a single copy that jumps straight
+    /// to the item's full size.
     buffer: Vec<u8>,
+    /// The unread tail of a source item that didn't fully fit into
+    /// `buffer` when [`RechunkState::ingest`] received it, together with
+    /// `pending_offset` marking how much of it has been copied into
+    /// `buffer` so far. Drained into `buffer` in further bounded slices by
+    /// [`RechunkState::drain_pending`] as room frees up, instead of ever
+    /// being copied in all at once.
+    pending: Vec<u8>,
+    /// How many bytes at the front of `pending` have already been copied
+    /// into `buffer`. `pending` is reset to an empty, zero-capacity `Vec`
+    /// once this reaches `pending.len()`, so a fully drained oversized item
+    /// does not linger in memory waiting to be reused.
+    pending_offset: usize,
     size_bytes: u64,
     total_written: u64,
     wrote_any: bool,
@@ -555,6 +644,63 @@ impl RechunkState {
             },
         }
     }
+
+    /// Copy a freshly received source item into `buffer`, never in one
+    /// piece larger than the space currently left before
+    /// [`DEFAULT_CHUNK_SIZE`]. When `piece` is bigger than that space, only
+    /// its head is copied in now; the tail becomes `pending` (with
+    /// `pending_offset` marking that the head has already been accounted
+    /// for) to be drained in further bounded slices by
+    /// [`RechunkState::drain_pending`] on later polls, once `buffer` has
+    /// been emptied out by an emitted chunk.
+    ///
+    /// This is the fix for the failure mode this module's docs warn about:
+    /// without it, a single `Vec::extend` call with an oversized `piece`
+    /// (for example a caller who already holds the whole file as one
+    /// in-memory `Vec<u8>` and yields it as a single stream item) would
+    /// grow `buffer` straight past one output chunk's worth, buffering
+    /// memory proportional to the whole file despite this function's docs
+    /// promising otherwise.
+    fn ingest(&mut self, piece: Vec<u8>) {
+        let space_left = DEFAULT_CHUNK_SIZE - self.buffer.len();
+        if piece.len() <= space_left {
+            self.buffer.extend_from_slice(&piece);
+        } else {
+            self.buffer.extend_from_slice(&piece[..space_left]);
+            self.pending = piece;
+            self.pending_offset = space_left;
+        }
+    }
+
+    /// `true` while `pending` still holds bytes that have not yet been
+    /// copied into `buffer`.
+    fn has_pending(&self) -> bool {
+        self.pending_offset < self.pending.len()
+    }
+
+    /// Copy as much of the unread tail of `pending` into `buffer` as fits
+    /// in the space left before [`DEFAULT_CHUNK_SIZE`], advancing
+    /// `pending_offset`, and free `pending` entirely once it has all been
+    /// copied over. Called ahead of pulling the next item from `source`,
+    /// so an oversized item already in `pending` finishes draining — in
+    /// chunk-sized slices, interleaved with emitting the chunks `buffer`
+    /// fills up to — before any more memory is pulled in from upstream.
+    fn drain_pending(&mut self) {
+        if !self.has_pending() {
+            return;
+        }
+        let space_left = DEFAULT_CHUNK_SIZE - self.buffer.len();
+        let available = self.pending.len() - self.pending_offset;
+        let take = space_left.min(available);
+        let end = self.pending_offset + take;
+        self.buffer
+            .extend_from_slice(&self.pending[self.pending_offset..end]);
+        self.pending_offset = end;
+        if !self.has_pending() {
+            self.pending = Vec::new();
+            self.pending_offset = 0;
+        }
+    }
 }
 
 /// Re-chunk an arbitrarily-sized byte stream into `UploadRequest` messages
@@ -562,7 +708,12 @@ impl RechunkState {
 /// shorter — the core of [`RociaDbClient::upload_file_chunked`]. Never
 /// buffers more than one outgoing chunk's worth of bytes at a time, unlike
 /// [`chunk_upload_requests`], which already holds the complete file in
-/// memory by the time it runs.
+/// memory by the time it runs. That bound holds regardless of how `chunks`
+/// happens to be split: a single source item larger than one chunk — even
+/// one as large as the whole file — is still copied into the outgoing
+/// buffer through [`RechunkState::ingest`] and [`RechunkState::drain_pending`]
+/// a bounded slice at a time rather than in one `extend` call, so it can
+/// never grow the buffer past [`DEFAULT_CHUNK_SIZE`].
 ///
 /// Validates as it goes: a chunk that would push the running total past
 /// `size_bytes` is rejected *before* being turned into a request (so it is
@@ -599,6 +750,8 @@ where
     let state = RechunkState {
         source: Box::pin(chunks),
         buffer: Vec::new(),
+        pending: Vec::new(),
+        pending_offset: 0,
         size_bytes,
         total_written: 0,
         wrote_any: false,
@@ -633,10 +786,20 @@ where
                 return Some((request, state));
             }
 
+            // Drain any tail left over from an oversized source item before
+            // pulling more data in, so it empties out in bounded slices —
+            // interleaved with the chunk emissions above — rather than
+            // sitting fully copied in `buffer` or growing it past
+            // `DEFAULT_CHUNK_SIZE` on some later `ingest` call.
+            if state.has_pending() {
+                state.drain_pending();
+                continue;
+            }
+
             if !state.source_exhausted {
                 match state.source.next().await {
                     Some(piece) => {
-                        state.buffer.extend(piece);
+                        state.ingest(piece);
                         continue;
                     }
                     None => {
@@ -680,8 +843,8 @@ where
 mod tests {
     use super::{
         CHECKSUM_LEN, DEFAULT_CHUNK_SIZE, FileStreamUploadOptions, FileUploadOptions,
-        MAX_FILE_BYTES, chunk_upload_requests, rechunk_upload_requests, require_checksum_len,
-        resolve_checksum, validate_file_size,
+        MAX_FILE_BYTES, RechunkState, chunk_upload_requests, rechunk_upload_requests,
+        require_checksum_len, resolve_checksum, validate_file_size,
     };
     use crate::RociaDbError;
     use crate::pb::upstream::v1::UploadRequest;
@@ -1080,5 +1243,102 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].content_type, "text/csv");
         assert_eq!(requests[0].request_id, "caller-request-id");
+    }
+
+    #[test]
+    fn ingest_never_grows_the_buffer_past_one_chunk_for_a_single_oversized_item() {
+        // Regression test for finding #3: before the fix, a caller who
+        // already held the whole file as one in-memory `Vec<u8>` and
+        // yielded it as a single stream item would have that whole item
+        // copied into `buffer` by one `Vec::extend` call, defeating the
+        // "never buffers more than one outgoing chunk" bound this module's
+        // docs promise. `RechunkState::ingest`/`RechunkState::drain_pending`
+        // are exercised directly here (rather than through the async
+        // `rechunk_upload_requests` pipeline) so `buffer.len()` can be
+        // asserted at every intermediate step, not just inferred from the
+        // sizes of the `UploadRequest`s that eventually come out the other
+        // end.
+        let error_slot: Arc<Mutex<Option<RociaDbError>>> = Arc::new(Mutex::new(None));
+        let mut state = RechunkState {
+            source: Box::pin(stream::empty::<Vec<u8>>()),
+            buffer: Vec::new(),
+            pending: Vec::new(),
+            pending_offset: 0,
+            size_bytes: 0,
+            total_written: 0,
+            wrote_any: false,
+            source_exhausted: false,
+            metadata: None,
+            error_slot,
+        };
+
+        let oversized = vec![42u8; DEFAULT_CHUNK_SIZE * 5 + 7];
+        state.ingest(oversized.clone());
+        assert!(
+            state.buffer.len() <= DEFAULT_CHUNK_SIZE,
+            "a single ingest() call must never grow the buffer past one output chunk, got {} \
+             bytes for a {}-byte item",
+            state.buffer.len(),
+            oversized.len()
+        );
+
+        // Drain exactly like `rechunk_upload_requests`'s `stream::unfold`
+        // loop does: emit the buffer once it reaches a full chunk,
+        // otherwise pull more of the oversized item's tail out of
+        // `pending` — checking the bound holds at every step, not just
+        // right after the first `ingest()` call.
+        let mut reassembled = Vec::new();
+        loop {
+            if state.buffer.len() >= DEFAULT_CHUNK_SIZE {
+                reassembled.extend(state.buffer.drain(..DEFAULT_CHUNK_SIZE));
+            } else if state.has_pending() {
+                state.drain_pending();
+            } else {
+                break;
+            }
+            assert!(
+                state.buffer.len() <= DEFAULT_CHUNK_SIZE,
+                "buffer must stay bounded by one output chunk at every step while draining an \
+                 oversized item, got {} bytes",
+                state.buffer.len()
+            );
+        }
+        reassembled.append(&mut state.buffer);
+
+        assert_eq!(
+            reassembled, oversized,
+            "draining an oversized item through ingest()/drain_pending() must reproduce it \
+             byte-for-byte, with no bytes lost, duplicated, or reordered"
+        );
+    }
+
+    #[test]
+    fn rechunk_reassembles_a_single_oversized_source_item_via_the_full_pipeline() {
+        // Companion to the `ingest`/`drain_pending` test above: the same
+        // scenario (one source item several times larger than
+        // `DEFAULT_CHUNK_SIZE`) driven through the full async
+        // `rechunk_upload_requests` pipeline, confirming the fix holds
+        // end-to-end and not only at the state-machine level.
+        let total = DEFAULT_CHUNK_SIZE * 3 + 12345;
+        let oversized: Vec<u8> = (0..total).map(|b| (b % 251) as u8).collect();
+        let (requests, error) = collect_rechunked(total as u64, vec![oversized.clone()]);
+        assert!(error.is_none(), "unexpected validation error: {error:?}");
+
+        let reassembled: Vec<u8> = requests.iter().flat_map(|r| r.chunk.clone()).collect();
+        assert_eq!(
+            reassembled, oversized,
+            "a single oversized stream item must still reassemble byte-for-byte"
+        );
+
+        let (last, all_but_last) = requests.split_last().expect("at least one request");
+        for request in all_but_last {
+            assert_eq!(
+                request.chunk.len(),
+                DEFAULT_CHUNK_SIZE,
+                "every chunk but the last must still be exactly one full chunk"
+            );
+        }
+        assert!(!last.chunk.is_empty());
+        assert!(last.chunk.len() <= DEFAULT_CHUNK_SIZE);
     }
 }
