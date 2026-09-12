@@ -30,7 +30,7 @@ not in this checkout — there is no `typescript/` directory here.
 
 This crate is a thin, typed client wrapper around the generated gRPC clients
 for Rocia DB's four upstream services — documents, graph, files, and
-tenants (22 RPCs in total). It handles connection setup, OAuth2
+tenants (23 RPCs in total). It handles connection setup, OAuth2
 client-credentials authentication with automatic token refresh, JSON
 encoding/decoding of payloads, pagination bookkeeping, and the file-upload
 wire contract, so callers work with plain Rust types (`serde_json::Value` or
@@ -152,7 +152,7 @@ retries:
   Retrying after a refresh will not help, because a fresh token carries the
   same scope. This happens in exactly two cases: a read-only client calling
   one of the 7 write RPCs, or an admin-scoped token (from `rocia-idp`'s
-  account-management API) calling *any* of the 22 RPCs, reads included — see
+  account-management API) calling *any* of the 23 RPCs, reads included — see
   [Tenancy and Authorization Scopes](#tenancy-and-authorization-scopes).
 
 ```rust
@@ -308,8 +308,8 @@ client.delete_document("tenant-1", "products", "sku-123").await?;
 ```
 
 `delete_document` is **idempotent**: deleting an id that does not exist
-succeeds rather than returning `NOT_FOUND` — unlike `delete_edge` (see
-[Graph](#graph)).
+succeeds rather than returning `NOT_FOUND`. So are `delete_edge` and
+`delete_file` — no deletion in this API reports a missing target.
 
 ### Reading, listing, and querying
 
@@ -320,7 +320,7 @@ succeeds rather than returning `NOT_FOUND` — unlike `delete_edge` (see
 - `query_documents::<T>` runs a multi-filter, sortable query (`QueryDoc`).
 
 All three listing methods return
-[`DocumentPage<T>`](#page-documentpage-and-neighborpage) — `items`,
+[`DocumentPage<T>`](#page-documentpage-neighborpage-and-edge) — `items`,
 `next_cursor`, and `total_count` — following the shared rules in
 [Pagination](#pagination). See [Document Query Rules](#document-query-rules)
 for the server-side validation each one enforces, and note that
@@ -368,6 +368,8 @@ let node: serde_json::Value = client.get_node_as("tenant-1", "products", "produc
 client
     .add_edge("tenant-1", "products", "1", "product:sku-1", "group:grp-1", "belongs_to", &json!({"weight": 1}))
     .await?;
+let edge: rociadb_sdk::Edge<serde_json::Value> =
+    client.get_edge("tenant-1", "products", "1").await?;
 client.delete_edge("tenant-1", "products", "1").await?;
 ```
 
@@ -375,8 +377,46 @@ client.delete_edge("tenant-1", "products", "1").await?;
 returning `serde_json::Value`; `get_node_as::<T>` deserializes into any
 `DeserializeOwned` type. `add_edge` fails with `NOT_FOUND` if either `from`
 or `to` does not already exist as a node — create both endpoint nodes
-first. Unlike `delete_document`/`delete_file`, `delete_edge` fails with
-`NOT_FOUND` if the edge does not exist; it is not idempotent.
+first, and see [Document Query Rules](#document-query-rules) for the
+`ALREADY_EXISTS` a duplicate `(from, label, to)` triplet produces. Like
+`delete_document` and `delete_file`, `delete_edge` is **idempotent**:
+deleting an edge that is not there succeeds and touches nothing.
+
+### Reading an edge back
+
+`get_edge` and `get_edge_as::<T>` are the only reads that return an edge's
+**properties**: `neighbors_out`/`neighbors_in` name the neighbor and the
+edge id only, so the JSON carried on a relation — a weight, a status, a
+date — has no other way back.
+
+Both return an [`Edge<T>`](#page-documentpage-neighborpage-and-edge) whose
+five fields are exactly the five `add_edge` takes, in the same orientation,
+so an edge read back feeds straight into a write:
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Belongs { weight: u32 }
+
+let edge: rociadb_sdk::Edge<Belongs> =
+    client.get_edge_as("tenant-1", "products", "1").await?;
+println!("{} -[{}]-> {} ({})", edge.from, edge.label, edge.to, edge.value.weight);
+
+client
+    .add_edge(
+        "tenant-1", "products", &edge.edge_id,
+        &edge.from, &edge.to, &edge.label,
+        &Belongs { weight: edge.value.weight + 1 },
+    )
+    .await?;
+```
+
+An unknown `edge_id` returns `NOT_FOUND`, as `get_node_as` does for a
+missing node. An edge id is scoped to one `(tenant_id, graph)` pair: the
+same id under another graph, or for another tenant, is a different edge and
+therefore absent. Properties come back in the shape they were written in,
+not as the bytes originally sent — the server normalizes JSON on write
+(object keys sorted, whitespace stripped). Unlike `get_node`, this read is
+not served from a server-side cache; every call reaches storage.
 
 ### Batch operations
 
@@ -427,7 +467,7 @@ writes that never landed actually happen.
 ### Neighbors
 
 `neighbors_out`/`neighbors_in` return one raw, single-page
-[`NeighborPage`](#page-documentpage-and-neighborpage) of graph edges —
+[`NeighborPage`](#page-documentpage-neighborpage-and-edge) of graph edges —
 `Neighbor { node_id, edge_id }` — following the pagination rules in
 [Pagination](#pagination):
 
@@ -657,8 +697,12 @@ Every listing RPC (`ListDoc`, `ListCollections`, `ListGraphs`,
   server has the final say (rejecting anything above its configured ceiling
   with `INVALID_ARGUMENT`).
 - When `limit` is `None`, the SDK sends **20** — note this is the SDK's own
-  default, not the server's own default of 50 when no `PageRequest` is sent
-  at all; the SDK always sends an explicit `PageRequest`.
+  default, not the server's own default of 50. `PageRequest.limit` is an
+  `optional` protobuf field, so leaving it off the wire is distinguishable
+  from an explicit `0` and is what makes the server apply its own default;
+  the SDK does not use that, and always sends an explicit `PageRequest`
+  with an explicit limit. The page size you get therefore never depends on
+  the server's configuration.
 - **`next_cursor` empty (`None` in this SDK's `Page`/`NeighborPage` types) is
   the only end-of-list signal.** A page can legitimately be short, or even
   completely empty, in the middle of a listing (for example, an index entry
@@ -695,7 +739,9 @@ re-checked client-side (except where noted), so they surface as
 | `search_documents` (`FindByField`) | `value` must serialize to a JSON **scalar** (a string, number, bool, or null) — `"active"`, `42`, `true`, `null`. An object or array is rejected with `INVALID_ARGUMENT`. |
 | `put_node`/`put_nodes` (`PutNode`) | `value` must serialize to a JSON **object**, never a scalar or an array. |
 | `add_edge`/`add_edges` (`AddEdge`) | Fails with `NOT_FOUND` if either `from` or `to` does not already exist as a node in the graph. Create both endpoint nodes first. |
-| `delete_edge`/`delete_edge_with_request_id` (`DeleteEdge`) | Fails with `NOT_FOUND` if the edge does not exist — **unlike** `delete_document`/`delete_file`, which are idempotent and succeed even when nothing was there to delete. |
+| `add_edge`/`add_edges` (`AddEdge`, uniqueness) | A `(from, label, to)` triplet names **at most one edge**: the adjacency index is keyed by the triplet and does not carry the edge id. A *second* edge over a triplet another edge already holds fails with `ALREADY_EXISTS`. Reusing the **same** `edge_id` over its own triplet is allowed and replaces its properties — which is what makes replaying a successful `add_edge` harmless. |
+| `delete_edge`/`delete_edge_with_request_id` (`DeleteEdge`) | **Idempotent**, like `delete_document`/`delete_file`: deleting an edge that is not there succeeds and touches nothing. No deletion in this API reports a missing target, so a wrong `edge_id` is not reported either — read the edge first (`get_edge`, `neighbors_out`, `neighbors_in`) when you need to know whether it existed. |
+| `get_edge`/`get_edge_as` (`GetEdge`) | Returns `NOT_FOUND` for an unknown `edge_id`. An edge id is scoped to one `(tenant_id, graph)` pair: the same id under another graph, or for another tenant, is a different edge and therefore absent. |
 | `query_documents` (`QueryDoc`, `Contains` operator) | Case-insensitive substring match, but a `Contains` term shorter than **3 characters is not indexable**. A query where *no* filter is indexable is refused with `INVALID_ARGUMENT` rather than served by a full scan — pair a short term with an `Eq` or `In` filter on another field. |
 | `list_documents` (`ListDoc`) vs `query_documents` (`QueryDoc`) | The `u64` total count returned alongside the results is **free** on `list_documents` (a maintained counter) but **costly** on `query_documents` (computed after full filtering). Prefer `list_documents` when there is nothing to filter, and never call `query_documents` in a loop just to get a count. |
 | `create_document`/`put_document`, `put_node`, `add_edge` (`json` payload) | The encoded JSON payload must not exceed the server's `limits.max_doc_bytes`, **2 MiB by default**. Larger payloads are rejected with `INVALID_ARGUMENT`. |
@@ -726,7 +772,7 @@ Two token scopes matter for this SDK:
   works normally, which is enough to build a full read-only exploration
   console.
 - **admin** — the scope used to create and rotate `rocia-idp` service
-  accounts through its own account-management API — is refused on **all 22
+  accounts through its own account-management API — is refused on **all 23
   RPCs**, reads included. It has no business talking to the data plane: an
   admin-scoped token calling any method on `RociaDbClient` gets
   `PERMISSION_DENIED`. If a *read* call unexpectedly returns
@@ -771,9 +817,10 @@ other error type with a blanket `From<E: std::error::Error>`).
 ## API Conventions
 
 Document reads deserialize directly to the requested type. For graph reads, use
-`get_node_as::<T>`, `get_outgoing_neighbor_nodes::<T>`, or
-`get_incoming_neighbor_nodes::<T>` for the same behavior. `get_node` remains a
-convenience method returning `serde_json::Value`.
+`get_node_as::<T>`, `get_edge_as::<T>`, `get_outgoing_neighbor_nodes::<T>`, or
+`get_incoming_neighbor_nodes::<T>` for the same behavior. `get_node` and
+`get_edge` remain convenience methods returning `serde_json::Value` (the
+latter inside an `Edge<serde_json::Value>`).
 
 ### Idempotency keys
 
@@ -821,7 +868,7 @@ then a `delete_document`, say) does not cancel or dedupe against each
 other. Idempotency markers expire after the server's `gc.request_ttl_secs`,
 **24 hours by default** — a replay after that window re-executes.
 
-### `Page`, `DocumentPage`, and `NeighborPage`
+### `Page`, `DocumentPage`, `NeighborPage`, and `Edge`
 
 Every listing method returns a named struct, never a bare tuple:
 `Page<T>` (`items`, `next_cursor`) when there is no total to
@@ -833,6 +880,13 @@ matched overall — `search_documents`, `list_documents`, and
 but with the field named `neighbors` instead of `items`, since it carries
 raw `Neighbor` records rather than a generic `T` — see
 [Neighbors](#neighbors).
+
+Single-item graph reads are named too: `get_edge`/`get_edge_as::<T>` return
+`Edge<T>` (`edge_id`, `from`, `to`, `label`, `value`), the five fields
+`add_edge` takes, so an edge read back round-trips into a write — see
+[Reading an edge back](#reading-an-edge-back). `edge_id` is echoed from the
+argument the read was made with; the server does not repeat it in the
+response.
 
 ### The `pb` module
 
@@ -848,9 +902,17 @@ those re-exports, not on paths reaching into `pb` directly.
 
 This SDK and the TypeScript SDK
 ([`rociadb-core-sdk-ts`](https://github.com/RociaDB/rociadb-core-sdk-ts))
-cover the same 22 RPCs against the same server, and are maintained to the
+cover the same 23 RPCs against the same server, and are maintained to the
 same standard: **every capability available in one is available in the
-other.** Neither imitates the other's syntax — this crate stays
+other.**
+
+> **Temporarily out of parity.** `GetEdge` is new in the upstream
+> `.proto`. It is wrapped here as `get_edge`/`get_edge_as`; the TypeScript
+> SDK does not expose it yet. This is a gap to close in
+> [`rociadb-core-sdk-ts`](https://github.com/RociaDB/rociadb-core-sdk-ts),
+> not a deliberate difference — remove this note once it ships there.
+
+Neither imitates the other's syntax — this crate stays
 snake_case/`Result`-idiomatic Rust, the TypeScript package stays
 camelCase/exception-idiomatic TypeScript — and the two languages'
 structural differences (ownership vs. garbage collection, exhaustive enum

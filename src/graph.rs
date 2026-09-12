@@ -2,8 +2,8 @@
 //! upserts with bounded concurrency, and paginated neighbor traversal.
 use crate::error::{JsonResultExt, StatusResultExt};
 use crate::pb::upstream::v1::{
-    AddEdgeRequest, DeleteEdgeRequest, GetNodeRequest, ListGraphsRequest, ListNodesRequest,
-    Neighbor, NeighborsInRequest, NeighborsOutRequest, PutNodeRequest,
+    AddEdgeRequest, DeleteEdgeRequest, GetEdgeRequest, GetNodeRequest, ListGraphsRequest,
+    ListNodesRequest, Neighbor, NeighborsInRequest, NeighborsOutRequest, PutNodeRequest,
 };
 use crate::{CONCURRENT_REQUESTS, Page, Result, RociaDbClient, non_empty, page_request};
 use futures::{StreamExt, TryStreamExt, stream};
@@ -24,6 +24,29 @@ pub struct NeighborPage {
 pub struct NeighborNode<T> {
     pub edge_id: String,
     pub node_id: String,
+    pub value: T,
+}
+
+/// One graph edge, endpoints and label included, with its properties
+/// decoded into `T`.
+///
+/// Returned by [`RociaDbClient::get_edge_as`] and
+/// [`RociaDbClient::get_edge`]. The five fields are exactly the five an
+/// [`RociaDbClient::add_edge`] call takes, in the same orientation, so an
+/// edge read back can be fed straight into a write without unwrapping
+/// anything: `value` carries the edge's own properties, never the envelope
+/// the server stores them in.
+///
+/// `edge_id` is echoed from the argument the read was made with — the
+/// server does not repeat it in the response — while `from`, `to`, `label`
+/// and `value` come from the server.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Edge<T> {
+    pub edge_id: String,
+    pub from: String,
+    pub to: String,
+    pub label: String,
     pub value: T,
 }
 
@@ -73,6 +96,51 @@ impl RociaDbClient {
         serde_json::from_slice(&response.json).decode_context("node json")
     }
 
+    /// Fetch one edge by id and decode its properties into the requested type.
+    ///
+    /// This is the only read that returns an edge's properties:
+    /// [`RociaDbClient::neighbors_out`] and
+    /// [`RociaDbClient::neighbors_in`] name the neighbor and the edge id
+    /// only, so the JSON carried on a relation — a weight, a status, a date
+    /// — has no other way back.
+    ///
+    /// The server returns `NOT_FOUND` for an unknown `edge_id`, just as
+    /// [`RociaDbClient::get_node_as`] does for a missing node. An edge id is
+    /// scoped to one `(tenant_id, graph)` pair: the same id under another
+    /// graph, or for another tenant, is a different edge and therefore
+    /// absent.
+    ///
+    /// The properties come back in the shape they were written in, not as
+    /// the bytes originally sent: the server normalizes JSON on write
+    /// (object keys sorted, whitespace stripped).
+    ///
+    /// Unlike [`RociaDbClient::get_node_as`], this read is not served from a
+    /// server-side cache — every call reaches storage.
+    pub async fn get_edge_as<T: DeserializeOwned>(
+        &self,
+        tenant_id: &str,
+        graph: &str,
+        edge_id: &str,
+    ) -> Result<Edge<T>> {
+        let mut upstream_graph = self.upstream_graph.clone();
+        let response = upstream_graph
+            .get_edge(GetEdgeRequest {
+                tenant_id: tenant_id.to_string(),
+                graph: graph.to_string(),
+                edge_id: edge_id.to_string(),
+            })
+            .await
+            .status_context("failed to get edge")?
+            .into_inner();
+        Ok(Edge {
+            edge_id: edge_id.to_string(),
+            from: response.from,
+            to: response.to,
+            label: response.label,
+            value: serde_json::from_slice(&response.json).decode_context("edge json")?,
+        })
+    }
+
     /// Create or replace one node using its complete node id (for example `product:42`).
     pub async fn put_node<T: Serialize + ?Sized>(
         &self,
@@ -115,11 +183,20 @@ impl RociaDbClient {
         Ok(())
     }
 
-    /// Create or replace one edge.
+    /// Create one edge, or replace the one `edge_id` already names.
     ///
     /// The server returns `NOT_FOUND` if `from` or `to` does not already
     /// exist as a node in `graph`: create both endpoint nodes before
     /// adding an edge between them.
+    ///
+    /// **A `(from, label, to)` triplet names at most one edge.** The
+    /// adjacency index is keyed by that triplet and does not carry the edge
+    /// id, so adding a *second* edge over a triplet another edge already
+    /// holds fails with `ALREADY_EXISTS`. Reusing the **same** `edge_id`
+    /// over its own triplet stays allowed and replaces its properties —
+    /// which is what makes replaying a successful `add_edge` harmless. A
+    /// known `edge_id` may also change endpoints or label: its former
+    /// adjacency is retracted in the same transaction.
     #[allow(clippy::too_many_arguments)]
     pub async fn add_edge<T: Serialize + ?Sized>(
         &self,
@@ -148,7 +225,9 @@ impl RociaDbClient {
     ///
     /// The server returns `NOT_FOUND` if `from` or `to` does not already
     /// exist as a node in `graph`: create both endpoint nodes before
-    /// adding an edge between them.
+    /// adding an edge between them. See [`RociaDbClient::add_edge`] for the
+    /// `(from, label, to)` uniqueness rule and the `ALREADY_EXISTS` it
+    /// produces.
     #[allow(clippy::too_many_arguments)]
     pub async fn add_edge_with_request_id<T: Serialize + ?Sized>(
         &self,
@@ -180,6 +259,16 @@ impl RociaDbClient {
     }
 
     /// Delete one edge with a caller-provided idempotency key.
+    ///
+    /// Deleting an edge that is not there is **not** an error: the call
+    /// succeeds and touches nothing, exactly like
+    /// [`RociaDbClient::delete_document`] and
+    /// [`RociaDbClient::delete_file`]. The cost of that is real — a caller
+    /// that got the `edge_id` wrong is no longer told so. Read the edge
+    /// first, with [`RociaDbClient::get_edge_as`],
+    /// [`RociaDbClient::neighbors_out`] or
+    /// [`RociaDbClient::neighbors_in`], when you need to know whether it
+    /// existed.
     pub async fn delete_edge_with_request_id(
         &self,
         tenant_id: &str,
@@ -424,7 +513,7 @@ mod tests {
         let page = page_request(None, None)
             .expect("page request should not fail")
             .expect("page should be present");
-        assert_eq!(page.limit, 20);
+        assert_eq!(page.limit, Some(20));
         assert!(page.cursor.is_empty());
         assert_eq!(non_empty(String::new()), None);
         assert_eq!(non_empty("next".into()).as_deref(), Some("next"));

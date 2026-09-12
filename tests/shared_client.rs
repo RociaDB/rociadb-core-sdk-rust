@@ -7,7 +7,7 @@
 //! have to compile.
 
 use rociadb_sdk::{
-    DocumentQueryFilter, DocumentQueryOperator, EdgeInput, NodeInput, Result, RociaDbClient,
+    DocumentQueryFilter, DocumentQueryOperator, Edge, EdgeInput, NodeInput, Result, RociaDbClient,
 };
 use std::sync::Arc;
 
@@ -18,7 +18,27 @@ async fn reads_through_an_arc(client: Arc<RociaDbClient>) -> Result<()> {
     let _ = client.list_graphs("tenant", None, None).await?;
     let _ = client.stat_file("tenant", "assets", "manual.txt").await?;
     let _ = client.list_tenants(None, None).await?;
+    let _: Edge<serde_json::Value> = client.get_edge("tenant", "catalog", "edge-1").await?;
+    let _: Edge<serde_json::Value> = client.get_edge_as("tenant", "catalog", "edge-1").await?;
     Ok(())
+}
+
+// An `Edge` read back carries exactly the five fields `add_edge` takes, so it
+// must be usable as the source of a write without restating any of them.
+#[allow(dead_code)]
+async fn an_edge_round_trips_into_a_write(client: Arc<RociaDbClient>) -> Result<()> {
+    let edge: Edge<serde_json::Value> = client.get_edge_as("tenant", "catalog", "edge-1").await?;
+    client
+        .add_edge(
+            "tenant",
+            "catalog",
+            &edge.edge_id,
+            &edge.from,
+            &edge.to,
+            &edge.label,
+            &edge.value,
+        )
+        .await
 }
 
 #[allow(dead_code)]

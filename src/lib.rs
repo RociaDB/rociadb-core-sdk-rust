@@ -61,8 +61,8 @@
 //! - [`mod@file`] — the option types for uploads ([`FileUploadOptions`],
 //!   [`FileStreamUploadOptions`]) and the chunking rules the wire contract
 //!   imposes.
-//! - [`graph`] — the page and node types returned by neighbor traversal
-//!   ([`NeighborPage`], [`NeighborNode`]).
+//! - [`graph`] — the edge, page and node types graph reads return
+//!   ([`Edge`], [`NeighborPage`], [`NeighborNode`]).
 //!
 //! # Stability
 //!
@@ -87,7 +87,7 @@ mod tenant;
 
 pub use error::{Result, RociaDbError};
 pub use file::{FileStreamUploadOptions, FileUploadOptions};
-pub use graph::{NeighborNode, NeighborPage};
+pub use graph::{Edge, NeighborNode, NeighborPage};
 /// Generated protobuf types that appear directly in a public method signature,
 /// re-exported here so callers can name them without depending on the crate's
 /// private `pb` module. The stability caveat in the crate documentation applies
@@ -244,6 +244,13 @@ pub struct DocumentPage<T> {
 /// (`limits.max_page_size`, 200 by default) is intentionally not
 /// duplicated here — it is configurable server-side, so any positive limit
 /// is forwarded unchanged and the server has the final say.
+///
+/// `PageRequest::limit` is an `optional` protobuf field, so leaving it
+/// unset is distinguishable on the wire from an explicit `0` and makes the
+/// server apply its own default (50). The SDK does not use that: it always
+/// sends an explicit limit, [`DEFAULT_PAGE_SIZE`] when the caller gave
+/// none, so the page size a caller gets never depends on the server's
+/// configuration.
 pub(crate) fn page_request(
     limit: Option<u32>,
     cursor: Option<&str>,
@@ -254,7 +261,7 @@ pub(crate) fn page_request(
         ));
     }
     Ok(Some(PageRequest {
-        limit: limit.unwrap_or(DEFAULT_PAGE_SIZE),
+        limit: Some(limit.unwrap_or(DEFAULT_PAGE_SIZE)),
         cursor: cursor.unwrap_or_default().to_string(),
     }))
 }
@@ -375,7 +382,7 @@ pub struct NodeInput {
     /// `PutNode` call always carries the same default prefix regardless of
     /// which path produced it). Provide it explicitly — and reuse the same
     /// value on a retry — so a batch replayed after a timeout resumes
-    /// safely: the server deduplicates on `(tenant, operation,
+    /// safely: the server deduplicates on `(tenant, operation, target,
     /// request_id)`, so a repeated `request_id` is recognized as the same
     /// write rather than a new one.
     pub request_id: Option<String>,
@@ -1340,9 +1347,9 @@ impl RociaDbClient {
     /// which items had already succeeded. To resume after a failure, replay
     /// the same `nodes` sequence with the same [`NodeInput::request_id`]
     /// values you used the first time — the server deduplicates on
-    /// `(tenant, operation, request_id)`, so already-applied writes are
-    /// recognized and skipped rather than reapplied, and only the writes
-    /// that never landed actually happen.
+    /// `(tenant, operation, target, request_id)`, so already-applied writes
+    /// are recognized and skipped rather than reapplied, and only the
+    /// writes that never landed actually happen.
     pub async fn put_nodes(
         &self,
         tenant_id: &str,
@@ -1441,6 +1448,45 @@ impl RociaDbClient {
         Ok(value)
     }
 
+    /// Fetch an edge by id, with its properties as a `serde_json::Value`.
+    ///
+    /// The convenience counterpart of
+    /// [`RociaDbClient::get_edge_as`], which decodes into a type of your
+    /// choosing; see it for what the read guarantees and what `NOT_FOUND`
+    /// means here.
+    pub async fn get_edge(
+        &self,
+        tenant_id: &str,
+        graph_name: &str,
+        edge_id: &str,
+    ) -> Result<Edge<Value>> {
+        debug!(
+            tenant_id = tenant_id,
+            graph = graph_name,
+            edge_id = edge_id,
+            "loading graph edge"
+        );
+        let edge = self
+            .get_edge_as(tenant_id, graph_name, edge_id)
+            .await
+            .inspect_err(|error| {
+                error!(
+                    tenant_id = tenant_id,
+                    graph = graph_name,
+                    edge_id = edge_id,
+                    error = %error,
+                    "failed to load graph edge"
+                );
+            })?;
+        debug!(
+            tenant_id = tenant_id,
+            graph = graph_name,
+            edge_id = edge_id,
+            "graph edge loaded"
+        );
+        Ok(edge)
+    }
+
     /// Upsert a batch of edges with bounded concurrency (at most 10
     /// `AddEdge` calls in flight at once). `edges` is consumed in the order
     /// the caller provides — duplicate `edge_id`s are **not** merged, both
@@ -1448,16 +1494,19 @@ impl RociaDbClient {
     ///
     /// The server returns `NOT_FOUND` for any edge whose `from` or `to`
     /// node does not already exist in `graph_name`: create both endpoint
-    /// nodes before adding an edge between them.
+    /// nodes before adding an edge between them. It returns
+    /// `ALREADY_EXISTS` for any edge that would be a *second* one over a
+    /// `(from, label, to)` triplet another edge already holds — see
+    /// [`RociaDbClient::add_edge`].
     ///
     /// **This batch is not atomic and stops at the first error**: on
     /// failure, in-flight requests are cancelled and the error does not say
     /// which items had already succeeded. To resume after a failure, replay
     /// the same `edges` sequence with the same [`EdgeInput::request_id`]
     /// values you used the first time — the server deduplicates on
-    /// `(tenant, operation, request_id)`, so already-applied writes are
-    /// recognized and skipped rather than reapplied, and only the writes
-    /// that never landed actually happen.
+    /// `(tenant, operation, target, request_id)`, so already-applied writes
+    /// are recognized and skipped rather than reapplied, and only the
+    /// writes that never landed actually happen.
     pub async fn add_edges(
         &self,
         tenant_id: &str,
@@ -1511,6 +1560,11 @@ impl RociaDbClient {
     }
 
     /// Delete an edge by id.
+    ///
+    /// **Idempotent**: deleting an `edge_id` that does not exist succeeds
+    /// rather than returning `NOT_FOUND`. See
+    /// [`RociaDbClient::delete_edge_with_request_id`] for what that costs a
+    /// caller who wanted to be told.
     pub async fn delete_edge(
         &self,
         tenant_id: &str,

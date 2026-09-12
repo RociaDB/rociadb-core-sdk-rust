@@ -38,8 +38,9 @@ tonic-prost = "0.14.2"
 tracing = "0.1"
 uuid = { version = "1.19.0", features = ["v4"] }
 
-# `build.rs` only calls `tonic_prost_build::configure()`. The prost and tonic
-# runtime crates the generated code links against are regular dependencies
-# above, not build dependencies.
+# `build.rs` only reaches for `tonic_prost_build` — including the
+# `prost_build::Config` it re-exports, which is why `prost-build` itself does
+# not need to be listed here. The prost and tonic runtime crates the generated
+# code links against are regular dependencies above, not build dependencies.
 [build-dependencies]
 tonic-prost-build = { version = "0.14.2" }

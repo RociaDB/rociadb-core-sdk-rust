@@ -4,8 +4,19 @@ package rocia.v1;
 
 import "google/protobuf/empty.proto";
 
+// `request_id` : identifiant d'idempotence optionnel, porté par les 7 RPC
+// d'écriture. Un rejeu séquentiel qui reprend le même identifiant, la même
+// opération et la même cible est absorbé et répond Ok. La portée inclut la
+// cible : réutiliser un identifiant sur deux documents, deux arêtes ou deux
+// fichiers exécute bien les deux écritures. Les marqueurs expirent après
+// gc.request_ttl_secs (24 h par défaut).
+
 message PageRequest {
-  uint32 limit = 1;
+  // `optional` pour retrouver la présence de champ : un client qui ne renseigne
+  // que le curseur n'envoie pas `limit`, et doit recevoir le défaut (50) — pas
+  // une erreur. Sans cela, ce « non renseigné » arrivait comme 0 et devenait
+  // indiscernable d'un 0 écrit à la main, qui reste une erreur.
+  optional uint32 limit = 1;
   string cursor = 2;
 }
 
@@ -84,6 +95,15 @@ message QueryDocRequest {
   PageRequest page = 5;
 }
 
+// `total_count` décrit le même instant que la page qu'il accompagne : les deux
+// sont prélevés sur un état unique du store (une transaction sur tikv, un
+// instantané RocksDB, une seule section critique en mémoire). Une page peuplée
+// dont le total ne compte pas les documents n'est donc pas un état possible.
+// Rien n'est promis en revanche d'un appel à l'autre.
+//
+// Trois listages seulement portent ce champ — FindByField, ListDoc, QueryDoc —
+// et ListCollections porte un compte par collection. Les sept autres n'ont
+// aucun total : voir ListBucketsResponse.
 message FindByFieldResponse {
   repeated bytes json = 1;
   PageResponse page = 2;
@@ -116,6 +136,13 @@ message ListBucketsRequest {
   PageRequest page = 2;
 }
 
+// Pas de total, ici ni sur ListFiles, ListGraphs, ListNodes, ListTenants,
+// NeighborsOut et NeighborsIn — et ce n'est pas un champ oublié sur le fil : la
+// couche stockage ne tient aucun compteur de buckets, de fichiers, de graphes,
+// de nœuds, de tenants ni d'arêtes, là où le total de ListDoc se contente de
+// lire le compteur de collection qui existe déjà pour ListCollections. Un
+// client qui veut un total pagine jusqu'à ce que next_cursor soit vide, en
+// comptant. Voir docs/api/rpc-reference.md, « Quels listages rendent un total ».
 message ListBucketsResponse {
   repeated string buckets = 1;
   PageResponse page = 2;
@@ -186,6 +213,10 @@ message GetNodeResponse {
   bytes json = 1;
 }
 
+// Un triplet (from, label, to) désigne au plus une arête : l'index d'adjacence
+// est indexé par ce triplet et ne porte pas l'edge_id. Ajouter une seconde
+// arête sur un triplet déjà pris échoue en ALREADY_EXISTS ; réutiliser le même
+// edge_id sur son propre triplet reste permis et remplace ses propriétés.
 message AddEdgeRequest {
   string tenant_id = 1;
   string graph = 2;
@@ -197,6 +228,27 @@ message AddEdgeRequest {
   string request_id = 8;
 }
 
+message GetEdgeRequest {
+  string tenant_id = 1;
+  string graph = 2;
+  string edge_id = 3;
+}
+
+// Le pendant lisible d'AddEdge : les mêmes champs, dans le même sens. `json`
+// rend les propriétés seules — pas l'enveloppe qui les stocke — pour qu'un
+// GetEdge puisse alimenter un AddEdge sans les emballer une seconde fois. Sa
+// forme est normalisée à l'écriture (clés d'objet triées, espaces supprimés) :
+// le json rendu est celui écrit, pas ses octets d'origine.
+message GetEdgeResponse {
+  string from = 1;
+  string to = 2;
+  string label = 3;
+  bytes json = 4;
+}
+
+// Supprimer une arête absente n'est pas une erreur : la suppression est
+// idempotente, comme DeleteDoc et Delete. Un client qui a besoin de savoir si
+// l'arête existait passe par GetEdge, NeighborsOut ou NeighborsIn.
 message DeleteEdgeRequest {
   string tenant_id = 1;
   string graph = 2;
@@ -217,6 +269,8 @@ message Neighbor {
   string edge_id = 2;
 }
 
+// Sans total, comme les autres listages non documentaires : voir
+// ListBucketsResponse.
 message NeighborsOutResponse {
   repeated Neighbor neighbors = 1;
   PageResponse page = 2;
@@ -235,6 +289,12 @@ message NeighborsInResponse {
   PageResponse page = 2;
 }
 
+// Le remplacement d'un file_id existant est atomique : l'envoi écrit dans sa
+// propre génération et ne touche jamais les morceaux de la version publiée. Un
+// Download qui commence avant le commit sert l'ancienne version entière, un qui
+// commence après sert la nouvelle entière ; un Download déjà en vol continue de
+// servir celle avec laquelle il a commencé. Un envoi interrompu ne laisse donc
+// jamais de version mélangée.
 message UploadRequest {
   string tenant_id = 1;
   string bucket = 2;
@@ -270,6 +330,10 @@ message StatResponse {
   string updated_at = 5;
 }
 
+// Supprimer un fichier absent n'est pas une erreur. Un file_id jamais validé
+// compte comme absent — il est déjà invisible de Stat, Download et ListFiles.
+// Un envoi en cours n'est jamais effacé : la suppression n'emporte que la
+// version publiée, et un envoi écrit dans sa propre génération.
 message DeleteRequest {
   string tenant_id = 1;
   string bucket = 2;
@@ -291,6 +355,7 @@ service GraphService {
   rpc PutNode(PutNodeRequest) returns (google.protobuf.Empty);
   rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
   rpc AddEdge(AddEdgeRequest) returns (google.protobuf.Empty);
+  rpc GetEdge(GetEdgeRequest) returns (GetEdgeResponse);
   rpc DeleteEdge(DeleteEdgeRequest) returns (google.protobuf.Empty);
   rpc NeighborsOut(NeighborsOutRequest) returns (NeighborsOutResponse);
   rpc NeighborsIn(NeighborsInRequest) returns (NeighborsInResponse);
