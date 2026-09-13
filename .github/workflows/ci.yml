@@ -13,10 +13,16 @@ env:
 # No protobuf compiler is installed anywhere in this file on purpose: the build
 # script compiles the `.proto` with `protox`, a pure-Rust compiler, so a bare
 # Rust toolchain is all any job needs.
+#
+# Every job runs on the organisation's self-hosted runner, selected by the
+# label set below (all labels must match). The runner ships a Rust toolchain
+# managed by rustup and Node.js (needed by the JavaScript-based actions), which
+# is what `dtolnay/rust-toolchain` relies on to select or install the exact
+# toolchain each job asks for.
 jobs:
   fmt:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, node, rust]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -26,7 +32,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, node, rust]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,7 +43,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, node, rust]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -46,7 +52,7 @@ jobs:
 
   docs:
     name: Docs
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, node, rust]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -57,7 +63,7 @@ jobs:
 
   msrv:
     name: MSRV 1.88
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, node, rust]
     steps:
       - uses: actions/checkout@v4
       # Must match `rust-version` in Cargo.toml. `--locked` is what makes this
@@ -69,7 +75,7 @@ jobs:
 
   deny:
     name: cargo-deny
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, node, rust]
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
