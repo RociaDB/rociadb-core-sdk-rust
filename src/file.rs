@@ -30,6 +30,18 @@ const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB.
 /// Server-side max file size (`limits.max_file_bytes`, 5 GiB default).
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
+/// Ceiling on the buffer [`RociaDbClient::download_file_verified`]
+/// pre-allocates from the `size_bytes` the server reported.
+///
+/// The size is the server's word, not a measurement, so allocating it blindly
+/// would let a compromised or simply buggy server make the client reserve
+/// gigabytes before a single byte of the file has arrived. 64 MiB is large
+/// enough that every realistic file is allocated exactly once, and small
+/// enough to be an unremarkable allocation if the number is nonsense; a file
+/// genuinely larger than this just grows its buffer while streaming, the same
+/// way [`RociaDbClient::download_file`] always does.
+pub(crate) const MAX_PREALLOCATED_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Default MIME type recorded for a file whose uploader did not name one.
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 
@@ -408,10 +420,14 @@ impl RociaDbClient {
     /// protection you get is whatever the transport itself already provides
     /// (TLS and HTTP/2 framing catch corruption or truncation in transit),
     /// which says nothing about whether the bytes stored on the server still
-    /// match what was originally uploaded. If you need that end-to-end
-    /// guarantee, call [`RociaDbClient::stat_file`] yourself and compare
-    /// its `checksum` against a SHA-256 digest you compute over the
-    /// downloaded bytes — this crate does not do that comparison for you.
+    /// match what was originally uploaded.
+    ///
+    /// [`RociaDbClient::download_file_verified`] closes that gap for a file
+    /// that fits in memory: it stats first, hashes while it streams, and
+    /// fails rather than returning bytes that disagree with the metadata.
+    /// Streaming callers who cannot buffer the file do the same thing
+    /// themselves — hash each chunk as it arrives and compare the digest
+    /// against [`RociaDbClient::stat_file`]'s `checksum` at the end.
     ///
     /// [`RociaDbBuilder::request_timeout`](crate::RociaDbBuilder::request_timeout)
     /// does **not** apply here, nor to [`RociaDbClient::download_file`]: how
@@ -449,9 +465,9 @@ impl RociaDbClient {
     /// method's docs for the full asymmetry with the upload path: no
     /// checksum is computed or checked here either, so a file that was
     /// corrupted or truncated in storage is still returned successfully,
-    /// with its bad bytes intact and no error raised. Verify integrity
-    /// yourself with [`RociaDbClient::stat_file`] if that matters for your
-    /// use case.
+    /// with its bad bytes intact and no error raised. Use
+    /// [`RociaDbClient::download_file_verified`] when the bytes have to be
+    /// checked against the metadata the server recorded for them.
     pub async fn download_file(
         &self,
         tenant_id: &str,
@@ -468,6 +484,127 @@ impl RociaDbClient {
             .status_context("file download stream failed")?
         {
             bytes.extend_from_slice(&response.chunk);
+        }
+        Ok(bytes)
+    }
+
+    /// Download a complete file into memory and check it against the
+    /// metadata the server recorded for it.
+    ///
+    /// The verifying counterpart of [`RociaDbClient::download_file`]. It
+    /// calls [`RociaDbClient::stat_file`] first, streams the download while
+    /// feeding every chunk to a SHA-256 hasher, and only then hands the
+    /// buffer back — after checking both the byte count against
+    /// [`StatResponse::size_bytes`] and the digest against
+    /// [`StatResponse::checksum`]. A file whose stored bytes have been
+    /// corrupted or truncated therefore fails here instead of being returned
+    /// as if nothing were wrong.
+    ///
+    /// # What this proves, and what it does not
+    ///
+    /// **The server never verified the uploader's checksum.** It checks that
+    /// the value is 32 bytes long and stores it; it never hashes the bytes it
+    /// received to confirm the two agree (see
+    /// [`StatResponse::checksum`] and
+    /// [`RociaDbClient::upload_file_stream`]). So a match here proves the
+    /// bytes you just received are the bytes the uploader *declared* — it
+    /// catches storage corruption, a truncated transfer, and a partially
+    /// overwritten file, and it does not catch an uploader that sent a
+    /// checksum which never matched its own payload. End-to-end integrity
+    /// against a source you do not control needs a digest carried out of
+    /// band, not this.
+    ///
+    /// Nothing is checked atomically with the download either: `stat_file`
+    /// and the download are two calls, so a file replaced between them is
+    /// read as a mismatch rather than as the new version. Replacement is
+    /// atomic server-side (see [`UploadRequest::file_id`](crate::UploadRequest)),
+    /// so the mismatch is the worst case — never a mixed file.
+    ///
+    /// # Errors
+    ///
+    /// [`RociaDbError::SizeMismatch`] when the byte count disagrees with
+    /// `size_bytes` (checked first: a truncated stream fails both checks, and
+    /// the byte count is the more actionable report), then
+    /// [`RociaDbError::ChecksumMismatch`] when the digest disagrees with the
+    /// stored checksum — including when that checksum is not a 32-byte
+    /// SHA-256 digest at all, since the comparison is over raw bytes.
+    /// Otherwise whatever [`RociaDbClient::stat_file`] and
+    /// [`RociaDbClient::download_file_stream`] return: `NOT_FOUND` for an
+    /// unknown `file_id`, and so on.
+    ///
+    /// # Memory
+    ///
+    /// The whole file is buffered, like [`RociaDbClient::download_file`]. The
+    /// buffer is pre-allocated from the size `stat_file` reported, capped at
+    /// 64 MiB, so a server reporting an absurd `size_bytes` cannot make the
+    /// client reserve gigabytes before a single byte has arrived; a genuinely
+    /// larger file simply grows the buffer as it streams, exactly as
+    /// `download_file` does.
+    ///
+    /// [`RociaDbBuilder::request_timeout`](crate::RociaDbBuilder::request_timeout)
+    /// covers the `stat_file` call (a unary RPC) but not the download stream,
+    /// as everywhere else on this client.
+    pub async fn download_file_verified(
+        &self,
+        tenant_id: &str,
+        bucket: &str,
+        file_id: &str,
+    ) -> Result<Vec<u8>> {
+        let stat = self.stat_file(tenant_id, bucket, file_id).await?;
+        debug!(
+            tenant_id = tenant_id,
+            bucket = bucket,
+            file_id = file_id,
+            size_bytes = stat.size_bytes,
+            "downloading file with verification"
+        );
+
+        // Never trust `size_bytes` with an allocation: it is a number the
+        // server chose, and `Vec::with_capacity` would reserve it up front.
+        let capacity = usize::try_from(stat.size_bytes.min(MAX_PREALLOCATED_DOWNLOAD_BYTES))
+            .unwrap_or(usize::MAX);
+        let mut bytes = Vec::with_capacity(capacity);
+        let mut hasher = Sha256::new();
+
+        let mut stream = self
+            .download_file_stream(tenant_id, bucket, file_id)
+            .await?;
+        while let Some(response) = stream
+            .message()
+            .await
+            .status_context("file download stream failed")?
+        {
+            // Hashed incrementally as the chunks arrive: a second pass over
+            // the assembled buffer would read the whole file twice for no
+            // gain.
+            hasher.update(&response.chunk);
+            bytes.extend_from_slice(&response.chunk);
+            // Stop as soon as the stream overshoots the size the metadata
+            // announced, rather than draining an arbitrarily long stream
+            // into memory only to reject it at the end: the outcome is the
+            // same mismatch, but the buffer never grows past `size_bytes`
+            // plus one chunk.
+            if bytes.len() as u64 > stat.size_bytes {
+                return Err(RociaDbError::SizeMismatch {
+                    expected: stat.size_bytes,
+                    actual: bytes.len() as u64,
+                });
+            }
+        }
+
+        let actual_size = bytes.len() as u64;
+        if actual_size != stat.size_bytes {
+            return Err(RociaDbError::SizeMismatch {
+                expected: stat.size_bytes,
+                actual: actual_size,
+            });
+        }
+        let digest: [u8; 32] = hasher.finalize().into();
+        if digest.as_slice() != stat.checksum.as_slice() {
+            return Err(RociaDbError::ChecksumMismatch {
+                expected: stat.checksum,
+                actual: digest.to_vec(),
+            });
         }
         Ok(bytes)
     }
@@ -964,8 +1101,9 @@ where
 mod tests {
     use super::{
         DEFAULT_CHUNK_SIZE, FileStreamUploadOptions, FileUploadOptions, MAX_FILE_BYTES,
-        RechunkState, chunk_upload_requests, default_upload_file_request_id,
-        rechunk_upload_requests, resolve_checksum, validate_file_size,
+        MAX_PREALLOCATED_DOWNLOAD_BYTES, RechunkState, chunk_upload_requests,
+        default_upload_file_request_id, rechunk_upload_requests, resolve_checksum,
+        validate_file_size,
     };
     use crate::RociaDbError;
     use crate::pb::upstream::v1::UploadRequest;
@@ -1191,6 +1329,27 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex pair"))
             .collect()
+    }
+
+    #[test]
+    fn the_verified_download_preallocation_is_capped_well_below_the_file_size_limit() {
+        // The point of the cap: `download_file_verified` reserves
+        // `min(size_bytes, cap)` up front, so the biggest allocation a
+        // server can provoke with a made-up `size_bytes` is the cap — not
+        // the 5 GiB a file is actually allowed to reach, and not the 2^64
+        // an unchecked `u64` would allow.
+        assert_eq!(MAX_PREALLOCATED_DOWNLOAD_BYTES, 64 * 1024 * 1024);
+        const {
+            assert!(MAX_PREALLOCATED_DOWNLOAD_BYTES < MAX_FILE_BYTES);
+        }
+        for reported in [0, 1, 4096, MAX_PREALLOCATED_DOWNLOAD_BYTES, u64::MAX] {
+            let capacity = usize::try_from(reported.min(MAX_PREALLOCATED_DOWNLOAD_BYTES))
+                .unwrap_or(usize::MAX);
+            assert!(
+                capacity as u64 <= MAX_PREALLOCATED_DOWNLOAD_BYTES,
+                "a reported size of {reported} must never reserve more than the cap"
+            );
+        }
     }
 
     #[test]

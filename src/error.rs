@@ -49,6 +49,14 @@ pub type Result<T> = std::result::Result<T, RociaDbError>;
 /// fixing the network or the server, a `Validation` error by changing the
 /// arguments of one call.
 ///
+/// Two more variants carry no status for a different reason: the call
+/// succeeded and the *data* it returned is wrong.
+/// [`RociaDbError::ChecksumMismatch`] and [`RociaDbError::SizeMismatch`] are
+/// raised only by
+/// [`download_file_verified`](crate::RociaDbClient::download_file_verified),
+/// which is the one call in this SDK that checks what it downloaded against
+/// what [`stat_file`](crate::RociaDbClient::stat_file) says.
+///
 /// New variants may be added in a minor release: match on this enum with a
 /// wildcard arm to stay forward-compatible.
 #[non_exhaustive]
@@ -169,6 +177,68 @@ pub enum RociaDbError {
     /// [`RociaDbError::Config`].
     #[error("{0}")]
     Validation(String),
+
+    /// A downloaded file's SHA-256 digest does not match the checksum
+    /// [`stat_file`](crate::RociaDbClient::stat_file) reported for it.
+    ///
+    /// Produced by [`download_file_verified`](crate::RociaDbClient::download_file_verified)
+    /// and by nothing else — no other call in this SDK verifies a download.
+    /// It means the bytes served differ from what the uploader declared when
+    /// the file was written: storage corruption, a partial overwrite, or an
+    /// upload whose declared checksum never matched its own bytes in the
+    /// first place (the server records the uploader's checksum without
+    /// checking it — see [`StatResponse::checksum`](crate::StatResponse)).
+    /// Retrying changes nothing on its own.
+    ///
+    /// Both digests are carried raw rather than hex-encoded, so a caller can
+    /// compare or store them without decoding; [`Display`](std::fmt::Display)
+    /// renders them as lowercase hex.
+    #[error(
+        "downloaded file failed SHA-256 verification: the server reported {} but the bytes \
+         received hash to {}",
+        hex(.expected),
+        hex(.actual)
+    )]
+    ChecksumMismatch {
+        /// Digest [`stat_file`](crate::RociaDbClient::stat_file) reported for
+        /// the file, exactly as stored (normally 32 bytes, but the server
+        /// never promises a length on read).
+        expected: Vec<u8>,
+        /// SHA-256 digest actually computed over the bytes received, always
+        /// 32 bytes.
+        actual: Vec<u8>,
+    },
+
+    /// A downloaded file's byte count does not match the `size_bytes`
+    /// [`stat_file`](crate::RociaDbClient::stat_file) reported for it.
+    ///
+    /// Produced by [`download_file_verified`](crate::RociaDbClient::download_file_verified)
+    /// and by nothing else. A short count usually means a truncated download
+    /// stream; a long one means the stored file grew past what the metadata
+    /// records. It is checked before the digest, because "the file is the
+    /// wrong length" is the more actionable of the two reports a truncated
+    /// transfer would produce.
+    #[error("downloaded file is {actual} bytes but the server reported {expected}")]
+    SizeMismatch {
+        /// Size [`stat_file`](crate::RociaDbClient::stat_file) reported.
+        expected: u64,
+        /// Number of bytes actually received.
+        actual: u64,
+    },
+}
+
+/// Render a digest as lowercase hex for the [`Display`](std::fmt::Display)
+/// output of [`RociaDbError::ChecksumMismatch`], which carries its two
+/// digests as raw bytes so a caller never has to decode them.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut rendered, byte| {
+        // Writing into a `String` is infallible, so the `Result` cannot be
+        // anything but `Ok` — and `write!` is what avoids one allocation per
+        // byte.
+        let _ = write!(rendered, "{byte:02x}");
+        rendered
+    })
 }
 
 /// Renders `": {source}"` when a cause is present, or an empty string when
@@ -676,6 +746,52 @@ mod tests {
             message.len() > "invalid upstream host".len(),
             "Display must fold in the cause, got: {message}"
         );
+    }
+
+    #[test]
+    fn checksum_mismatch_renders_both_digests_as_lowercase_hex() {
+        let error = RociaDbError::ChecksumMismatch {
+            expected: vec![0x00, 0x0f, 0xa0, 0xff],
+            actual: vec![0xde, 0xad, 0xbe, 0xef],
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("000fa0ff"),
+            "the stored digest must be readable as hex, got: {message}"
+        );
+        assert!(
+            message.contains("deadbeef"),
+            "the computed digest must be readable as hex, got: {message}"
+        );
+        // An integrity failure is not a gRPC status: the call itself
+        // succeeded and it is the bytes that are wrong.
+        assert_eq!(error.code(), None);
+        assert_eq!(error.reason(), None);
+        assert!(!error.is_not_found());
+    }
+
+    #[test]
+    fn hex_pads_every_byte_to_two_digits_and_renders_an_empty_digest_as_nothing() {
+        // A one-digit rendering of a byte below 0x10 would silently corrupt
+        // the whole digest by shifting every later character.
+        assert_eq!(hex(&[0x00, 0x01, 0x0a, 0x10, 0xff]), "00010a10ff");
+        assert_eq!(hex(&[]), "");
+        assert_eq!(hex(&[0xab; 32]).len(), 64, "32 bytes render as 64 chars");
+    }
+
+    #[test]
+    fn size_mismatch_names_both_counts() {
+        let error = RociaDbError::SizeMismatch {
+            expected: 4096,
+            actual: 4095,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("4096") && message.contains("4095"),
+            "both byte counts must be readable, got: {message}"
+        );
+        assert_eq!(error.code(), None);
+        assert!(error.status().is_none());
     }
 
     #[test]

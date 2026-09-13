@@ -13,11 +13,15 @@ all-features = true
 ignore = []
 
 [licenses]
-# Licences actually present in the dependency graph, all permissive. A dual or
-# multi-licensed crate only needs one side of its SPDX expression allowed, so
-# this list is the minimum that satisfies every crate:
+# Licences actually present in the dependency graph — development dependencies
+# included, since cargo-deny walks those too — all permissive. A dual or
+# multi-licensed crate only needs one side of its SPDX expression allowed
+# (an `OR`), while an `AND` needs both, so this list is the minimum that
+# satisfies every crate:
 #   - Apache-2.0 / MIT: the overwhelming majority, and this crate's own licence
-#   - BSD-3-Clause: `subtle`, which offers nothing else
+#   - BSD-3-Clause: `subtle`, which offers nothing else, and one side of
+#     `matchit`'s "MIT AND BSD-3-Clause" (a dev-only crate, reached through the
+#     `tonic` server/router feature stack the integration tests build with)
 #   - ISC: `ring` (Apache-2.0 AND ISC), `untrusted`, `rustls-webpki`
 #   - Unicode-3.0: the `icu_*` crates reached through reqwest -> url -> idna
 #   - Zlib: `foldhash`, which offers nothing else

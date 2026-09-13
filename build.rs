@@ -1,4 +1,5 @@
-//! Build script: generates the gRPC client code from `proto/`.
+//! Build script: generates the gRPC client code from `proto/`, plus the
+//! server stubs the integration tests run their in-process server on.
 //!
 //! The `.proto` is compiled by `protox`, a pure-Rust protobuf compiler, so
 //! building this crate needs no `protoc` binary and no system include
@@ -6,6 +7,15 @@
 //! and in CI. `protox` also carries its own copy of the Google well-known
 //! types (`google/protobuf/empty.proto` is the only one `upstream.proto`
 //! imports), which is why none of them are vendored here.
+
+use std::path::PathBuf;
+
+/// Subdirectory of `OUT_DIR` the second codegen pass writes to. The
+/// integration tests pick the result up with
+/// `include!(concat!(env!("OUT_DIR"), "/test_server/rocia.v1.rs"))` — `OUT_DIR`
+/// is set for every target of a package that has a build script, integration
+/// tests included.
+const TEST_SERVER_OUT_DIR: &str = "test_server";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `include_source_info(false)` strips `SourceCodeInfo` from the descriptor
@@ -32,20 +42,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open_files(["proto/upstream/v1/upstream.proto"])?
         .file_descriptor_set();
 
-    let mut builder = tonic_prost_build::configure()
-        // This SDK is a gRPC client; nothing in `src/` uses a server API, and
-        // `tonic` itself is built without its server feature stack.
-        .build_server(false)
-        .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
+    // Pass 1 — the library's own code, at the root of `OUT_DIR`, included by
+    // `src/pb.rs`. Client only: nothing in `src/` uses a server API, and
+    // `tonic` itself is a regular dependency without its server feature stack,
+    // so a generated `*Server` type would not even compile for a consumer.
+    documented(tonic_prost_build::configure().build_server(false))
+        .compile_fds(file_descriptor_set.clone())?;
 
-    for (path, doc) in DOCS {
-        builder = builder.type_attribute(path, doc_attribute(doc));
-    }
-    for (path, doc) in FIELD_DOCS {
-        builder = builder.field_attribute(path, doc_attribute(doc));
-    }
-
-    builder.compile_fds(file_descriptor_set)?;
+    // Pass 2 — the mirror image, in `$OUT_DIR/test_server/`: server stubs and
+    // no client. `tests/support/mod.rs` includes it to implement all four
+    // services in-process, so the integration tests exercise the real client
+    // path (builder -> channel -> interceptor -> generated client -> `unary`
+    // -> decoding) against a real gRPC server over a loopback socket, with no
+    // external service and no `protoc`.
+    //
+    // Why a second pass rather than one `build_server(true)` pass shared by
+    // both: the generated server code names `tonic::transport::Server`'s
+    // supporting types, which only exist when `tonic` is built with its
+    // `server` feature. That feature is enabled by the `tonic` entry in
+    // `[dev-dependencies]` and therefore only when tests are built — so
+    // server code emitted into the library's own module would break every
+    // consumer's `cargo build`. Keeping the two passes apart also keeps the
+    // library's public surface exactly what it was: `src/pb.rs` includes only
+    // the client file, and the message types are generated twice into two
+    // separate modules rather than shared.
+    //
+    // What a consumer pays for a pass whose output they never compile: one
+    // more prost/tonic codegen run over a single 380-line `.proto`, and ~100 KB
+    // written under `target/`. The whole build script — the `protox` compile
+    // and both passes — measures around 150 ms, so this is a few tens of
+    // milliseconds once per `cargo build` of this crate, against a `tonic` and
+    // `prost` build that takes seconds. The `.proto` itself is compiled once
+    // either way: the `FileDescriptorSet` is cloned, not recompiled. Nothing
+    // here reaches the network, and nothing is written outside `OUT_DIR`.
+    // Nothing is *compiled* for a consumer either — the generated file is only
+    // ever included by `tests/support/mod.rs`.
+    let test_server_out_dir = PathBuf::from(std::env::var("OUT_DIR")?).join(TEST_SERVER_OUT_DIR);
+    // prost-build writes into this directory but never creates it.
+    std::fs::create_dir_all(&test_server_out_dir)?;
+    documented(
+        tonic_prost_build::configure()
+            .build_client(false)
+            .build_server(true)
+            .out_dir(&test_server_out_dir),
+    )
+    .compile_fds(file_descriptor_set)?;
 
     // Emitting any rerun-if-changed line switches Cargo off its default
     // "watch the whole package" heuristic, so every path the build depends on
@@ -55,6 +96,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/upstream/v1/upstream.proto");
     println!("cargo:rerun-if-changed=build.rs");
     Ok(())
+}
+
+/// Apply the settings both codegen passes share: the serde derives every
+/// message carries, and the English documentation in [`DOCS`] / [`FIELD_DOCS`].
+///
+/// Shared so the two passes cannot drift apart — the messages the test server
+/// decodes must be the same types, with the same derives, as the ones the
+/// client encodes, and `serde::Serialize` in particular is what lets
+/// `tests/support` record a received request as JSON without hand-writing a
+/// matcher per RPC.
+fn documented(builder: tonic_prost_build::Builder) -> tonic_prost_build::Builder {
+    let mut builder =
+        builder.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
+    for (path, doc) in DOCS {
+        builder = builder.type_attribute(path, doc_attribute(doc));
+    }
+    for (path, doc) in FIELD_DOCS {
+        builder = builder.field_attribute(path, doc_attribute(doc));
+    }
+    builder
 }
 
 /// Wrap one documentation line into the `#[doc = ".."]` attribute

@@ -75,13 +75,39 @@ tracing = "0.1"
 uuid = { version = "1.19.0", features = ["v4"] }
 
 [dev-dependencies]
+# The mock OAuth2 identity provider in `tests/support/` is a hundred lines of
+# hyper rather than a mock-HTTP-server crate, because it needs to script a
+# sequence of responses (fail once with 500, then hand out a *different*
+# token), count requests, and record the form bodies it received — and because
+# `hyper`, `hyper-util` and `http-body-util` are already in the dependency
+# graph through `reqwest` and `tonic`, so this adds features to the lock file
+# rather than crates. `http1` + `server` serve the connection, `hyper-util`'s
+# `tokio` supplies the `TokioIo` adapter, and `http-body-util`'s `Full` is the
+# fixed-size response body.
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 # `#[tokio::main]` in the crate documentation's examples defaults to the
 # multi-thread runtime, and `tests/` spawns tasks, so the test and doctest
 # builds need `rt-multi-thread` on top of the library's own feature set.
 # `test-util` is what `#[tokio::test(start_paused = true)]` needs: the retry and
 # token-refresh backoff tests advance a paused clock instead of sleeping for
-# real, so a schedule measured in seconds is still tested in microseconds.
-tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+# real, so a schedule measured in seconds is still tested in microseconds. `net`
+# is for the integration tests' own listeners — the mock IdP binds one directly.
+tokio = { version = "1", features = ["rt-multi-thread", "test-util", "net"] }
+# The integration tests run all four services in-process over a loopback
+# socket: `server` is tonic's server stack and `router` the `add_service`
+# router the four generated services are assembled into. Both are test-only —
+# the library's own `tonic` entry above stays client-only, and `build.rs`
+# generates the server stubs into a separate directory for exactly that reason
+# (see its second codegen pass). Because Cargo unifies features per crate,
+# naming `tonic` here enables `server`/`router` when tests are built and never
+# when a consumer builds the library.
+tonic = { version = "0.14.2", default-features = false, features = [
+    "codegen",
+    "router",
+    "server",
+] }
 
 # `build.rs` reaches for exactly two crates: `protox`, a pure-Rust protobuf
 # compiler that replaces the `protoc` binary (and bundles the Google well-known

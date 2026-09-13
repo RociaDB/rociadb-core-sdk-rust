@@ -806,16 +806,83 @@ impl RociaDbClient {
         })
     }
 
+    /// Return one page of outgoing neighbors of `node_id` over `label`, each
+    /// with its node payload decoded into `T`.
+    ///
+    /// The bounded counterpart of
+    /// [`RociaDbClient::get_outgoing_neighbor_nodes`], and the one to reach
+    /// for by default: exactly one [`RociaDbClient::neighbors_out`] call for
+    /// the page the caller asked for, followed by one `GetNode` per neighbor
+    /// *on that page* (at most 10 in flight at a time, order preserved). The
+    /// work is therefore bounded by `limit`, not by the node's degree, and
+    /// `next_cursor` drives the next page exactly as it does for
+    /// [`RociaDbClient::neighbors_out`] — including its scoping rules: a
+    /// cursor belongs to the `(tenant_id, graph, node_id, label, direction)`
+    /// it was issued for and is rejected anywhere else.
+    ///
+    /// A neighbor whose node has been deleted between the two calls makes
+    /// the whole page fail with `NOT_FOUND`, since the page is decoded as a
+    /// unit — the same behaviour as the all-pages variants.
+    pub async fn neighbor_nodes_out<T: DeserializeOwned>(
+        &self,
+        tenant_id: &str,
+        graph: &str,
+        node_id: &str,
+        label: &str,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<Page<NeighborNode<T>>> {
+        let page = self
+            .neighbors_out(tenant_id, graph, node_id, label, limit, cursor)
+            .await?;
+        Ok(Page {
+            items: self
+                .fetch_neighbor_nodes(tenant_id, graph, page.items)
+                .await?,
+            next_cursor: page.next_cursor,
+        })
+    }
+
+    /// Return one page of incoming neighbors of `node_id` over `label`, each
+    /// with its node payload decoded into `T`.
+    ///
+    /// The incoming counterpart of [`RociaDbClient::neighbor_nodes_out`],
+    /// built on [`RociaDbClient::neighbors_in`]; see it for the cost and the
+    /// cursor rules, which are identical.
+    pub async fn neighbor_nodes_in<T: DeserializeOwned>(
+        &self,
+        tenant_id: &str,
+        graph: &str,
+        node_id: &str,
+        label: &str,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<Page<NeighborNode<T>>> {
+        let page = self
+            .neighbors_in(tenant_id, graph, node_id, label, limit, cursor)
+            .await?;
+        Ok(Page {
+            items: self
+                .fetch_neighbor_nodes(tenant_id, graph, page.items)
+                .await?,
+            next_cursor: page.next_cursor,
+        })
+    }
+
     /// Load **every** outgoing neighbor of `node_id` over `label` and decode
     /// each neighbor's node payload into `T`.
     ///
-    /// Unbounded by design: this walks every page of
+    /// Unbounded by design: this walks **every** page of
     /// [`RociaDbClient::neighbors_out`] (50 neighbors per page, not
     /// caller-tunable) and then issues one `GetNode` per neighbor, at most
     /// 10 in flight at a time, collecting the lot in memory. Cost and
     /// memory therefore scale with the node's degree, and nothing here caps
-    /// either — reach for [`RociaDbClient::neighbors_out`] directly, one
-    /// page at a time, for a node whose degree you do not control.
+    /// either — there is no `limit` to pass and no cursor to stop on.
+    ///
+    /// Prefer [`RociaDbClient::neighbor_nodes_out`], which does the same
+    /// work one page at a time, whenever the node's degree is not something
+    /// you control; use this one only when "all of them" is genuinely what
+    /// the caller means and the degree is known to be small.
     pub async fn get_outgoing_neighbor_nodes<T: DeserializeOwned>(
         &self,
         tenant_id: &str,
@@ -838,7 +905,9 @@ impl RociaDbClient {
     ///
     /// The incoming counterpart of
     /// [`RociaDbClient::get_outgoing_neighbor_nodes`], with the same
-    /// unbounded cost: see it for what that means for a high-degree node.
+    /// unbounded cost: see it for what that means for a high-degree node,
+    /// and reach for [`RociaDbClient::neighbor_nodes_in`] instead when the
+    /// degree is not yours to control.
     pub async fn get_incoming_neighbor_nodes<T: DeserializeOwned>(
         &self,
         tenant_id: &str,
@@ -911,6 +980,37 @@ impl RociaDbClient {
             graph = graph,
             node_id = node_id,
             label = label,
+            neighbor_count = neighbors.len(),
+            "walked every neighbor page"
+        );
+        self.fetch_neighbor_nodes(tenant_id, graph, neighbors).await
+    }
+
+    /// Fetch and decode the node payload of each neighbor in `neighbors`.
+    ///
+    /// The fan-out both the paged reads
+    /// ([`RociaDbClient::neighbor_nodes_out`],
+    /// [`RociaDbClient::neighbor_nodes_in`]) and the all-pages ones
+    /// ([`RociaDbClient::get_outgoing_neighbor_nodes`],
+    /// [`RociaDbClient::get_incoming_neighbor_nodes`]) end in, so the
+    /// concurrency bound, the ordering guarantee and the decode-error context
+    /// are defined once. `buffered` — not `buffer_unordered` — because the
+    /// result must keep the order the server returned the neighbors in, which
+    /// for a paginated read is also the order the next page continues from.
+    ///
+    /// Each `GetNode` goes through [`RociaDbClient::unary`], so every one of
+    /// them carries the per-RPC deadline and the refresh-and-retry on
+    /// `UNAUTHENTICATED` individually. One failure aborts the whole fan-out
+    /// (`try_collect` short-circuits) and the in-flight calls are dropped.
+    async fn fetch_neighbor_nodes<T: DeserializeOwned>(
+        &self,
+        tenant_id: &str,
+        graph: &str,
+        neighbors: Vec<Neighbor>,
+    ) -> Result<Vec<NeighborNode<T>>> {
+        debug!(
+            tenant_id = tenant_id,
+            graph = graph,
             neighbor_count = neighbors.len(),
             "loading neighbor nodes"
         );

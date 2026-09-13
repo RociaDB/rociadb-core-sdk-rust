@@ -15,12 +15,20 @@ use rociadb_sdk::{
     Channel, ClientTlsConfig, DocumentPage, DocumentQueryFilter, DocumentQueryOperator,
     DocumentQuerySort, DocumentQuerySortDirection, DocumentWriteOptions, Edge, EdgeInput,
     ExposeSecret, FileStreamUploadOptions, FileUploadOptions, Neighbor, NeighborNode, NodeBinding,
-    NodeInput, Page, Result, RetryPolicy, RociaDbBuilder, RociaDbClient, SecretString,
-    StatResponse, UploadRequest, WriteOptions,
+    NodeInput, Page, Result, RetryPolicy, RociaDbBuilder, RociaDbClient, RociaDbError,
+    SecretString, StatResponse, UploadRequest, WriteOptions,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// A caller's own document type, to pin down that the generic reads decode
+/// into something other than `serde_json::Value`.
+#[derive(Debug, Serialize, Deserialize)]
+struct Product {
+    sku: String,
+}
 
 #[allow(dead_code)]
 async fn reads_through_an_arc(client: Arc<RociaDbClient>) -> Result<()> {
@@ -63,6 +71,71 @@ async fn generic_reads_pick_their_own_types(client: Arc<RociaDbClient>) -> Resul
         .get_incoming_neighbor_nodes("tenant", "catalog", "group:featured", "belongs_to")
         .await?;
     Ok(())
+}
+
+// The paged neighbor-node reads return the same `Page<T>` every other
+// paginated read does, carry the same positional `limit`/`cursor`, and decode
+// into whatever the caller names — including a struct of their own.
+#[allow(dead_code)]
+async fn paged_neighbor_nodes_compose_with_the_shared_page_type(
+    client: Arc<RociaDbClient>,
+) -> Result<()> {
+    let outgoing: Page<NeighborNode<Value>> = client
+        .neighbor_nodes_out(
+            "tenant",
+            "catalog",
+            "product:sku-1",
+            "belongs_to",
+            Some(25),
+            None,
+        )
+        .await?;
+    let _: Vec<NeighborNode<Value>> = outgoing.items;
+
+    let mut cursor = outgoing.next_cursor;
+    while let Some(next) = cursor {
+        let page: Page<NeighborNode<Product>> = client
+            .neighbor_nodes_in(
+                "tenant",
+                "catalog",
+                "group:featured",
+                "belongs_to",
+                None,
+                Some(&next),
+            )
+            .await?;
+        let _: Vec<String> = page
+            .items
+            .iter()
+            .map(|neighbor| neighbor.value.sku.clone())
+            .collect();
+        cursor = page.next_cursor;
+    }
+    Ok(())
+}
+
+// `download_file_verified` returns the same owned buffer `download_file` does,
+// and its two integrity failures are ordinary `RociaDbError` variants a caller
+// can match on by name.
+#[allow(dead_code)]
+async fn a_verified_download_returns_bytes_or_names_the_mismatch(
+    client: Arc<RociaDbClient>,
+) -> Result<Vec<u8>> {
+    match client
+        .download_file_verified("tenant", "assets", "manual.pdf")
+        .await
+    {
+        Ok(bytes) => Ok(bytes),
+        Err(RociaDbError::ChecksumMismatch { expected, actual }) => {
+            let _: (Vec<u8>, Vec<u8>) = (expected, actual);
+            Ok(Vec::new())
+        }
+        Err(RociaDbError::SizeMismatch { expected, actual }) => {
+            let _: (u64, u64) = (expected, actual);
+            Ok(Vec::new())
+        }
+        Err(other) => Err(other),
+    }
 }
 
 // Neighbor pagination returns the shared `Page<T>`, not a bespoke page type.

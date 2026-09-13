@@ -186,6 +186,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RociaDbError::is_not_found()` and `RociaDbError::is_invalid_argument()`,
   alongside the existing `is_unauthenticated` / `is_permission_denied` /
   `is_already_exists` / `is_aborted`.
+- `RociaDbClient::download_file_verified(tenant_id, bucket, file_id)`: the
+  verifying counterpart of `download_file`. It calls `stat_file` first,
+  streams the download while hashing it with SHA-256, and checks the byte
+  count against `size_bytes` and the digest against the stored `checksum`
+  before returning the buffer. The buffer is pre-allocated from the reported
+  size, capped at 64 MiB so a server reporting an absurd `size_bytes` cannot
+  make the client reserve gigabytes up front. **What it proves**: the bytes
+  received are the bytes the uploader *declared* — the server never verified
+  the uploader's checksum against the payload, so this catches storage
+  corruption, truncation and partial overwrites, and not an uploader whose
+  declared digest never matched its own bytes. `download_file` and
+  `download_file_stream` link to it where they describe that asymmetry.
+- `RociaDbError::ChecksumMismatch { expected: Vec<u8>, actual: Vec<u8> }` and
+  `RociaDbError::SizeMismatch { expected: u64, actual: u64 }`, raised only by
+  `download_file_verified`. Two flat variants rather than one nested
+  `Integrity` value, so a caller branches with one match arm per failure and
+  reads the numbers straight off it. The size is checked first (a truncated
+  transfer fails both, and the byte count is the more actionable report);
+  `Display` renders the two digests as lowercase hex, and both carry raw
+  bytes so nothing has to be decoded to compare them.
+- `RociaDbClient::neighbor_nodes_out<T>` and
+  `RociaDbClient::neighbor_nodes_in<T>`:
+  `(tenant_id, graph, node_id, label, limit, cursor) -> Result<Page<NeighborNode<T>>>`.
+  One `neighbors_*` page, then the node payload of each neighbor *on that
+  page* fetched concurrently (at most `CONCURRENT_REQUESTS` = 10 in flight,
+  order preserved) and decoded into `T`. The work is bounded by `limit`
+  rather than by the node's degree, and the cursor is the one
+  `neighbors_out` / `neighbors_in` issued, with the same scoping rules.
+  `get_outgoing_neighbor_nodes` / `get_incoming_neighbor_nodes` keep their
+  all-pages behaviour, now documented as unbounded with a pointer here, and
+  both shapes share one fan-out helper.
+- An integration test suite (`tests/documents.rs`, `tests/graph.rs`,
+  `tests/files.rs`, `tests/auth.rs`, `tests/resilience.rs`, on a shared
+  `tests/support/`) that runs the real client path — builder, channel, bearer
+  interceptor, generated client, the unary helper, JSON decoding — against an
+  in-process tonic server implementing all four services and a mock OAuth2
+  identity provider served by hyper. Both bind `127.0.0.1:0`, so the suite is
+  loopback-only, parallel-safe and needs nothing installed; the server
+  reproduces the parts of the contract the SDK depends on (cursor pagination,
+  `total_count`, the `(from, label, to)` edge uniqueness rule, idempotent
+  deletes, the 1 MiB upload chunk cap, a checksum length check that never
+  looks at the bytes, and the `reason` trailing metadata on every error) and
+  offers scripted per-RPC failures, per-RPC delays and a recorder of every
+  request and its `authorization` header.
 - Crate-root re-exports so configuring the SDK needs no extra direct
   dependency: `Channel` and `ClientTlsConfig` (from `tonic`), `SecretString`
   and `ExposeSecret` (from `secrecy`). The same stability caveat as
@@ -225,6 +269,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get_outgoing_neighbor_nodes` / `get_incoming_neighbor_nodes` is a documented
   named constant instead of a literal `50` repeated at two call sites. The
   value is unchanged.
+- **`build.rs` runs a second codegen pass**, writing server-only stubs
+  (`build_server(true).build_client(false)`, the same `type_attribute` and
+  documentation settings) into `$OUT_DIR/test_server/` for the integration
+  tests to `include!`. The library's own generated code is unchanged and
+  stays client-only — its `tonic` has no server feature, and the one in
+  `[dev-dependencies]` does. The `.proto` is still compiled once: the
+  `FileDescriptorSet` is cloned between the two passes. A consumer pays a few
+  tens of milliseconds inside a build script that measures around 150 ms in
+  total, and compiles none of the second pass's output.
+- New development dependencies, all of them crates the graph already carried
+  (only features and five small crates — `axum`, `axum-core`, `matchit`,
+  `mime`, `httpdate` — are added to `Cargo.lock`, and nothing changes for a
+  consumer building the library): `tonic` with `server` + `router`, `hyper`
+  with `http1` + `server`, `hyper-util` with `tokio`, `http-body-util`, and
+  `net` on `tokio`.
 
 ### Removed
 
