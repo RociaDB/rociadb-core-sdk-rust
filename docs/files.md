@@ -1,0 +1,323 @@
+# Files
+
+Files live under a `(tenant_id, bucket)` pair and are addressed by
+`file_id`. Uploads and downloads are the only streaming RPCs in the API;
+everything else about files — `stat_file`, `list_buckets`, `list_files`,
+`delete_file` — is an ordinary unary call.
+
+## The upload wire contract
+
+Worth understanding even if you never touch `upload_file_chunked` or
+`upload_file_stream` directly, because it is what the ergonomic helpers
+implement for you.
+
+- **Chunk size is the client's choice, capped at 1 MiB — not a fixed
+  requirement.** The server stores each chunk verbatim at its position in
+  the stream and, on download, reads chunks back until it has collected
+  `size_bytes` in total, assuming no particular chunk size. A single
+  message's `chunk` larger than 1 MiB (1 048 576 bytes) is rejected with
+  `INVALID_ARGUMENT` (`"chunk exceeds 1 MiB"`); anything at or under the cap
+  is fine, sliced however the client likes.
+- **The SDK always emits exactly-1-MiB chunks** (the last one possibly
+  shorter) — not because the server requires it, but because 1 MiB is the
+  largest message allowed and therefore the fewest messages for a given
+  file. It also remains the only chunk size that is safe against a server
+  older than `1.0.0-rc.16`. This is why neither `FileUploadOptions` nor
+  `FileStreamUploadOptions` has a `chunk_size` knob.
+- **The first message carries the metadata**: `tenant_id`, `bucket`,
+  `file_id`, `size_bytes` (the exact total byte count), `content_type`,
+  `checksum` and `request_id`. Every later message is read only for its
+  `chunk` field.
+- **`checksum` must be exactly 32 raw bytes**, a SHA-256 digest. The server
+  rejects any other length, empty included, with `INVALID_ARGUMENT`
+  (`"checksum must be 32 bytes (sha256)"`). The SDK types it as `[u8; 32]`,
+  so the length is the compiler's business rather than a runtime check.
+  **The server never verifies that the digest matches the bytes** — only
+  that it is 32 bytes long.
+- **The sum of every `chunk` across the stream must equal `size_bytes`
+  exactly**, or the server rejects the upload at the end of the stream with
+  `INVALID_ARGUMENT` (`"size_bytes does not match uploaded data"`). That is
+  what makes `size_bytes` a value the server can trust on download rather
+  than a caller-supplied claim.
+- **Re-uploading an existing `file_id` replaces it, with no error for the
+  duplicate** — no delete-then-upload dance. The replacement is atomic: the
+  upload writes into its own generation and never touches the published
+  version's chunks, so a download that started before the commit serves the
+  old version in full, one that starts after serves the new version in full,
+  and an in-flight download keeps serving the version it began with. There
+  is never a mixed file.
+- **Files over the server's `limits.max_file_bytes` (5 GiB by default) are
+  rejected.** `upload_file` and `upload_file_chunked` check this client-side
+  and return `RociaDbError::Validation` before sending anything.
+- **An empty file is valid and common**: exactly one message (metadata only,
+  empty `chunk`) and no data messages. `upload_file` handles it.
+- **A file becomes visible only once the whole stream has been received and
+  validated.** Until then it is absent from `list_files`, `stat_file` and
+  downloads. An interrupted stream leaves orphaned chunks that a background
+  GC reclaims; the partial file never appears anywhere.
+
+`RociaDbBuilder::request_timeout` does **not** cover any of this: how long a
+transfer takes is a property of the file's size and the link, not of a
+single round trip. Wrap an upload or download in a `tokio::time::timeout` of
+your own when it needs a deadline.
+
+## The three upload tiers
+
+| Method | Input | Does for you | Use when |
+| ------ | ----- | ------------ | -------- |
+| `upload_file` | `impl Into<Vec<u8>>` | chunking **and** the SHA-256 digest | the file fits in memory |
+| `upload_file_chunked` | `Stream<Item = Vec<u8>>` | re-chunking, and validates the total against `size_bytes` | the file does not fit in memory but can be hashed ahead of time |
+| `upload_file_stream` | `Stream<Item = UploadRequest>` | nothing at all | you need to build every protobuf message yourself |
+
+### `upload_file` — an in-memory buffer
+
+```rust,no_run
+use rociadb_sdk::{FileUploadOptions, RociaDbBuilder, WriteOptions};
+
+# #[tokio::main]
+# async fn main() -> rociadb_sdk::Result<()> {
+# let client = RociaDbBuilder::new().disable_auth().build().await?;
+client
+    .upload_file(
+        "tenant-1",
+        "assets",
+        "manual.txt",
+        b"hello RociaDB".to_vec(),
+        FileUploadOptions::new()
+            .with_content_type("text/plain")
+            .with_request_id("import-42:manual.txt"),
+    )
+    .await?;
+
+let metadata = client.stat_file("tenant-1", "assets", "manual.txt").await?;
+println!("{} bytes, {}", metadata.size_bytes, metadata.content_type);
+
+client
+    .delete_file("tenant-1", "assets", "manual.txt", WriteOptions::new())
+    .await?;
+# Ok(())
+# }
+```
+
+With `FileUploadOptions::checksum` left `None` — the default — the SHA-256
+digest of the buffer is computed and sent for you, which is almost always
+what you want. Set it explicitly only when the digest is already known from
+elsewhere (a manifest, an earlier pass over the same bytes).
+
+`bytes` is `impl Into<Vec<u8>>`, so both ownership styles are one call: a
+`Vec<u8>` you already hold is **moved** straight into the chunking step with
+no copy, while a borrowed `&[u8]` (or `&[u8; N]`, or `&str`) is **copied
+once** into the owned buffer the `'static` upload stream requires. That copy
+is unavoidable for a borrowed buffer and worth avoiding for a large owned
+one: it doubles peak memory for the whole upload, since the original stays
+alive until the upload finishes.
+
+`content_type` defaults to `"application/octet-stream"`. The server records
+it as given and never inspects the bytes to confirm it.
+
+### `upload_file_chunked` — a stream you cannot buffer
+
+```rust,no_run
+use futures::stream;
+use rociadb_sdk::{FileStreamUploadOptions, RociaDbBuilder};
+use sha2::{Digest, Sha256};
+
+# #[tokio::main]
+# async fn main() -> rociadb_sdk::Result<()> {
+# let client = RociaDbBuilder::new().disable_auth().build().await?;
+let payload = std::fs::read("large-report.csv").expect("read the source file");
+let checksum: [u8; 32] = Sha256::digest(&payload).into();
+let size_bytes = payload.len() as u64;
+
+// Whatever chunking the source naturally produces — 64 KiB here purely as
+// an example. `upload_file_chunked` re-slices to the server's 1 MiB
+// messages internally regardless of what it is handed.
+let chunks: Vec<Vec<u8>> = payload.chunks(64 * 1024).map(<[u8]>::to_vec).collect();
+
+client
+    .upload_file_chunked(
+        "tenant-1",
+        "reports",
+        "large-report.csv",
+        stream::iter(chunks),
+        FileStreamUploadOptions::new(size_bytes, checksum).with_content_type("text/csv"),
+    )
+    .await?;
+# Ok(())
+# }
+```
+
+`size_bytes` and `checksum` are constructor arguments rather than optional
+fields — which is why `FileStreamUploadOptions` has no `Default` — because
+the metadata travels on the very first gRPC message, before a single byte
+has been read from the caller's stream. Neither can be derived on the fly
+the way `upload_file` derives them from a complete buffer: hash the source
+ahead of time.
+
+If the stream ends up producing more or fewer total bytes than `size_bytes`
+declared, the call fails with `RociaDbError::Validation` naming the actual
+byte counts, rather than sending a stream the server would reject anyway at
+the end. It never holds more than one outgoing chunk's worth of bytes at a
+time, however the input happens to be sliced.
+
+**Naming trap when porting code between SDKs:** despite doing the
+re-chunking and the validation, this method is not called
+`upload_file_stream` — that name belongs to the raw escape hatch below. See
+[parity with the TypeScript SDK](typescript-parity.md).
+
+### `upload_file_stream` — the raw escape hatch
+
+Zero validation: no re-chunking, no chunk-size cap, no checksum, and no
+generated `request_id` — the first message's is forwarded as-is. The caller
+must match the wire contract above exactly.
+
+```rust,no_run
+use futures::stream;
+use rociadb_sdk::{RociaDbBuilder, UploadRequest};
+
+# #[tokio::main]
+# async fn main() -> rociadb_sdk::Result<()> {
+# let client = RociaDbBuilder::new().disable_auth().build().await?;
+# let checksum: [u8; 32] = [0; 32];
+// One metadata-first message carrying the whole (tiny) payload.
+let requests = vec![UploadRequest {
+    tenant_id: "tenant-1".to_string(),
+    bucket: "assets".to_string(),
+    file_id: "manual.txt".to_string(),
+    size_bytes: 13,
+    content_type: "text/plain".to_string(),
+    checksum: checksum.to_vec(),
+    chunk: b"hello RociaDB".to_vec(),
+    request_id: "import-42:manual.txt".to_string(),
+}];
+client.upload_file_stream(stream::iter(requests)).await?;
+# Ok(())
+# }
+```
+
+Getting the chunk *size* wrong here fails fast with `INVALID_ARGUMENT`
+rather than corrupting a later download — but a wrong `size_bytes` total, or
+a `checksum` that does not match the bytes, can still produce an upload that
+looks successful while carrying bad data. Prefer `upload_file_chunked`
+unless you specifically need to hand-build the message stream.
+
+## Downloads
+
+```rust,no_run
+use rociadb_sdk::RociaDbBuilder;
+
+# #[tokio::main]
+# async fn main() -> rociadb_sdk::Result<()> {
+# let client = RociaDbBuilder::new().disable_auth().build().await?;
+// Buffered, unverified.
+let bytes = client.download_file("tenant-1", "assets", "manual.txt").await?;
+
+// Buffered, and checked against what `stat_file` reports.
+let verified = client
+    .download_file_verified("tenant-1", "assets", "manual.txt")
+    .await?;
+
+println!("{} / {} bytes", bytes.len(), verified.len());
+# Ok(())
+# }
+```
+
+Streaming, when the file must not be buffered at all. The stream hands back
+a raw `tonic::Status` on failure rather than a `RociaDbError`, so an example
+that mixes the two uses a boxed error:
+
+```rust,no_run
+use rociadb_sdk::RociaDbBuilder;
+
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = RociaDbBuilder::new().disable_auth().build().await?;
+let mut stream = client
+    .download_file_stream("tenant-1", "assets", "manual.txt")
+    .await?;
+let mut total = 0usize;
+while let Some(response) = stream.message().await? {
+    total += response.chunk.len();
+}
+println!("{total} bytes");
+# Ok(())
+# }
+```
+
+`download_file_stream` returns a `Streaming<DownloadResponse>` and performs
+no integrity verification of its own; `download_file` collects that stream
+into one buffer and performs none either. That is a real asymmetry with the
+upload path: every upload method sends a SHA-256 checksum with the file, and
+`StatResponse::checksum` exposes the one recorded for a stored file, but
+nothing on the download side checks anything. The only protection is
+whatever the transport already provides — TLS and HTTP/2 framing catch
+corruption in transit, which says nothing about whether the bytes stored on
+the server still match what was uploaded.
+
+### `download_file_verified`, and what it actually proves
+
+It calls `stat_file` first, streams the download while feeding every chunk
+to a SHA-256 hasher, and only then hands the buffer back — after checking
+the byte count against `StatResponse::size_bytes` and the digest against
+`StatResponse::checksum`. A file whose stored bytes have been corrupted or
+truncated fails here instead of being returned as if nothing were wrong.
+
+**But the server never verified the uploader's checksum.** It checks that
+the value is 32 bytes long and stores it; it never hashes what it received
+to confirm the two agree. So a match proves the bytes you just received are
+the bytes the uploader *declared*: it catches storage corruption, a
+truncated transfer and a partially overwritten file, and it does **not**
+catch an uploader that sent a checksum which never matched its own payload.
+End-to-end integrity against a source you do not control needs a digest
+carried out of band, not this.
+
+Nothing is checked atomically with the download either: `stat_file` and the
+download are two calls, so a file replaced between them reads as a mismatch
+rather than as the new version. Replacement is atomic server-side, so the
+mismatch is the worst case — never a mixed file.
+
+Failures are `RociaDbError::SizeMismatch` (checked first: a truncated stream
+fails both checks, and the byte count is the more actionable report) then
+`RociaDbError::ChecksumMismatch` — including when the stored checksum is not
+a 32-byte SHA-256 digest at all, since the comparison is over raw bytes.
+Otherwise whatever `stat_file` and the download return, `NOT_FOUND` for an
+unknown `file_id` included.
+
+The whole file is buffered, like `download_file`. The buffer is
+pre-allocated from the reported size but **capped at 64 MiB**, so a server
+reporting an absurd `size_bytes` cannot make the client reserve gigabytes
+before a byte has arrived; a genuinely larger file simply grows its buffer
+as it streams. The stream is also abandoned as soon as it overshoots
+`size_bytes`, rather than being drained into memory only to be rejected at
+the end.
+
+A streaming caller who cannot buffer the file does the same thing by hand:
+hash each chunk as it arrives and compare the digest against `stat_file`'s
+`checksum` at the end.
+
+## Metadata, listing and deletion
+
+`stat_file` returns a `StatResponse` with `size_bytes`, `content_type`,
+`checksum`, `created_at` and `updated_at`.
+
+```rust,no_run
+# use rociadb_sdk::{RociaDbBuilder, WriteOptions};
+# #[tokio::main]
+# async fn main() -> rociadb_sdk::Result<()> {
+# let client = RociaDbBuilder::new().disable_auth().build().await?;
+let buckets = client.list_buckets("tenant-1", None, None).await?;
+let files = client.list_files("tenant-1", "assets", Some(100), None).await?;
+println!("{} buckets, {} files", buckets.items.len(), files.items.len());
+
+client
+    .delete_file("tenant-1", "assets", "manual.txt", WriteOptions::new())
+    .await?;
+# Ok(())
+# }
+```
+
+`list_buckets` lists bucket names holding at least one file. `delete_file`
+is **idempotent**, like `delete_document` and `delete_edge`: deleting a
+`file_id` that does not exist succeeds and touches nothing, so call
+`stat_file` first when you need to know whether the file was there. An
+upload still in flight is never deleted.

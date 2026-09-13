@@ -8,7 +8,7 @@
 //! # Quick example
 //!
 //! ```rust,no_run
-//! use rociadb_sdk::RociaDbBuilder;
+//! use rociadb_sdk::{DocumentWriteOptions, NodeBinding, RociaDbBuilder};
 //! use serde_json::json;
 //!
 //! # #[tokio::main]
@@ -24,26 +24,137 @@
 //!     .await?;
 //!
 //! client
-//!     .create_document(
+//!     .put_document(
 //!         "tenant-1",
 //!         "products",
 //!         "sku-123",
-//!         json!({"sku": "sku-123"}),
-//!         Some("product".to_string()),
-//!         Some("products".to_string()),
+//!         &json!({"sku": "sku-123"}),
+//!         DocumentWriteOptions::new()
+//!             .with_node_binding(NodeBinding::new("product", "catalog")),
 //!     )
 //!     .await?;
+//!
+//! let product: serde_json::Value = client
+//!     .get_document("tenant-1", "products", "sku-123")
+//!     .await?;
+//! # let _ = product;
 //! # Ok(())
 //! # }
 //! ```
 //!
+//! # One method per operation
+//!
+//! There is exactly one method per server operation. Everything optional
+//! travels in an options or input struct passed as the last argument —
+//! never in a `_with_request_id` / `_with_node_binding` / `_as` sibling
+//! method:
+//!
+//! - [`WriteOptions`] for a write whose only tunable is its idempotency
+//!   key, [`DocumentWriteOptions`] for a document write (which can also
+//!   bind a graph node), and [`FileUploadOptions`] /
+//!   [`FileStreamUploadOptions`] for the two ergonomic upload paths. Each
+//!   is built with `new()` plus chainable `with_*` setters, and
+//!   [`WriteOptions`] documents — in one place — the idempotency key every
+//!   write generates when you do not supply one.
+//! - [`NodeInput`] and [`EdgeInput`] carry one node or edge to write, by
+//!   name rather than as a run of same-typed positional arguments.
+//! - Reads that decode a payload are generic over the target type:
+//!   `get_document::<Product>(..)`, `get_node::<Value>(..)`,
+//!   `get_edge::<Weight>(..)`.
+//! - Pagination stays positional (`limit: Option<u32>`,
+//!   `cursor: Option<&str>`) and returns [`Page<T>`], or [`DocumentPage<T>`]
+//!   for the three document reads that also report a total count.
+//!
+//! # Authentication
+//!
+//! [`RociaDbBuilder`] enables OAuth2 client-credentials auth by default,
+//! reading `AUTH_TOKEN_URL`, `AUTH_CLIENT_ID` and `AUTH_CLIENT_SECRET` from
+//! the environment unless
+//! [`auth_client_credentials`](RociaDbBuilder::auth_client_credentials)
+//! supplies them. [`build`](RociaDbBuilder::build) fetches the first token
+//! and the client keeps it fresh from then on; the credentials and the token
+//! are held as [`SecretString`], so they are redacted by every formatter and
+//! zeroized when the client is dropped.
+//!
+//! Three things happen automatically, and none of them needs calling code:
+//!
+//! - **Scheduled refresh.** A background task refreshes the token after
+//!   about two thirds of its lifetime (400 seconds for the 600-second tokens
+//!   the IdP issues), and stops when the last clone of the client is
+//!   dropped. The cadence follows the lifetime the IdP reports, so it tracks
+//!   an IdP that changes it.
+//! - **Fast recovery from a failed refresh.** A refresh that fails is
+//!   retried after roughly 1 s, then 2 s, 4 s, 8 s, 16 s and 30 s (jittered,
+//!   capped at 30 s) until one succeeds, rather than waiting out the whole
+//!   regular interval — which would leave a long window in which every RPC
+//!   fails with `UNAUTHENTICATED`. See
+//!   [`TokenManager::spawn_refresh`](auth::TokenManager::spawn_refresh).
+//! - **Refresh-and-retry on `UNAUTHENTICATED`.** A unary RPC that comes back
+//!   `UNAUTHENTICATED` triggers one coalesced token refresh and is then
+//!   re-issued exactly once. A caller only sees that status when the second
+//!   attempt fails too, or when the refresh itself did.
+//!
+//! [`RociaDbClient::refresh_auth_token`] and
+//! [`RociaDbClient::invalidate_auth_token`] remain for driving a refresh out
+//! of band, and [`disable_auth`](RociaDbBuilder::disable_auth) turns the
+//! whole mechanism off for a controlled local deployment.
+//!
+//! # Timeouts, transport and retries
+//!
+//! - [`connect_timeout`](RociaDbBuilder::connect_timeout) bounds the dial (10
+//!   seconds by default), and
+//!   [`request_timeout`](RociaDbBuilder::request_timeout) puts a deadline on
+//!   every unary RPC (opt-in, no default).
+//! - [`tls_config`](RociaDbBuilder::tls_config) replaces the default
+//!   native-roots TLS setup, for a private CA or mTLS, and
+//!   [`http2_keep_alive`](RociaDbBuilder::http2_keep_alive) turns on HTTP/2
+//!   keep-alive pings for a connection held open across an idle NAT or load
+//!   balancer.
+//! - [`build_with_channel`](RociaDbBuilder::build_with_channel) takes a
+//!   [`Channel`] you built yourself — a custom connector, a Unix socket, a
+//!   load-balanced list — and still does all of the auth work above.
+//! - [`RetryPolicy`] and [`RociaDbClient::retry`] replay a call while it
+//!   fails with `ABORTED`, the one status the server expects callers to
+//!   retry (see [`RociaDbError::is_aborted`]) — and with `UNAVAILABLE` too
+//!   when [`with_retry_unavailable`](RetryPolicy::with_retry_unavailable)
+//!   asks for it.
+//!
 //! # Building
 //!
-//! The build script compiles the `.proto` files bundled with this crate, so
-//! **`protoc` must be available** on any machine that compiles it, including
-//! CI: either on `PATH`, or at the location given by the `PROTOC` environment
-//! variable. Nothing else is needed from the system — the Google well-known
-//! types the API uses ship inside the crate.
+//! No system dependency is required: `cargo build` on a bare Rust toolchain
+//! is enough. The build script compiles the `.proto` bundled with this crate
+//! using [`protox`](https://docs.rs/protox), a pure-Rust protobuf compiler,
+//! so there is no `protoc` binary to install and no `PROTOC` environment
+//! variable to set — on a developer machine, in CI, or on docs.rs. The
+//! Google well-known types the API imports come from `protox` itself.
+//!
+//! # Guides
+//!
+//! The deep dives live in the repository, next to the code, and every
+//! example in them is compiled as a doctest. rustdoc cannot render them as
+//! pages of this documentation, so they are listed here by path — read them
+//! on
+//! [GitHub](https://github.com/RociaDB/rociadb-core-sdk-rust/tree/main/docs)
+//! or in a checkout:
+//!
+//! - `docs/authentication.md` — token lifetime, the background refresh and
+//!   its backoff, refresh-and-retry on `UNAUTHENTICATED`, the `auth` module.
+//! - `docs/errors-and-retries.md` — every [`RociaDbError`] variant, the
+//!   predicates, `ABORTED`, and [`RetryPolicy`].
+//! - `docs/documents.md` — writes, reads, listings, queries, and what
+//!   `total_count` costs.
+//! - `docs/graph.md` — nodes, edges, the `(from, label, to)` uniqueness
+//!   rule, batches, and neighbor traversal.
+//! - `docs/files.md` — the upload wire contract, the three upload tiers, and
+//!   verified downloads.
+//! - `docs/pagination.md` — limits, cursors, and the one correct stop
+//!   condition.
+//! - `docs/tenancy.md` — what `tenant_id` is and is not, the token scopes,
+//!   and the tenant registry.
+//! - `docs/transport.md` — where TLS terminates, the timeouts, and bringing
+//!   your own [`Channel`].
+//! - `docs/typescript-parity.md` — the names and shapes that do not
+//!   translate mechanically to the TypeScript SDK.
 //!
 //! # Example project
 //!
@@ -53,41 +164,90 @@
 //! # Where things live
 //!
 //! Document, graph, file and tenant calls are all inherent methods on
-//! [`RociaDbClient`], so the module list is short:
+//! [`RociaDbClient`], and every public type is re-exported at the crate
+//! root, so exactly one module is left to name:
 //!
 //! - [`auth`] — token acquisition and refresh, and the interceptors that
 //!   attach credentials to outgoing calls. Useful when you drive
 //!   authentication yourself rather than through the builder.
-//! - [`mod@file`] — the option types for uploads ([`FileUploadOptions`],
-//!   [`FileStreamUploadOptions`]) and the chunking rules the wire contract
-//!   imposes.
-//! - [`graph`] — the page and node types returned by neighbor traversal
-//!   ([`NeighborPage`], [`NeighborNode`]).
 //!
 //! # Stability
 //!
-//! The public API follows semantic versioning from 1.0.0 onward, with one
+//! The public API follows semantic versioning from 2.0.0 onward, with one
 //! documented exception: the internal `pb` module holds code generated from
-//! the `.proto` files by prost and tonic, and is not covered by that promise.
-//! A routine prost or
-//! tonic upgrade can reshape those generated types without this SDK's own API
-//! changing. Five of them — [`CollectionInfo`], [`StatResponse`],
-//! [`Neighbor`], [`UploadRequest`] and [`DownloadResponse`] — appear in public
-//! signatures and are re-exported at the crate root for that reason; depend on
-//! the re-exports: the `pb` module itself is private.
-#![allow(clippy::doc_lazy_continuation)]
+//! the `.proto` files by prost and tonic, and is not covered by that
+//! promise. A routine prost or tonic upgrade can reshape those generated
+//! types without
+//! this SDK's own API changing. Five of them — [`CollectionInfo`],
+//! [`StatResponse`], [`Neighbor`], [`UploadRequest`] and
+//! [`DownloadResponse`] — appear in public signatures and are re-exported at
+//! the crate root for that reason; depend on the re-exports: the `pb` module
+//! itself is private.
+//!
+//! The same caveat covers the four types re-exported straight from another
+//! crate so that configuring this one needs no extra direct dependency:
+//! [`Streaming`], [`Channel`] and [`ClientTlsConfig`] from `tonic`, and
+//! [`SecretString`] (with [`ExposeSecret`]) from `secrecy`. A major upgrade
+//! of either crate can reshape them without this SDK's own API changing.
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+/// Compiles every Rust example in `README.md` as a doctest, so a code block
+/// that stops matching the API fails `cargo test` instead of misleading a
+/// reader.
+///
+/// The file is attached as documentation on a private, `cfg(doctest)`-only
+/// item: rustdoc collects the code blocks when running doctests and the item
+/// does not exist in any other build, so nothing about the public API
+/// changes. Consequence to keep in mind when editing the file: rustdoc treats
+/// an **untagged** fence as Rust, so every non-Rust block must carry its
+/// language (` ```toml `, ` ```bash `, ` ```text `), and every Rust block that
+/// would talk to a server is ` ```rust,no_run `.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
+/// The guides under `docs/`, compiled as doctests on the same terms as
+/// [`ReadmeDoctests`]. One item per file so a failure names the guide it came
+/// from.
+#[cfg(doctest)]
+mod guide_doctests {
+    #[doc = include_str!("../docs/authentication.md")]
+    struct Authentication;
+    #[doc = include_str!("../docs/errors-and-retries.md")]
+    struct ErrorsAndRetries;
+    #[doc = include_str!("../docs/documents.md")]
+    struct Documents;
+    #[doc = include_str!("../docs/graph.md")]
+    struct Graph;
+    #[doc = include_str!("../docs/files.md")]
+    struct Files;
+    #[doc = include_str!("../docs/pagination.md")]
+    struct Pagination;
+    #[doc = include_str!("../docs/tenancy.md")]
+    struct Tenancy;
+    #[doc = include_str!("../docs/transport.md")]
+    struct Transport;
+    #[doc = include_str!("../docs/typescript-parity.md")]
+    struct TypeScriptParity;
+}
 
 pub mod auth;
 mod document;
 mod error;
-pub mod file;
-pub mod graph;
+mod file;
+mod graph;
 pub(crate) mod pb;
+mod retry;
 mod tenant;
 
+pub use document::{
+    DocumentPage, DocumentQueryFilter, DocumentQueryOperator, DocumentQuerySort,
+    DocumentQuerySortDirection, DocumentWriteOptions, NodeBinding,
+};
 pub use error::{Result, RociaDbError};
 pub use file::{FileStreamUploadOptions, FileUploadOptions};
-pub use graph::{NeighborNode, NeighborPage};
+pub use graph::{Edge, EdgeInput, NeighborNode, NodeInput};
 /// Generated protobuf types that appear directly in a public method signature,
 /// re-exported here so callers can name them without depending on the crate's
 /// private `pb` module. The stability caveat in the crate documentation applies
@@ -96,33 +256,42 @@ pub use graph::{NeighborNode, NeighborPage};
 pub use pb::upstream::v1::{
     CollectionInfo, DownloadResponse, Neighbor, StatResponse, UploadRequest,
 };
+pub use retry::RetryPolicy;
+/// Re-exported so callers can hold the OAuth2 client secret, and read the
+/// tokens this crate hands back, in a type that redacts itself in `Debug`
+/// output and zeroizes its buffer on drop — without taking `secrecy` as a
+/// direct dependency. [`ExposeSecret::expose_secret`] is the only way to read
+/// the bytes back. The crate documentation's stability caveat applies: a
+/// major `secrecy` upgrade can reshape these without the SDK's own API
+/// changing.
+pub use secrecy::{ExposeSecret, SecretString};
 /// Re-exported so callers do not need `tonic` as a direct dependency just to
 /// name the return type of [`RociaDbClient::download_file_stream`]. The same
 /// stability caveat applies: a major tonic upgrade can reshape this type
 /// without the SDK's own API changing.
 pub use tonic::codec::Streaming;
+/// Re-exported so callers do not need `tonic` as a direct dependency just to
+/// configure the builder: [`ClientTlsConfig`] for
+/// [`RociaDbBuilder::tls_config`] and [`Channel`] for
+/// [`RociaDbBuilder::build_with_channel`]. The same stability caveat applies:
+/// a major tonic upgrade can reshape these types without the SDK's own API
+/// changing.
+pub use tonic::transport::{Channel, ClientTlsConfig};
 
-use crate::error::{AuthResultExt, ConnectionResultExt, JsonResultExt, StatusResultExt};
+use crate::auth::{BearerInterceptor, TokenManager, TokenRefreshGuard};
+use crate::error::{AuthResultExt, ConfigResultExt, ConnectionResultExt, StatusResultExt};
+use crate::pb::upstream::v1::PageRequest;
 use crate::pb::upstream::v1::document_service_client::DocumentServiceClient;
 use crate::pb::upstream::v1::file_service_client::FileServiceClient;
 use crate::pb::upstream::v1::graph_service_client::GraphServiceClient;
 use crate::pb::upstream::v1::tenant_service_client::TenantServiceClient;
-use crate::pb::upstream::v1::{
-    AddEdgeRequest, FindByFieldRequest, GetDocRequest, GetNodeRequest, ListCollectionsRequest,
-    ListDocRequest, PageRequest, PutDocRequest, PutNodeRequest, QueryDocRequest, QueryFilter,
-    QueryOperator, QuerySort, SortDirection,
-};
-use auth::{BearerInterceptor, TokenManager, TokenRefreshGuard};
-use futures::{TryStreamExt, stream};
-use serde::{Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
 use std::env;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::codegen::InterceptedService;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
+use tonic::transport::Endpoint;
+use tracing::{debug, warn};
 
 /// Max concurrent in-flight requests for batch operations.
 const CONCURRENT_REQUESTS: usize = 10;
@@ -135,44 +304,54 @@ const AUTH_CLIENT_SECRET_ENV: &str = "AUTH_CLIENT_SECRET";
 /// [`RociaDbBuilder::connect_timeout`] was never called, so a host that
 /// never answers cannot hang `build()` forever.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Overall deadline applied to every request the OAuth2 HTTP client makes —
+/// the token fetch in [`RociaDbBuilder::build`] and every later refresh.
+///
+/// `reqwest::Client::new()` has no timeout of any kind, so an IdP that
+/// accepts the TCP connection and then never answers would hang `build()`,
+/// and every [`RociaDbClient::refresh_auth_token`] call after it, forever —
+/// the latter while holding the refresh lock, which would block every other
+/// task waiting to refresh too. Generous compared with a token endpoint's
+/// real latency (tens of milliseconds), because exceeding it fails the
+/// client's authentication outright: it exists to break a hang, not to
+/// enforce a service level.
+const OAUTH_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum BuilderAuthConfig {
     Enabled {
         token_url: Option<String>,
         client_id: Option<String>,
-        client_secret: Option<String>,
+        /// A [`SecretString`], so `#[derive(Debug)]` on this enum prints a
+        /// redaction rather than the secret, and the buffer is zeroized
+        /// when the builder (and the `TokenManagerInner` it is cloned into
+        /// at `build()`) is dropped — closing the window in which a core
+        /// dump, an attached debugger, or swapped-out memory could recover
+        /// it.
+        client_secret: Option<SecretString>,
     },
     Disabled,
 }
 
-// Manual `Debug` impl instead of `#[derive(Debug)]`: a derived impl would
-// print `client_secret` in clear text, so any `format!("{:?}", ..)` or
-// debug-level log of a `RociaDbBuilder` would leak the OAuth2 secret.
-impl std::fmt::Debug for BuilderAuthConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Enabled {
-                token_url,
-                client_id,
-                client_secret: _,
-            } => f
-                .debug_struct("Enabled")
-                .field("token_url", token_url)
-                .field("client_id", client_id)
-                .field("client_secret", &"[redacted]")
-                .finish(),
-            Self::Disabled => f.write_str("Disabled"),
-        }
-    }
-}
-
-/// Builder for RociaDbClient.
+/// Builder for [`RociaDbClient`].
+///
+/// Every setter takes `self` and returns `Self`, so a whole configuration
+/// can be written as one chain from a temporary
+/// (`RociaDbBuilder::new().host("..").disable_auth()`), or kept in a
+/// variable and extended a step at a time. [`RociaDbBuilder::build`] takes
+/// `&self`, so one builder can produce several clients.
 #[derive(Debug)]
 pub struct RociaDbBuilder {
     host: Option<String>,
     auth: BuilderAuthConfig,
     connect_timeout: Option<Duration>,
+    request_timeout: Option<Duration>,
+    /// `None` means "the default native-roots configuration"; see
+    /// [`RociaDbBuilder::tls_config`].
+    tls_config: Option<ClientTlsConfig>,
+    /// `(interval, timeout)` from [`RociaDbBuilder::http2_keep_alive`], or
+    /// `None` for tonic's default of no keep-alive pings at all.
+    http2_keep_alive: Option<(Duration, Duration)>,
 }
 
 /// gRPC client for document, graph, file, and tenant services.
@@ -185,12 +364,23 @@ pub struct RociaDbBuilder {
 /// ([`RociaDbClient::put_nodes`], [`RociaDbClient::add_edges`]) always
 /// have. A shared `RociaDbClient` behind an `Arc` therefore needs no
 /// `Mutex` to be usable concurrently.
+///
+/// [`Debug`](std::fmt::Debug) reports the host the client was built for and
+/// whether auth is enabled — never a token, a client id, or a secret.
 #[derive(Clone)]
 pub struct RociaDbClient {
     upstream_document: DocumentServiceClient<InterceptedService<Channel, BearerInterceptor>>,
     upstream_graph: GraphServiceClient<InterceptedService<Channel, BearerInterceptor>>,
     upstream_file: FileServiceClient<InterceptedService<Channel, BearerInterceptor>>,
     upstream_tenant: TenantServiceClient<InterceptedService<Channel, BearerInterceptor>>,
+    /// Host this client was built for, kept only so `Debug` can name it.
+    /// An `Arc<str>` rather than a `String` so cloning the client stays
+    /// allocation-free, as its documentation promises.
+    host: Arc<str>,
+    /// Deadline applied to every unary RPC, from
+    /// [`RociaDbBuilder::request_timeout`]. `None` (the default) means no
+    /// client-side deadline at all.
+    request_timeout: Option<Duration>,
     /// `None` when auth is disabled. Used to service
     /// [`RociaDbClient::refresh_auth_token`].
     token_manager: Option<TokenManager>,
@@ -200,40 +390,99 @@ pub struct RociaDbClient {
     _token_refresh_guard: Option<Arc<TokenRefreshGuard>>,
 }
 
+// Manual `Debug` impl instead of `#[derive(Debug)]`: a derived impl would
+// print the four generated service clients (channel internals, and a
+// `BearerInterceptor` holding the cached bearer token) and the
+// `TokenManager` behind them. Host plus "is auth on" is the whole of what a
+// caller can act on, and neither is a credential.
+impl std::fmt::Debug for RociaDbClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RociaDbClient")
+            .field("host", &self.host)
+            .field("auth_enabled", &self.token_manager.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// One page of listed items with the cursor for the next page.
 ///
+/// Returned by every paginated read except the three document reads that
+/// also report a total count, which return [`DocumentPage<T>`] instead.
 /// `next_cursor` is `None` once the server has no further page. The cursor
 /// is opaque and must be passed back unchanged.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page<T> {
+    /// The items on this page, in the order the server returned them.
     pub items: Vec<T>,
+    /// Cursor to pass back to fetch the page after this one, or `None` when
+    /// this is the last page.
     pub next_cursor: Option<String>,
 }
 
-/// One page of document results, together with the total number of
-/// documents matching the request (before pagination). `items` and
-/// `next_cursor` follow the same contract as [`Page<T>`].
+/// Per-call options for a write whose only tunable is its idempotency key:
+/// [`RociaDbClient::delete_document`], [`RociaDbClient::put_node`],
+/// [`RociaDbClient::delete_edge`] and [`RociaDbClient::delete_file`].
 ///
-/// The cost of `total_count` is **not** the same across the three methods
-/// that produce it, because the server computes it differently for each:
-/// - [`RociaDbClient::list_documents`] (`ListDoc`): free — the server keeps
-///   a running per-collection counter updated on every write, so reading it
-///   costs nothing beyond the listing itself.
-/// - [`RociaDbClient::search_documents`] (`FindByField`): a count over the
-///   matching field-index entries.
-/// - [`RociaDbClient::query_documents`] (`QueryDoc`): expensive — the server
-///   only knows the total once it has filtered the *complete* candidate set
-///   for the query, so the cost scales with the number of candidates on
-///   every single call. Do not call this in a loop expecting a cheap
-///   number; fetch it once and cache it if the same query is issued
-///   repeatedly.
+/// A document write takes [`DocumentWriteOptions`] (a graph node binding on
+/// top of the key) and the two ergonomic uploads take
+/// [`FileUploadOptions`] / [`FileStreamUploadOptions`], but every one of
+/// them defaults its `request_id` the same way — stated once, below.
+///
+/// # Idempotency key defaults
+///
+/// The server deduplicates a write on `(tenant, operation, target,
+/// request_id)`, so a replay carrying the same `request_id` is recognized
+/// as the same write instead of being applied twice. Supply the key
+/// yourself — and reuse the same value on every retry — whenever a replay
+/// after a timeout must not write twice; markers expire after the server's
+/// `gc.request_ttl_secs` (24 hours by default).
+///
+/// Left unset, the SDK mints a fresh `"<operation>:<uuid>"` key on every
+/// call. That makes each call distinct, so it protects against a *network*
+/// replay of one call, not against the caller issuing the same logical
+/// write twice:
+///
+/// | Call | Generated `request_id` |
+/// | ---- | ---------------------- |
+/// | [`put_document`](RociaDbClient::put_document) | `put_document:{collection}:<uuid>` |
+/// | [`delete_document`](RociaDbClient::delete_document) | `delete_document:{collection}:<uuid>` |
+/// | [`put_node`](RociaDbClient::put_node), [`put_nodes`](RociaDbClient::put_nodes) | `put_node:<uuid>` |
+/// | [`add_edge`](RociaDbClient::add_edge), [`add_edges`](RociaDbClient::add_edges) | `add_edge:<uuid>` |
+/// | [`delete_edge`](RociaDbClient::delete_edge) | `delete_edge:<uuid>` |
+/// | [`upload_file`](RociaDbClient::upload_file), [`upload_file_chunked`](RociaDbClient::upload_file_chunked) | `upload_file:<uuid>` |
+/// | [`delete_file`](RociaDbClient::delete_file) | `delete_file:<uuid>` |
+///
+/// Two cases need a note beyond the table.
+/// [`put_document`](RociaDbClient::put_document) with a [`NodeBinding`]
+/// issues two writes and deliberately reuses the one `request_id` for both:
+/// the dedup scope includes the operation, so the `PutDoc` and `PutNode`
+/// markers cannot collide, and replaying the whole call stays idempotent.
+/// [`upload_file_stream`](RociaDbClient::upload_file_stream) generates
+/// nothing at all — it forwards whatever the caller put on the first
+/// message of the stream.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DocumentPage<T> {
-    pub items: Vec<T>,
-    pub next_cursor: Option<String>,
-    pub total_count: u64,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteOptions {
+    /// Idempotency key for the write. `None` lets the SDK generate one; see
+    /// the [idempotency key defaults](Self#idempotency-key-defaults).
+    pub request_id: Option<String>,
+}
+
+impl WriteOptions {
+    /// Options with every field at its default: no caller-supplied
+    /// idempotency key.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the idempotency key for this write; see the [idempotency key
+    /// defaults](Self#idempotency-key-defaults) for what happens without
+    /// one.
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
 }
 
 /// Build a `PageRequest` applying the SDK default page size.
@@ -244,6 +493,13 @@ pub struct DocumentPage<T> {
 /// (`limits.max_page_size`, 200 by default) is intentionally not
 /// duplicated here — it is configurable server-side, so any positive limit
 /// is forwarded unchanged and the server has the final say.
+///
+/// `PageRequest::limit` is an `optional` protobuf field, so leaving it
+/// unset is distinguishable on the wire from an explicit `0` and makes the
+/// server apply its own default (50). The SDK does not use that: it always
+/// sends an explicit limit, [`DEFAULT_PAGE_SIZE`] when the caller gave
+/// none, so the page size a caller gets never depends on the server's
+/// configuration.
 pub(crate) fn page_request(
     limit: Option<u32>,
     cursor: Option<&str>,
@@ -254,7 +510,7 @@ pub(crate) fn page_request(
         ));
     }
     Ok(Some(PageRequest {
-        limit: limit.unwrap_or(DEFAULT_PAGE_SIZE),
+        limit: Some(limit.unwrap_or(DEFAULT_PAGE_SIZE)),
         cursor: cursor.unwrap_or_default().to_string(),
     }))
 }
@@ -264,286 +520,39 @@ pub(crate) fn non_empty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-/// Validate that `node_label` and `node_graph` are either both set or both
-/// absent, before any network call. Pulled out of
-/// [`RociaDbClient::create_document`] as a pure function so the rule is
-/// unit-testable without a live client.
-fn validate_node_binding(node_label: &Option<String>, node_graph: &Option<String>) -> Result<()> {
-    if node_label.is_some() != node_graph.is_some() {
-        return Err(RociaDbError::validation(format!(
-            "node_label and node_graph must be provided together (got node_label={:?}, node_graph={:?})",
-            node_label, node_graph
-        )));
-    }
-    Ok(())
-}
-
-/// Supported document query operators exposed by the SDK.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy)]
-pub enum DocumentQueryOperator {
-    Eq,
-    In,
-    Contains,
-}
-
-impl DocumentQueryOperator {
-    fn as_proto(self) -> i32 {
-        match self {
-            Self::Eq => QueryOperator::Eq as i32,
-            Self::In => QueryOperator::In as i32,
-            Self::Contains => QueryOperator::Contains as i32,
-        }
-    }
-}
-
-/// Supported document sort directions exposed by the SDK.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy)]
-pub enum DocumentQuerySortDirection {
-    Asc,
-    Desc,
-}
-
-impl DocumentQuerySortDirection {
-    fn as_proto(self) -> i32 {
-        match self {
-            Self::Asc => SortDirection::Asc as i32,
-            Self::Desc => SortDirection::Desc as i32,
-        }
-    }
-}
-
-/// Filter definition for `QueryDoc`.
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct DocumentQueryFilter {
-    pub field: String,
-    pub operator: DocumentQueryOperator,
-    pub values: Vec<Value>,
-}
-
-impl DocumentQueryFilter {
-    /// Build a filter on `field`, comparing it against `values` with
-    /// `operator`. How many values an operator expects is the server's
-    /// contract, not the SDK's: `Eq` takes one, `In` takes the set to match.
-    pub fn new(
-        field: impl Into<String>,
-        operator: DocumentQueryOperator,
-        values: Vec<Value>,
-    ) -> Self {
-        Self {
-            field: field.into(),
-            operator,
-            values,
-        }
-    }
-}
-
-/// Sort definition for `QueryDoc`.
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct DocumentQuerySort {
-    pub field: String,
-    pub direction: DocumentQuerySortDirection,
-}
-
-impl DocumentQuerySort {
-    /// Sort on `field` in `direction`.
-    pub fn new(field: impl Into<String>, direction: DocumentQuerySortDirection) -> Self {
-        Self {
-            field: field.into(),
-            direction,
-        }
-    }
-}
-
-/// One node to upsert, used by [`RociaDbClient::put_nodes`].
-///
-/// `node_id` is the **complete** node id (for example `"product:sku-1"`),
-/// not a `(label, id)` pair for the SDK to reassemble: `label:id` remains a
-/// usage convention, not something the server enforces or the SDK
-/// recomposes.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq)]
-pub struct NodeInput {
-    pub node_id: String,
-    pub value: Value,
-    /// Idempotency key for this item's `PutNode` call. When `None`, one is
-    /// generated automatically (`put_node:<uuid>` — the same prefix
-    /// [`RociaDbClient::put_node`] uses for a single-item write, so a
-    /// `PutNode` call always carries the same default prefix regardless of
-    /// which path produced it). Provide it explicitly — and reuse the same
-    /// value on a retry — so a batch replayed after a timeout resumes
-    /// safely: the server deduplicates on `(tenant, operation,
-    /// request_id)`, so a repeated `request_id` is recognized as the same
-    /// write rather than a new one.
-    pub request_id: Option<String>,
-}
-
-impl NodeInput {
-    /// Upsert `value` at `node_id`, letting the SDK generate the
-    /// idempotency key. Chain [`NodeInput::with_request_id`] to supply your
-    /// own — which is what makes a retried batch safe to replay.
-    pub fn new(node_id: impl Into<String>, value: Value) -> Self {
-        Self {
-            node_id: node_id.into(),
-            value,
-            request_id: None,
-        }
-    }
-
-    /// Set the idempotency key for this item; see [`NodeInput::request_id`].
-    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
-        self.request_id = Some(request_id.into());
-        self
-    }
-}
-
-/// One edge to upsert, used by [`RociaDbClient::add_edges`].
-///
-/// `edge_id` is raw and must not be prefixed with `label`.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq)]
-pub struct EdgeInput {
-    pub edge_id: String,
-    pub from: String,
-    pub to: String,
-    pub label: String,
-    pub value: Value,
-    /// Idempotency key for this item's `AddEdge` call. When `None`, one is
-    /// generated automatically (a bare UUID, with no prefix). See
-    /// [`NodeInput::request_id`] for why reusing it on a retry matters.
-    pub request_id: Option<String>,
-}
-
-impl EdgeInput {
-    /// Upsert an edge `label` carrying `value`, running `from` -> `to`,
-    /// letting the SDK generate the idempotency key. Chain
-    /// [`EdgeInput::with_request_id`] to supply your own. `edge_id` is raw:
-    /// do not prefix it with `label`.
-    pub fn new(
-        edge_id: impl Into<String>,
-        from: impl Into<String>,
-        to: impl Into<String>,
-        label: impl Into<String>,
-        value: Value,
-    ) -> Self {
-        Self {
-            edge_id: edge_id.into(),
-            from: from.into(),
-            to: to.into(),
-            label: label.into(),
-            value,
-            request_id: None,
-        }
-    }
-
-    /// Set the idempotency key for this item; see [`EdgeInput::request_id`].
-    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
-        self.request_id = Some(request_id.into());
-        self
-    }
-}
-
-/// Build the ordered `PutNodeRequest` batch for [`RociaDbClient::put_nodes`].
-/// Pulled out as a pure, network-free function — the same way
-/// [`crate::file::chunk_upload_requests`] is for uploads — so the batch's
-/// wire shape is unit-testable without a live client: item order is
-/// preserved (`nodes` is consumed via `into_iter` in the order given),
-/// duplicate `node_id`s are not merged (each `NodeInput` becomes exactly
-/// one `PutNodeRequest`), and `request_id` is passed through unchanged or
-/// defaulted to `put_node:<uuid>` when absent — the same default prefix
-/// [`RociaDbClient::put_node`] uses for a single-item write, so every
-/// `PutNode` call defaults consistently regardless of whether it went
-/// through the batch or single-item path.
-fn build_put_node_requests(
-    tenant_id: &str,
-    graph_name: &str,
-    nodes: Vec<NodeInput>,
-) -> Result<Vec<PutNodeRequest>> {
-    nodes
-        .into_iter()
-        .map(|node| {
-            let json = serde_json::to_vec(&node.value).encode_context("node json")?;
-            Ok(PutNodeRequest {
-                tenant_id: tenant_id.to_string(),
-                graph: graph_name.to_string(),
-                node_id: node.node_id,
-                json,
-                request_id: node
-                    .request_id
-                    .unwrap_or_else(|| format!("put_node:{}", Uuid::new_v4())),
-            })
-        })
-        .collect()
-}
-
-/// Build the ordered `AddEdgeRequest` batch for [`RociaDbClient::add_edges`].
-/// Same rationale and guarantees as [`build_put_node_requests`]: order
-/// preserved, duplicate `edge_id`s not merged, `request_id` passed through
-/// unchanged or defaulted to a bare UUID (no prefix) when absent.
-fn build_add_edge_requests(
-    tenant_id: &str,
-    graph_name: &str,
-    edges: Vec<EdgeInput>,
-) -> Result<Vec<AddEdgeRequest>> {
-    edges
-        .into_iter()
-        .map(|edge| {
-            let json = serde_json::to_vec(&edge.value).encode_context("edge json")?;
-            debug!(
-                tenant_id = tenant_id,
-                graph = graph_name,
-                edge_id = edge.edge_id,
-                from = edge.from,
-                to = edge.to,
-                label = edge.label,
-                "prepared graph edge upsert"
-            );
-            Ok(AddEdgeRequest {
-                tenant_id: tenant_id.to_string(),
-                graph: graph_name.to_string(),
-                edge_id: edge.edge_id,
-                from: edge.from,
-                to: edge.to,
-                label: edge.label,
-                json,
-                request_id: edge
-                    .request_id
-                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
-            })
-        })
-        .collect()
-}
-
-/// Default idempotency key for the `PutDoc` write issued by
-/// [`RociaDbClient::create_document`] when the caller does not use
-/// [`RociaDbClient::create_document_with_request_id`] directly. Pulled out
-/// as a pure, network-free function — the same reason
-/// [`build_put_node_requests`] and [`build_add_edge_requests`] exist — so
-/// the exact default prefix (`put_document:{collection}:<uuid>`, matching
-/// [`RociaDbClient::put_document`]'s own default) is unit-testable without
-/// a live client or a network call.
-fn default_document_request_id(collection_name: &str) -> String {
-    format!("put_document:{}:{}", collection_name, Uuid::new_v4())
-}
-
-/// Reject a `host` URL whose path is neither empty nor `"/"`, before any
-/// connection attempt: a mistyped host carrying a leftover path (for
-/// example `http://127.0.0.1:50051/v1` pasted from somewhere else) would
-/// otherwise be silently accepted by tonic, which simply ignores the path
-/// component when dialing.
+/// Reject a `host` URL that carries anything beyond a hostname and port,
+/// before any connection attempt: a mistyped host with a leftover path (for
+/// example `http://127.0.0.1:50051/v1` pasted from somewhere else), a query
+/// string (`http://127.0.0.1:50051?debug=1`), or a fragment
+/// (`http://127.0.0.1:50051#note`) would otherwise be silently accepted by
+/// tonic, which only reads the authority when dialing and drops everything
+/// else on the floor with no error — including a query string a caller
+/// might expect to reach the server.
 ///
 /// `http::Uri::path()` already returns `"/"` for a URI with no explicit
-/// path component (verified against `http` 1.x), so this rejects strictly
-/// more than "path is exactly absent".
+/// path component (verified against `http` 1.x), so the path check rejects
+/// strictly more than "path is exactly absent". The fragment check runs
+/// against the raw string before any parsing happens: `http::Uri` itself
+/// scans off and silently discards a fragment while building the `Uri`
+/// value (see its `PathAndQuery` parser), so by the time a `Uri` exists
+/// there is no `fragment()` accessor left to consult here — the fragment
+/// has already vanished.
 fn validate_host_path(host: &str) -> Result<()> {
-    let uri: http::Uri = host.parse().connection_context("invalid upstream host")?;
+    if host.contains('#') {
+        return Err(RociaDbError::config(format!(
+            "RociaDB host must contain only a hostname and port, got a fragment in {host:?}"
+        )));
+    }
+    let uri: http::Uri = host.parse().config_context("invalid upstream host")?;
     let path = uri.path();
     if !path.is_empty() && path != "/" {
-        return Err(RociaDbError::connection(format!(
+        return Err(RociaDbError::config(format!(
             "RociaDB host must contain only a hostname and port, got path {path:?}"
+        )));
+    }
+    if let Some(query) = uri.query() {
+        return Err(RociaDbError::config(format!(
+            "RociaDB host must contain only a hostname and port, got query {query:?}"
         )));
     }
     Ok(())
@@ -558,11 +567,73 @@ fn validate_host_path(host: &str) -> Result<()> {
 fn resolve_connect_timeout(explicit: Option<Duration>) -> Result<Duration> {
     let connect_timeout = explicit.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
     if connect_timeout.is_zero() {
-        return Err(RociaDbError::validation(
+        return Err(RociaDbError::config(
             "connect timeout must be greater than zero",
         ));
     }
     Ok(connect_timeout)
+}
+
+/// Resolve the per-RPC deadline [`RociaDbBuilder::build`] applies: whatever
+/// [`RociaDbBuilder::request_timeout`] was given, or `None` for "no
+/// client-side deadline". There is deliberately no default — unlike the
+/// connect timeout, a request deadline depends on what the caller's own
+/// calls do (a `query_documents` over a large collection is not a
+/// `get_document`), so guessing one would break slow-but-healthy calls.
+///
+/// A zero timeout is rejected, exactly as for the connect timeout: it would
+/// mean "every RPC fails instantly", which is never what a caller who
+/// reached for this method wanted.
+fn resolve_request_timeout(explicit: Option<Duration>) -> Result<Option<Duration>> {
+    if explicit.is_some_and(|timeout| timeout.is_zero()) {
+        return Err(RociaDbError::config(
+            "request timeout must be greater than zero",
+        ));
+    }
+    Ok(explicit)
+}
+
+/// Build the [`RociaDbError::Status`] a per-RPC deadline produces, carrying a
+/// real [`tonic::Status`] so [`RociaDbError::code`] reports
+/// [`tonic::Code::DeadlineExceeded`] like any other status.
+fn deadline_exceeded(operation: &'static str, timeout: Duration) -> RociaDbError {
+    RociaDbError::Status {
+        operation,
+        status: tonic::Status::deadline_exceeded(format!(
+            "the client-side request timeout of {}ms expired",
+            u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
+        )),
+    }
+}
+
+/// Whether `status` is `tonic`'s own report that the `grpc-timeout` header
+/// expired, rather than anything the server said.
+///
+/// tonic's client channel enforces that header locally, through a timeout
+/// layer of its own (`GrpcTimeout`, in `tonic::transport::service`) — but it
+/// maps the expiry to `CANCELLED`, not `DEADLINE_EXCEEDED`, and it covers the
+/// call only up to the response headers. A caller who set
+/// [`RociaDbBuilder::request_timeout`] should see one code for one cause
+/// whichever layer notices first, so this recognizes tonic's outcome and
+/// [`RociaDbClient::attempt`] reports it as the same [`deadline_exceeded`] as
+/// its own `tokio::time::timeout`.
+///
+/// The test is a walk of the status's source chain looking for
+/// [`tonic::TimeoutExpired`] rather than a match on the status message:
+/// `tonic::Status::try_from_error` keeps the error it was built from as the
+/// status's `source`, so the marker type is there to be found (nested inside
+/// a `tonic::transport::Error`) and nothing depends on the wording tonic
+/// chose. A status the server sent carries no source at all, so a genuine
+/// server-sent `CANCELLED` can never match.
+fn is_local_deadline_expired(status: &tonic::Status) -> bool {
+    let mut source = std::error::Error::source(status);
+    while let Some(error) = source {
+        if error.is::<tonic::TimeoutExpired>() {
+            return true;
+        }
+        source = error.source();
+    }
+    false
 }
 
 impl Default for RociaDbBuilder {
@@ -575,39 +646,67 @@ impl Default for RociaDbBuilder {
                 client_secret: None,
             },
             connect_timeout: None,
+            request_timeout: None,
+            tls_config: None,
+            http2_keep_alive: None,
         }
     }
 }
 
 impl RociaDbBuilder {
-    /// Create a builder with default settings.
+    /// Create a builder with default settings: host
+    /// `http://127.0.0.1:50051`, auth enabled and read from the
+    /// `AUTH_TOKEN_URL`, `AUTH_CLIENT_ID` and `AUTH_CLIENT_SECRET`
+    /// environment variables unless
+    /// [`auth_client_credentials`](Self::auth_client_credentials) supplies
+    /// them.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Set the upstream host (ex: http://127.0.0.1:50051).
-    pub fn host(&mut self, host: impl Into<String>) -> &mut Self {
+    /// Set the upstream host (for example `http://127.0.0.1:50051`).
+    ///
+    /// Only a scheme, host and port are accepted; a path, query string or
+    /// fragment is rejected by [`build`](Self::build) rather than silently
+    /// dropped when dialing.
+    pub fn host(mut self, host: impl Into<String>) -> Self {
         self.host = Some(host.into());
         self
     }
 
-    /// Configure OAuth2 client credentials for upstream auth.
+    /// Configure OAuth2 client credentials for upstream auth, overriding
+    /// the `AUTH_TOKEN_URL`, `AUTH_CLIENT_ID` and `AUTH_CLIENT_SECRET`
+    /// environment variables [`build`](Self::build) would otherwise read.
+    ///
+    /// `client_secret` is wrapped in a [`SecretString`] the moment it
+    /// arrives, so from here on it is redacted in `Debug` output and
+    /// zeroized when the builder and the clients built from it are dropped.
+    /// The parameter stays `impl Into<String>` so the ordinary cases
+    /// (`&str`, `String`, `std::env::var(..)?`) keep working; pass an owned
+    /// `String` where you can, since it moves straight into the secret
+    /// instead of being copied out of a buffer nothing will scrub. A caller
+    /// already holding a `SecretString` hands over
+    /// `secret.expose_secret().to_string()` — one deliberate, visible
+    /// exposure, which is the point of the type.
     pub fn auth_client_credentials(
-        &mut self,
+        mut self,
         token_url: impl Into<String>,
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
-    ) -> &mut Self {
+    ) -> Self {
         self.auth = BuilderAuthConfig::Enabled {
             token_url: Some(token_url.into()),
             client_id: Some(client_id.into()),
-            client_secret: Some(client_secret.into()),
+            client_secret: Some(SecretString::from(client_secret.into())),
         };
         self
     }
 
     /// Disable auth headers on outgoing requests.
-    pub fn disable_auth(&mut self) -> &mut Self {
+    ///
+    /// Intended for a controlled local or test deployment only:
+    /// [`build`](Self::build) emits a `warn!` when it takes effect.
+    pub fn disable_auth(mut self) -> Self {
         self.auth = BuilderAuthConfig::Disabled;
         self
     }
@@ -615,43 +714,241 @@ impl RociaDbBuilder {
     /// Set the deadline used while connecting to the upstream host.
     ///
     /// The value is stored as-is here (no validation), the same way
-    /// [`RociaDbBuilder::host`] and
-    /// [`RociaDbBuilder::auth_client_credentials`] never validate before
-    /// [`RociaDbBuilder::build`] — validation (rejecting a zero timeout)
-    /// happens there instead. When this is never called, `build()` applies
-    /// a 10-second default unconditionally: without any timeout at all,
-    /// `.connect().await` could hang forever against a host with slow
-    /// DNS/TCP, which is a robustness gap rather than a mere convenience.
-    pub fn connect_timeout(&mut self, timeout: Duration) -> &mut Self {
+    /// [`host`](Self::host) and
+    /// [`auth_client_credentials`](Self::auth_client_credentials) never
+    /// validate before [`build`](Self::build) — validation (rejecting a
+    /// zero timeout) happens there instead. When this is never called,
+    /// `build()` applies a 10-second default unconditionally: without any
+    /// timeout at all, `.connect().await` could hang forever against a host
+    /// with slow DNS/TCP, which is a robustness gap rather than a mere
+    /// convenience.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Set a deadline for every unary RPC the client issues.
+    ///
+    /// Opt-in with no default: a request deadline depends on what the
+    /// caller's own calls do, so the SDK never invents one. The value is
+    /// stored as-is (a zero duration is rejected by
+    /// [`build`](Self::build), like the connect timeout, rather than here).
+    ///
+    /// # How it is enforced
+    ///
+    /// Two ways at once, per attempt:
+    ///
+    /// - the `grpc-timeout` header is set on the request, so the **server**
+    ///   learns the deadline and can abandon the work instead of finishing a
+    ///   call nobody is waiting for. tonic's client channel also enforces
+    ///   that header locally, but only up to the response headers;
+    /// - the whole call future is wrapped in a `tokio::time::timeout`, which
+    ///   additionally covers decoding the response message and its trailers.
+    ///
+    /// Either way the call fails with [`RociaDbError::Status`] whose
+    /// [`code`](RociaDbError::code) is
+    /// [`DeadlineExceeded`](tonic::Code::DeadlineExceeded).
+    ///
+    /// # What it does not cover
+    ///
+    /// The deadline is **per attempt**, not per call: when auth is enabled
+    /// and the first attempt comes back `UNAUTHENTICATED`, the refreshed
+    /// retry gets a fresh deadline of its own, so a single call can take up
+    /// to twice this long (see [`RociaDbClient::refresh_auth_token`]). The
+    /// same is true of each attempt made by
+    /// [`RociaDbClient::retry`].
+    ///
+    /// The file transfers are deliberately **not** covered — neither the two
+    /// streaming RPCs themselves ([`upload_file_stream`],
+    /// [`download_file_stream`]) nor the [`upload_file`],
+    /// [`upload_file_chunked`] and [`download_file`] helpers built on them.
+    /// How long a stream the caller is feeding or draining may take is a
+    /// property of that stream's own data rate, not of the SDK, and a
+    /// deadline meant for a single unary round trip would abort a perfectly
+    /// healthy multi-gigabyte transfer. Bound those with a
+    /// `tokio::time::timeout` of your own around the call.
+    ///
+    /// [`upload_file`]: RociaDbClient::upload_file
+    /// [`upload_file_chunked`]: RociaDbClient::upload_file_chunked
+    /// [`upload_file_stream`]: RociaDbClient::upload_file_stream
+    /// [`download_file`]: RociaDbClient::download_file
+    /// [`download_file_stream`]: RociaDbClient::download_file_stream
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    /// Replace the TLS configuration used when dialing the upstream host.
+    ///
+    /// Without this, [`build`](Self::build) uses
+    /// `ClientTlsConfig::new().with_native_roots()` — the operating system's
+    /// trust store, which is also what the OAuth2 HTTP client trusts. Supply
+    /// your own to add a private CA
+    /// ([`ca_certificate`](ClientTlsConfig::ca_certificate)), to present a
+    /// client certificate for mTLS
+    /// ([`identity`](ClientTlsConfig::identity)), or to override the name
+    /// the server's certificate is verified against
+    /// ([`domain_name`](ClientTlsConfig::domain_name)).
+    ///
+    /// **tonic only applies TLS to an `https://` host.** A configuration
+    /// passed here is stored on the endpoint either way, but it has no
+    /// effect on a `http://` host: the connector decides whether to wrap the
+    /// socket from the URI scheme alone, so a `http://` host silently stays
+    /// plaintext. If TLS matters, the host must say `https://`.
+    ///
+    /// Has no effect on [`build_with_channel`](Self::build_with_channel),
+    /// which does no dialing — configure TLS on the channel you build there.
+    pub fn tls_config(mut self, tls_config: ClientTlsConfig) -> Self {
+        self.tls_config = Some(tls_config);
+        self
+    }
+
+    /// Send HTTP/2 keep-alive pings on the connection, every `interval`,
+    /// closing it when a ping goes `timeout` unanswered.
+    ///
+    /// Off by default, which is tonic's own default. Turn it on for a client
+    /// that holds a connection open through something that silently drops
+    /// idle flows — a NAT, a stateful firewall, a cloud load balancer: with
+    /// no keep-alive the SDK only discovers the dead connection when the
+    /// next RPC fails on it. `keep_alive_while_idle(true)` is implied, so the
+    /// pings continue while no RPC is in flight, which is exactly when the
+    /// flow would otherwise be reaped.
+    ///
+    /// Pick an `interval` comfortably shorter than the idle timeout you are
+    /// working around (30 s against a 60 s NAT, say) and a `timeout` of a few
+    /// seconds. An `interval` far shorter than that wastes a round trip per
+    /// tick per connection, and some servers reject pings they consider too
+    /// frequent with an HTTP/2 `ENHANCE_YOUR_CALM`.
+    ///
+    /// Applies to [`build`](Self::build) only, like every other endpoint
+    /// setting: [`build_with_channel`](Self::build_with_channel) uses the
+    /// channel as given.
+    pub fn http2_keep_alive(mut self, interval: Duration, timeout: Duration) -> Self {
+        self.http2_keep_alive = Some((interval, timeout));
         self
     }
 
     /// Build a client connected to the upstream.
     ///
+    /// Takes `&self`, so the same builder can be reused to produce several
+    /// clients.
+    ///
     /// When auth is enabled, this fetches the first token and starts a
     /// background task that refreshes it before it expires (the IdP's
     /// tokens are short-lived — 600 seconds today) for as long as the
-    /// returned `RociaDbClient` or any of its clones is kept alive. Call
-    /// [`RociaDbClient::refresh_auth_token`] after an `UNAUTHENTICATED`
-    /// error to force an out-of-band refresh.
+    /// returned `RociaDbClient` or any of its clones is kept alive; a
+    /// refresh that fails is retried on a short backoff until one succeeds.
+    /// Every unary RPC also refreshes and retries once on its own when the
+    /// server answers `UNAUTHENTICATED`, so
+    /// [`RociaDbClient::refresh_auth_token`] is only needed to drive a
+    /// refresh out of band.
+    ///
+    /// # Errors
+    ///
+    /// [`RociaDbError::Config`] for anything wrong with the configuration —
+    /// a missing or malformed host, a missing `AUTH_*` value, a zero
+    /// timeout, a TLS configuration the endpoint rejects — all detected
+    /// before any socket is opened. [`RociaDbError::Connection`] when the
+    /// dial itself fails, and [`RociaDbError::Auth`] when the IdP does.
     pub async fn build(&self) -> Result<RociaDbClient> {
         let host = self
             .host
             .as_ref()
-            .ok_or_else(|| RociaDbError::connection("missing upstream host"))?;
-        info!(host = %host, "building rocia db client");
+            .ok_or_else(|| RociaDbError::config("missing upstream host"))?;
+        debug!(
+            host = %host,
+            auth_enabled = !matches!(self.auth, BuilderAuthConfig::Disabled),
+            "building rocia db client"
+        );
         validate_host_path(host)?;
         let connect_timeout = resolve_connect_timeout(self.connect_timeout)?;
-        let endpoint = Endpoint::from_shared(host.clone())
-            .connection_context("invalid upstream host")?
-            .tls_config(ClientTlsConfig::new().with_native_roots())
-            .connection_context("failed to configure TLS")?
+        let tls_config = self
+            .tls_config
+            .clone()
+            .unwrap_or_else(|| ClientTlsConfig::new().with_native_roots());
+        let mut endpoint = Endpoint::from_shared(host.clone())
+            .config_context("invalid upstream host")?
+            .tls_config(tls_config)
+            .config_context("failed to configure TLS")?
             .connect_timeout(connect_timeout);
+        if let Some((interval, timeout)) = self.http2_keep_alive {
+            endpoint = endpoint
+                .http2_keep_alive_interval(interval)
+                .keep_alive_timeout(timeout)
+                // Without this, tonic only pings while an RPC is in flight —
+                // which is never the case for the idle connection this
+                // setting exists to keep alive.
+                .keep_alive_while_idle(true);
+        }
         let channel = endpoint
             .connect()
             .await
             .connection_context("failed to connect to upstream")?;
+        self.build_on_channel(channel, host.clone(), connect_timeout)
+            .await
+    }
+
+    /// Build a client on a [`Channel`] the caller already has, skipping both
+    /// host validation and dialing.
+    ///
+    /// Everything auth-related still happens exactly as in
+    /// [`build`](Self::build): the first token is fetched, the background
+    /// refresh starts, and the bearer interceptor is installed on all four
+    /// service clients. What is skipped is only what belongs to the channel:
+    /// the host URL checks, the TLS configuration and the HTTP/2 keep-alive
+    /// settings, because the channel handed in has already decided all of
+    /// it.
+    ///
+    /// Use this for a transport `Endpoint` cannot express on its own: a
+    /// custom connector (`Endpoint::connect_with_connector`), a Unix domain
+    /// socket, a load-balanced `Channel::balance_list`, or an in-process
+    /// server in a test. A lazy channel
+    /// (`Endpoint::connect_lazy`) works too, and moves the first connection
+    /// attempt to the first RPC.
+    ///
+    /// Both timeouts are still read and still validated.
+    /// [`request_timeout`](Self::request_timeout) applies to every unary RPC
+    /// however the channel was built, and
+    /// [`connect_timeout`](Self::connect_timeout) is what the OAuth2 HTTP
+    /// client uses to reach the IdP — the one connection this method does
+    /// open itself.
+    ///
+    /// [`Debug`](std::fmt::Debug) on the returned client reports the host
+    /// *configured on the builder*, which here is only a label — the channel
+    /// decides where the requests actually go.
+    pub async fn build_with_channel(&self, channel: Channel) -> Result<RociaDbClient> {
+        let host = self
+            .host
+            .clone()
+            .unwrap_or_else(|| "<caller-supplied channel>".to_string());
+        debug!(
+            host = %host,
+            auth_enabled = !matches!(self.auth, BuilderAuthConfig::Disabled),
+            "building rocia db client on a caller-supplied channel"
+        );
+        let connect_timeout = resolve_connect_timeout(self.connect_timeout)?;
+        self.build_on_channel(channel, host, connect_timeout).await
+    }
+
+    /// The half of building a client that has nothing to do with the
+    /// channel: resolve the request timeout, set up authentication, and wrap
+    /// the channel in the four generated service clients.
+    ///
+    /// Shared by [`build`](Self::build) and
+    /// [`build_with_channel`](Self::build_with_channel) so the token-manager
+    /// setup — which is where the subtle parts are (environment fallbacks, a
+    /// timeout-carrying HTTP client, the background refresh guard the client
+    /// must keep alive) — exists exactly once.
+    ///
+    /// `connect_timeout` is passed in rather than re-resolved: both callers
+    /// have already validated it, `build` because it also dials with it.
+    async fn build_on_channel(
+        &self,
+        channel: Channel,
+        host: String,
+        connect_timeout: Duration,
+    ) -> Result<RociaDbClient> {
+        let request_timeout = resolve_request_timeout(self.request_timeout)?;
         let (interceptor, token_manager, token_refresh_guard) = match &self.auth {
             BuilderAuthConfig::Disabled => {
                 warn!(host = %host, "building rocia db client with auth disabled");
@@ -666,39 +963,50 @@ impl RociaDbBuilder {
                     .clone()
                     .or_else(|| env::var(AUTH_TOKEN_URL_ENV).ok())
                     .ok_or_else(|| {
-                        RociaDbError::connection("missing auth token url (set AUTH_TOKEN_URL)")
+                        RociaDbError::config("missing auth token url (set AUTH_TOKEN_URL)")
                     })?;
                 let client_id = client_id
                     .clone()
                     .or_else(|| env::var(AUTH_CLIENT_ID_ENV).ok())
                     .ok_or_else(|| {
-                        RociaDbError::connection("missing auth client id (set AUTH_CLIENT_ID)")
+                        RociaDbError::config("missing auth client id (set AUTH_CLIENT_ID)")
                     })?;
                 let client_secret = client_secret
                     .clone()
-                    .or_else(|| env::var(AUTH_CLIENT_SECRET_ENV).ok())
+                    .or_else(|| {
+                        env::var(AUTH_CLIENT_SECRET_ENV)
+                            .ok()
+                            .map(SecretString::from)
+                    })
                     .ok_or_else(|| {
-                        RociaDbError::connection(
-                            "missing auth client secret (set AUTH_CLIENT_SECRET)",
-                        )
+                        RociaDbError::config("missing auth client secret (set AUTH_CLIENT_SECRET)")
                     })?;
+
+                // Both timeouts matter: without them a token endpoint that
+                // accepts the connection and never answers would hang this
+                // `build()` — and every later refresh, each holding the
+                // refresh lock — indefinitely.
+                let http = reqwest::Client::builder()
+                    .connect_timeout(connect_timeout)
+                    .timeout(OAUTH_HTTP_REQUEST_TIMEOUT)
+                    .build()
+                    .config_context("failed to build the OAuth2 HTTP client")?;
 
                 // `token_url`/`client_id` are deliberately not logged here:
                 // they expose the auth infrastructure (IdP endpoint, OAuth2
                 // client identity) in any log pipeline configured at debug
                 // level.
                 debug!(host = %host, "initializing upstream token manager");
-                let token_manager =
-                    TokenManager::new(reqwest::Client::new(), token_url, client_id, client_secret)
-                        .await
-                        .auth_context("failed to initialize token manager")?;
+                let token_manager = TokenManager::new(http, token_url, client_id, client_secret)
+                    .await
+                    .auth_context("failed to initialize token manager")?;
                 let interceptor = token_manager.interceptor();
                 // Without a background refresh, the IdP token would simply
                 // expire after its `expires_in` (600s here). Start it now
                 // and keep the guard alive inside the client for as long as
                 // it (or any clone of it) exists.
                 let refresh_interval = token_manager.refresh_interval();
-                info!(
+                debug!(
                     host = %host,
                     refresh_interval_secs = refresh_interval.as_secs(),
                     "starting background token refresh"
@@ -714,12 +1022,13 @@ impl RociaDbBuilder {
         let upstream_file =
             FileServiceClient::with_interceptor(channel.clone(), interceptor.clone());
         let upstream_tenant = TenantServiceClient::with_interceptor(channel, interceptor);
-        info!(host = %host, "rocia db client ready");
         Ok(RociaDbClient {
             upstream_document,
             upstream_graph,
             upstream_file,
             upstream_tenant,
+            host: Arc::from(host.as_str()),
+            request_timeout,
             token_manager,
             _token_refresh_guard: token_refresh_guard,
         })
@@ -729,11 +1038,24 @@ impl RociaDbBuilder {
 impl RociaDbClient {
     /// Force an immediate refresh of the upstream auth token.
     ///
-    /// Call this after an RPC fails with `UNAUTHENTICATED` — the server
-    /// treats that status as the signal to renew the token, as opposed to
+    /// **Every unary RPC already does this for you**, once, whenever the
+    /// server answers `UNAUTHENTICATED`: the token is refreshed (coalesced
+    /// with any concurrent refresh) and the call is re-issued a single time,
+    /// so a caller normally sees that status only when the retry failed too.
+    /// A background task also refreshes the token before it expires, and
+    /// retries on a short backoff when a refresh fails.
+    ///
+    /// What is left for this method is the out-of-band cases: a token you
+    /// know has been revoked, a credential rotation you want to pick up
+    /// immediately, a streaming upload or download (neither of which is
+    /// retried automatically — the automatic path covers unary RPCs only)
+    /// that failed with `UNAUTHENTICATED`, or code that wants to pay the
+    /// refresh cost up front rather than on the next call.
+    ///
+    /// `UNAUTHENTICATED` is the renewal signal, as opposed to
     /// `PERMISSION_DENIED`, which means the token is valid but lacks the
-    /// required scope and retrying after a refresh will not help. A no-op
-    /// returning `Ok(())` when the client was built with
+    /// required scope — refreshing it will not help. A no-op returning
+    /// `Ok(())` when the client was built with
     /// [`RociaDbBuilder::disable_auth`].
     pub async fn refresh_auth_token(&self) -> Result<()> {
         match &self.token_manager {
@@ -760,798 +1082,142 @@ impl RociaDbClient {
             manager.request_refresh();
         }
     }
-}
 
-impl RociaDbClient {
-    /// Create or update a document, and optionally a graph node reference.
+    /// Issue one unary RPC: wrap `message` in a [`tonic::Request`], apply
+    /// the per-RPC deadline, hand it to `call`, refresh-and-retry once on
+    /// `UNAUTHENTICATED`, and map a non-OK [`tonic::Status`] into
+    /// [`RociaDbError::Status`] tagged with `operation`.
     ///
-    /// `node_label` and `node_graph` must be provided together: if only one
-    /// of them is set, this returns an error before any network call.
+    /// Every unary call in the crate goes through here — including the ones
+    /// the batch helpers ([`RociaDbClient::put_nodes`],
+    /// [`RociaDbClient::add_edges`]) and the neighbor-node fan-out issue
+    /// one per item. Only the two streaming RPCs (`Upload`, `Download`) call
+    /// the generated client directly, because neither a per-call deadline
+    /// nor a transparent replay applies to a stream the caller is feeding
+    /// or draining.
     ///
-    /// This call is **not atomic**: the document is written first, and the
-    /// graph node binding (when requested) is written second. If the node
-    /// write fails, the document is left in place without its node
-    /// binding — callers that need both or neither must handle that
-    /// themselves (for example by retrying the node write, or by treating
-    /// a document without its expected node as needing repair).
-    pub async fn create_document(
+    /// That single choke point is the point: both behaviours below are
+    /// properties of "any unary RPC", and belong here rather than repeated
+    /// at twenty call sites.
+    ///
+    /// # Deadline
+    ///
+    /// When [`RociaDbBuilder::request_timeout`] was set, each attempt both
+    /// carries a `grpc-timeout` header (so the server can abandon the work)
+    /// and is wrapped in a `tokio::time::timeout` (which also covers
+    /// decoding the response body, unlike tonic's own header-phase
+    /// enforcement). Both paths surface the same
+    /// `DEADLINE_EXCEEDED`-carrying error.
+    ///
+    /// # Refresh-and-retry on `UNAUTHENTICATED`
+    ///
+    /// With auth enabled, a first attempt answered `UNAUTHENTICATED` — the
+    /// status the server uses to mean "renew your token" — triggers
+    /// [`TokenManager::refresh_now`](auth::TokenManager::refresh_now), which
+    /// coalesces with any refresh already in flight, and the call is
+    /// re-issued exactly once. Never more than once: a second
+    /// `UNAUTHENTICATED` against a token minted moments earlier is a
+    /// credential or scope problem that looping cannot fix. If the refresh
+    /// itself fails, the *original* `UNAUTHENTICATED` is returned (it
+    /// describes what the caller actually asked for) and the refresh failure
+    /// is reported as a `warn!`.
+    ///
+    /// This is why `Req: Clone`: the first attempt consumes `message`, so a
+    /// replay needs a copy made beforehand. The clone happens only when auth
+    /// is enabled — with `disable_auth()` no refresh exists, nothing can be
+    /// replayed, and every RPC in the crate would otherwise pay for a copy
+    /// that is never read.
+    ///
+    /// `call` takes the whole `tonic::Request` (not just the message) so
+    /// this function stays the only place that touches per-call metadata
+    /// and extensions. It is `Fn`, not `FnOnce`, for the same replay reason.
+    pub(crate) async fn unary<Req, Resp, F, Fut>(
         &self,
-        tenant_id: &str,
-        collection_name: &str,
-        document_id: &str,
-        value: Value,
-        node_label: Option<String>,
-        node_graph: Option<String>,
-    ) -> Result<()> {
-        let request_id = default_document_request_id(collection_name);
-        self.create_document_with_request_id(
-            tenant_id,
-            collection_name,
-            document_id,
-            &value,
-            node_label,
-            node_graph,
-            request_id,
-        )
-        .await
-    }
-
-    /// Same as [`RociaDbClient::create_document`], with a caller-provided
-    /// idempotency key for the document write (the `PutDoc` call only — the
-    /// graph node binding, when requested, keeps generating its own key,
-    /// exactly as it already does in [`RociaDbClient::create_document`]).
-    /// Reuse the same `request_id` on a retry so the server recognizes a
-    /// repeated write instead of applying it twice.
-    ///
-    /// Unlike [`RociaDbClient::create_document`], `value` is generic over
-    /// any `Serialize` type — consistent with
-    /// [`RociaDbClient::put_document_with_request_id`],
-    /// [`RociaDbClient::put_node_with_request_id`], and
-    /// [`RociaDbClient::add_edge_with_request_id`] — rather than requiring
-    /// the caller to pre-serialize into `serde_json::Value` first.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_document_with_request_id<T: Serialize + ?Sized>(
-        &self,
-        tenant_id: &str,
-        collection_name: &str,
-        document_id: &str,
-        value: &T,
-        node_label: Option<String>,
-        node_graph: Option<String>,
-        request_id: impl Into<String>,
-    ) -> Result<()> {
-        validate_node_binding(&node_label, &node_graph)?;
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            document_id = document_id,
-            has_node_binding = node_label.is_some() && node_graph.is_some(),
-            "upserting document"
-        );
-        let json = serde_json::to_vec(value)
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    document_id = document_id,
-                    error = %error,
-                    "failed to encode document json"
-                );
-            })
-            .encode_context("document json")?;
-        let doc = PutDocRequest {
-            tenant_id: tenant_id.to_string(),
-            collection: collection_name.to_string(),
-            id: document_id.to_string(),
-            json,
-            request_id: request_id.into(),
+        operation: &'static str,
+        message: Req,
+        call: F,
+    ) -> Result<Resp>
+    where
+        Req: Clone,
+        F: Fn(tonic::Request<Req>) -> Fut,
+        Fut: Future<Output = std::result::Result<tonic::Response<Resp>, tonic::Status>>,
+    {
+        let replay = self.token_manager.as_ref().map(|_| Clone::clone(&message));
+        let error = match self.attempt(operation, message, &call).await {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
         };
-        let mut upstream_document = self.upstream_document.clone();
-        upstream_document
-            .put_doc(doc)
-            .await
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    document_id = document_id,
-                    error = %error,
-                    "failed to upsert document"
-                );
-            })
-            .status_context("failed to upsert document")?;
-        info!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            document_id = document_id,
-            "document upserted"
-        );
-        if let (Some(label), Some(graph)) = (node_label, node_graph) {
-            debug!(
-                tenant_id = tenant_id,
-                collection = collection_name,
-                document_id = document_id,
-                graph = %graph,
-                label = %label,
-                "upserting graph node binding for document"
-            );
-            let json = serde_json::to_vec(&json!({
-                "collection": collection_name,
-                "id": document_id,
-            }))
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    document_id = document_id,
-                    graph = %graph,
-                    label = %label,
-                    error = %error,
-                    "failed to encode node json"
-                );
-            })
-            .encode_context("node json")?;
-            let req = PutNodeRequest {
-                tenant_id: tenant_id.to_string(),
-                graph: graph.clone(),
-                node_id: format!("{}:{}", label, document_id),
-                json,
-                request_id: format!("put_node:{}", Uuid::new_v4()),
-            };
-            let mut upstream_graph = self.upstream_graph.clone();
-            upstream_graph
-                .put_node(req)
-                .await
-                .inspect_err(|error| {
-                    error!(
-                        tenant_id = tenant_id,
-                        collection = collection_name,
-                        document_id = document_id,
-                        graph = %graph,
-                        label = %label,
-                        error = %error,
-                        "failed to upsert graph node binding"
-                    );
-                })
-                .status_context("failed to upsert graph node binding")?;
-            info!(
-                tenant_id = tenant_id,
-                collection = collection_name,
-                document_id = document_id,
-                graph = %graph,
-                label = %label,
-                "graph node binding upserted"
-            );
+        if !error.is_unauthenticated() {
+            return Err(error);
         }
-        Ok(())
+        // A token manager is present exactly when auth is enabled, which is
+        // exactly when `replay` was cloned above — so this destructuring
+        // never falls through in practice, and returning the original error
+        // is the right answer if it ever did.
+        let (Some(manager), Some(replay)) = (&self.token_manager, replay) else {
+            return Err(error);
+        };
+        debug!(
+            operation,
+            "upstream rejected the call as unauthenticated; refreshing the token and retrying once"
+        );
+        if let Err(refresh_error) = manager.refresh_now().await {
+            warn!(
+                operation,
+                error = %refresh_error,
+                "refreshing the auth token after an UNAUTHENTICATED response failed; returning \
+                 the original error"
+            );
+            return Err(error);
+        }
+        self.attempt(operation, replay, &call).await
     }
 
-    /// Find documents whose `search_field` equals `value` (`FindByField`).
+    /// One attempt at a unary RPC, with the per-RPC deadline applied.
     ///
-    /// `total_count` on the returned [`DocumentPage`] is a count over the
-    /// matching field-index entries — see [`DocumentPage`] for how this
-    /// compares to [`RociaDbClient::list_documents`] and
-    /// [`RociaDbClient::query_documents`].
-    pub async fn search_documents<T>(
+    /// Split out of [`RociaDbClient::unary`] because the refresh-and-retry
+    /// path needs to run it twice, and each attempt must get its own
+    /// deadline: a retry that inherited the first attempt's remaining budget
+    /// would routinely be born already expired.
+    async fn attempt<Req, Resp, F, Fut>(
         &self,
-        tenant_id: &str,
-        collection_name: &str,
-        search_field: &str,
-        value: &impl Serialize,
-        limit: Option<u32>,
-        cursor: Option<&str>,
-    ) -> Result<DocumentPage<T>>
+        operation: &'static str,
+        message: Req,
+        call: &F,
+    ) -> Result<Resp>
     where
-        T: DeserializeOwned,
+        F: Fn(tonic::Request<Req>) -> Fut,
+        Fut: Future<Output = std::result::Result<tonic::Response<Resp>, tonic::Status>>,
     {
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            search_field = search_field,
-            limit = limit.unwrap_or(DEFAULT_PAGE_SIZE),
-            cursor = cursor.unwrap_or(""),
-            "searching documents by field"
-        );
-        let page = page_request(limit, cursor)?;
-
-        let value_json = serde_json::to_vec(value)
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    search_field = search_field,
-                    error = %error,
-                    "failed to encode search value"
-                );
-            })
-            .encode_context("search value")?;
-
-        let mut upstream_document = self.upstream_document.clone();
-        let result = upstream_document
-            .find_by_field(FindByFieldRequest {
-                tenant_id: tenant_id.to_string(),
-                collection: collection_name.to_string(),
-                field: search_field.to_string(),
-                value_json,
-                page,
-            })
-            .await
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    search_field = search_field,
-                    error = %error,
-                    "failed to search documents"
-                );
-            })
-            .status_context("failed to search documents")?
-            .into_inner();
-
-        let resp = result
-            .json
-            .into_iter()
-            .map(|data| serde_json::from_slice::<T>(&data))
-            .collect::<std::result::Result<Vec<T>, serde_json::Error>>()
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    search_field = search_field,
-                    error = %error,
-                    "failed to decode search results"
-                );
-            })
-            .decode_context("search results")?;
-
-        let next_cursor = result
-            .page
-            .and_then(|page| (!page.next_cursor.is_empty()).then_some(page.next_cursor));
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            search_field = search_field,
-            result_count = resp.len(),
-            total_count = result.total_count,
-            next_cursor = next_cursor.as_deref().unwrap_or(""),
-            "document search completed"
-        );
-
-        Ok(DocumentPage {
-            items: resp,
-            next_cursor,
-            total_count: result.total_count,
-        })
-    }
-
-    /// Return one paginated page of every document in `collection_name`
-    /// (`ListDoc`).
-    ///
-    /// `total_count` on the returned [`DocumentPage`] is **free**: the
-    /// server keeps a running per-collection counter updated on every
-    /// write, so reading it costs nothing beyond the listing itself — see
-    /// [`DocumentPage`] for how this compares to
-    /// [`RociaDbClient::search_documents`] and
-    /// [`RociaDbClient::query_documents`].
-    pub async fn list_documents<T>(
-        &self,
-        tenant_id: &str,
-        collection_name: &str,
-        limit: Option<u32>,
-        cursor: Option<&str>,
-    ) -> Result<DocumentPage<T>>
-    where
-        T: DeserializeOwned,
-    {
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            limit = limit.unwrap_or(DEFAULT_PAGE_SIZE),
-            cursor = cursor.unwrap_or(""),
-            "listing documents"
-        );
-        let page = page_request(limit, cursor)?;
-        let mut upstream_document = self.upstream_document.clone();
-        let result = upstream_document
-            .list_doc(ListDocRequest {
-                tenant_id: tenant_id.to_string(),
-                collection: collection_name.to_string(),
-                page,
-            })
-            .await
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    error = %error,
-                    "failed to list documents"
-                );
-            })
-            .status_context("failed to list documents")?
-            .into_inner();
-
-        let resp = result
-            .json
-            .into_iter()
-            .map(|data| serde_json::from_slice::<T>(&data))
-            .collect::<std::result::Result<Vec<T>, serde_json::Error>>()
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    error = %error,
-                    "failed to decode listed documents"
-                );
-            })
-            .decode_context("listed documents")?;
-
-        let next_cursor = result
-            .page
-            .and_then(|page| (!page.next_cursor.is_empty()).then_some(page.next_cursor));
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            result_count = resp.len(),
-            total_count = result.total_count,
-            next_cursor = next_cursor.as_deref().unwrap_or(""),
-            "document listing completed"
-        );
-
-        Ok(DocumentPage {
-            items: resp,
-            next_cursor,
-            total_count: result.total_count,
-        })
-    }
-
-    /// List the document collections holding at least one document. Each
-    /// `CollectionInfo` carries its document count.
-    pub async fn list_collections(
-        &self,
-        tenant_id: &str,
-        limit: Option<u32>,
-        cursor: Option<&str>,
-    ) -> Result<Page<CollectionInfo>> {
-        debug!(
-            tenant_id = tenant_id,
-            limit = limit.unwrap_or(DEFAULT_PAGE_SIZE),
-            cursor = cursor.unwrap_or(""),
-            "listing collections"
-        );
-        let mut upstream_document = self.upstream_document.clone();
-        let result = upstream_document
-            .list_collections(ListCollectionsRequest {
-                tenant_id: tenant_id.to_string(),
-                page: page_request(limit, cursor)?,
-            })
-            .await
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    error = %error,
-                    "failed to list collections"
-                );
-            })
-            .status_context("failed to list collections")?
-            .into_inner();
-
-        Ok(Page {
-            items: result.collections,
-            next_cursor: result.page.and_then(|page| non_empty(page.next_cursor)),
-        })
-    }
-
-    /// Execute a paginated multi-filter document query.
-    ///
-    /// The underlying server applies filters with logical AND and uses the
-    /// provided sort list in order. The returned `next_cursor` is an opaque
-    /// server cursor that should be fed back unchanged.
-    ///
-    /// `total_count` on the returned [`DocumentPage`] is **expensive**: the
-    /// server only knows it after filtering the complete candidate set for
-    /// the query, so the cost scales with the number of candidates on every
-    /// call — never call this in a loop just to get a count; see
-    /// [`DocumentPage`] for the full comparison with
-    /// [`RociaDbClient::list_documents`] and
-    /// [`RociaDbClient::search_documents`].
-    pub async fn query_documents<T>(
-        &self,
-        tenant_id: &str,
-        collection_name: &str,
-        filters: &[DocumentQueryFilter],
-        sort: &[DocumentQuerySort],
-        limit: Option<u32>,
-        cursor: Option<&str>,
-    ) -> Result<DocumentPage<T>>
-    where
-        T: DeserializeOwned,
-    {
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            filter_count = filters.len(),
-            sort_count = sort.len(),
-            limit = limit.unwrap_or(DEFAULT_PAGE_SIZE),
-            cursor = cursor.unwrap_or(""),
-            "querying documents"
-        );
-
-        let page = page_request(limit, cursor)?;
-
-        let proto_filters = filters
-            .iter()
-            .map(|filter| -> Result<QueryFilter> {
-                Ok(QueryFilter {
-                    field: filter.field.clone(),
-                    operator: filter.operator.as_proto(),
-                    values_json: filter
-                        .values
-                        .iter()
-                        .map(serde_json::to_vec)
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .inspect_err(|error| {
-                            error!(
-                                tenant_id = tenant_id,
-                                collection = collection_name,
-                                field = %filter.field,
-                                error = %error,
-                                "failed to encode query filter value"
-                            );
-                        })
-                        .encode_context("query filter value")?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let proto_sort = sort
-            .iter()
-            .map(|sort| QuerySort {
-                field: sort.field.clone(),
-                direction: sort.direction.as_proto(),
-            })
-            .collect::<Vec<_>>();
-
-        let mut upstream_document = self.upstream_document.clone();
-        let result = upstream_document
-            .query_doc(QueryDocRequest {
-                tenant_id: tenant_id.to_string(),
-                collection: collection_name.to_string(),
-                filters: proto_filters,
-                sort: proto_sort,
-                page,
-            })
-            .await
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    error = %error,
-                    "failed to query documents"
-                );
-            })
-            .status_context("failed to query documents")?
-            .into_inner();
-
-        let resp = result
-            .json
-            .into_iter()
-            .map(|data| serde_json::from_slice::<T>(&data))
-            .collect::<std::result::Result<Vec<T>, serde_json::Error>>()
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    error = %error,
-                    "failed to decode queried documents"
-                );
-            })
-            .decode_context("queried documents")?;
-
-        let next_cursor = result
-            .page
-            .and_then(|page| (!page.next_cursor.is_empty()).then_some(page.next_cursor));
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            result_count = resp.len(),
-            total_count = result.total_count,
-            next_cursor = next_cursor.as_deref().unwrap_or(""),
-            "document query completed"
-        );
-
-        Ok(DocumentPage {
-            items: resp,
-            next_cursor,
-            total_count: result.total_count,
-        })
-    }
-
-    /// Fetch a single document by id and decode its JSON payload into `T`
-    /// (`GetDoc`).
-    ///
-    /// Unlike [`search_documents`](Self::search_documents),
-    /// [`list_documents`](Self::list_documents) and
-    /// [`query_documents`](Self::query_documents), this returns the value
-    /// directly rather than a [`DocumentPage`]: there is nothing to paginate
-    /// when fetching by id.
-    pub async fn get_document<T>(
-        &self,
-        tenant_id: &str,
-        collection_name: &str,
-        document_id: &str,
-    ) -> Result<T>
-    where
-        T: DeserializeOwned,
-    {
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            document_id = document_id,
-            "loading document"
-        );
-        let mut upstream_document = self.upstream_document.clone();
-        let result = upstream_document
-            .get_doc(GetDocRequest {
-                tenant_id: tenant_id.to_string(),
-                collection: collection_name.to_string(),
-                id: document_id.to_string(),
-            })
-            .await
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    document_id = document_id,
-                    error = %error,
-                    "failed to load document"
-                );
-            })
-            .status_context("failed to load document")?
-            .into_inner();
-
-        let resp = serde_json::from_slice::<T>(&result.json)
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    document_id = document_id,
-                    error = %error,
-                    "failed to decode document"
-                );
-            })
-            .decode_context("document")?;
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            document_id = document_id,
-            "document loaded"
-        );
-
-        Ok(resp)
-    }
-
-    /// Upsert a batch of nodes in a graph with bounded concurrency (at most
-    /// 10 `PutNode` calls in flight at once). `nodes` is consumed in the
-    /// order the caller provides — duplicate `node_id`s are **not** merged,
-    /// both are sent, in order.
-    ///
-    /// **This batch is not atomic and stops at the first error**: on
-    /// failure, in-flight requests are cancelled and the error does not say
-    /// which items had already succeeded. To resume after a failure, replay
-    /// the same `nodes` sequence with the same [`NodeInput::request_id`]
-    /// values you used the first time — the server deduplicates on
-    /// `(tenant, operation, request_id)`, so already-applied writes are
-    /// recognized and skipped rather than reapplied, and only the writes
-    /// that never landed actually happen.
-    pub async fn put_nodes(
-        &self,
-        tenant_id: &str,
-        graph_name: &str,
-        nodes: impl IntoIterator<Item = NodeInput>,
-    ) -> Result<()> {
-        let nodes: Vec<NodeInput> = nodes.into_iter().collect();
-        debug!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            node_count = nodes.len(),
-            "upserting graph nodes batch"
-        );
-        let requests = build_put_node_requests(tenant_id, graph_name, nodes)?;
-        stream::iter(requests.into_iter().map(Ok::<_, RociaDbError>))
-            .try_for_each_concurrent(CONCURRENT_REQUESTS, |node| {
-                let mut upstream = self.upstream_graph.clone();
-                async move {
-                    let graph = node.graph.clone();
-                    let node_id = node.node_id.clone();
-                    upstream
-                        .put_node(node)
-                        .await
-                        .status_context("failed to upsert node")
-                        .map_err(|error| {
-                            error!(
-                                graph = graph,
-                                node_id = node_id,
-                                error = %error,
-                                "failed to upsert graph node"
-                            );
-                            error
-                        })?;
-                    Ok(())
-                }
-            })
-            .await?;
-        info!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            "graph nodes batch upserted"
-        );
-        Ok(())
-    }
-
-    /// Fetch a node and decode its JSON payload. `node_id` uses the
-    /// `label:id` format.
-    pub async fn get_node(
-        &self,
-        tenant_id: &str,
-        graph_name: &str,
-        node_id: &str,
-    ) -> Result<Value> {
-        debug!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            node_id = node_id,
-            "loading graph node"
-        );
-        let mut upstream_graph = self.upstream_graph.clone();
-        let resp = upstream_graph
-            .get_node(GetNodeRequest {
-                tenant_id: tenant_id.to_string(),
-                graph: graph_name.to_string(),
-                node_id: node_id.to_string(),
-            })
-            .await
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    graph = graph_name,
-                    node_id = node_id,
-                    error = %error,
-                    "failed to load graph node"
-                );
-            })
-            .status_context("failed to load graph node")?
-            .into_inner();
-        let value = serde_json::from_slice(&resp.json)
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    graph = graph_name,
-                    node_id = node_id,
-                    error = %error,
-                    "failed to decode node json"
-                );
-            })
-            .decode_context("node json")?;
-        debug!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            node_id = node_id,
-            "graph node loaded"
-        );
-        Ok(value)
-    }
-
-    /// Upsert a batch of edges with bounded concurrency (at most 10
-    /// `AddEdge` calls in flight at once). `edges` is consumed in the order
-    /// the caller provides — duplicate `edge_id`s are **not** merged, both
-    /// are sent, in order.
-    ///
-    /// The server returns `NOT_FOUND` for any edge whose `from` or `to`
-    /// node does not already exist in `graph_name`: create both endpoint
-    /// nodes before adding an edge between them.
-    ///
-    /// **This batch is not atomic and stops at the first error**: on
-    /// failure, in-flight requests are cancelled and the error does not say
-    /// which items had already succeeded. To resume after a failure, replay
-    /// the same `edges` sequence with the same [`EdgeInput::request_id`]
-    /// values you used the first time — the server deduplicates on
-    /// `(tenant, operation, request_id)`, so already-applied writes are
-    /// recognized and skipped rather than reapplied, and only the writes
-    /// that never landed actually happen.
-    pub async fn add_edges(
-        &self,
-        tenant_id: &str,
-        graph_name: &str,
-        edges: impl IntoIterator<Item = EdgeInput>,
-    ) -> Result<()> {
-        let edges: Vec<EdgeInput> = edges.into_iter().collect();
-        debug!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            edge_count = edges.len(),
-            "upserting graph edges batch"
-        );
-        let requests = build_add_edge_requests(tenant_id, graph_name, edges)?;
-        stream::iter(requests.into_iter().map(Ok::<_, RociaDbError>))
-            .try_for_each_concurrent(CONCURRENT_REQUESTS, |edge| {
-                let mut upstream = self.upstream_graph.clone();
-                async move {
-                    let graph = edge.graph.clone();
-                    let edge_id = edge.edge_id.clone();
-                    let from = edge.from.clone();
-                    let to = edge.to.clone();
-                    let label = edge.label.clone();
-                    upstream
-                        .add_edge(edge)
-                        .await
-                        .status_context("failed to add edge")
-                        .map_err(|error| {
-                            error!(
-                                graph = graph,
-                                edge_id = edge_id,
-                                from = from,
-                                to = to,
-                                label = label,
-                                error = %error,
-                                "failed to upsert graph edge"
-                            );
-                            error
-                        })?;
-                    Ok(())
-                }
-            })
-            .await?;
-        info!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            "graph edges batch upserted"
-        );
-
-        Ok(())
-    }
-
-    /// Delete an edge by id.
-    pub async fn delete_edge(
-        &self,
-        tenant_id: &str,
-        graph_name: &str,
-        edge_id: &str,
-    ) -> Result<()> {
-        debug!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            edge_id = edge_id,
-            "deleting graph edge"
-        );
-        self.delete_edge_with_request_id(
-            tenant_id,
-            graph_name,
-            edge_id,
-            format!("delete_edge:{}", Uuid::new_v4()),
-        )
-        .await?;
-        info!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            edge_id = edge_id,
-            "graph edge deleted"
-        );
-        Ok(())
+        let mut request = tonic::Request::new(message);
+        let Some(timeout) = self.request_timeout else {
+            return Ok(call(request).await.status_context(operation)?.into_inner());
+        };
+        // Tells the server the deadline (it can then stop work nobody is
+        // waiting for) and arms tonic's own client-side `grpc-timeout`
+        // layer, which covers the call up to the response headers.
+        request.set_timeout(timeout);
+        // The outer timeout additionally covers decoding the response
+        // message and reading its trailers, which happen after tonic's layer
+        // has already resolved.
+        match tokio::time::timeout(timeout, call(request)).await {
+            Err(_elapsed) => Err(deadline_exceeded(operation, timeout)),
+            Ok(Err(status)) if is_local_deadline_expired(&status) => {
+                Err(deadline_exceeded(operation, timeout))
+            }
+            Ok(outcome) => Ok(outcome.status_context(operation)?.into_inner()),
+        }
     }
 }
 
+/// Helpers shared by the unit tests of several modules.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::{
-        BearerInterceptor, DEFAULT_CONNECT_TIMEOUT, DocumentPage, DocumentServiceClient, EdgeInput,
-        FileServiceClient, GraphServiceClient, NodeInput, RociaDbBuilder, RociaDbClient,
-        TenantServiceClient, build_add_edge_requests, build_put_node_requests,
-        default_document_request_id, resolve_connect_timeout, validate_host_path,
-        validate_node_binding,
+        BearerInterceptor, DocumentServiceClient, FileServiceClient, GraphServiceClient,
+        RociaDbClient, TenantServiceClient,
     };
-    use crate::{FileStreamUploadOptions, RociaDbError};
-    use futures::stream;
-    use std::time::Duration;
+    use std::sync::Arc;
     use tonic::transport::Endpoint;
 
     /// A `RociaDbClient` wired to a channel that never actually dials
@@ -1561,7 +1227,15 @@ mod tests {
     /// ever reaching the network — if such a test regressed and the
     /// gating ran too late, it would hang or fail against the unreachable
     /// `127.0.0.1:1` host instead of returning promptly.
-    fn lazy_test_client() -> RociaDbClient {
+    pub(crate) fn lazy_test_client() -> RociaDbClient {
+        lazy_test_client_with_request_timeout(None)
+    }
+
+    /// [`lazy_test_client`] with an explicit per-RPC deadline, for the tests
+    /// that exercise the deadline path in `RociaDbClient::attempt`.
+    pub(crate) fn lazy_test_client_with_request_timeout(
+        request_timeout: Option<std::time::Duration>,
+    ) -> RociaDbClient {
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         let interceptor = BearerInterceptor::disabled();
         RociaDbClient {
@@ -1578,39 +1252,24 @@ mod tests {
                 interceptor.clone(),
             ),
             upstream_tenant: TenantServiceClient::with_interceptor(channel, interceptor),
+            host: Arc::from("http://127.0.0.1:1"),
+            request_timeout,
             token_manager: None,
             _token_refresh_guard: None,
         }
     }
+}
 
-    #[test]
-    fn node_binding_accepts_both_absent() {
-        validate_node_binding(&None, &None).expect("both absent must be accepted");
-    }
-
-    #[test]
-    fn node_binding_accepts_both_present() {
-        validate_node_binding(&Some("product".to_string()), &Some("products".to_string()))
-            .expect("both present must be accepted");
-    }
-
-    #[test]
-    fn node_binding_rejects_label_without_graph() {
-        let error = validate_node_binding(&Some("product".to_string()), &None)
-            .expect_err("node_label without node_graph must be rejected");
-        assert!(matches!(error, RociaDbError::Validation(_)));
-        assert!(error.to_string().contains("must be provided together"));
-        assert!(error.to_string().contains("node_label=Some(\"product\")"));
-    }
-
-    #[test]
-    fn node_binding_rejects_graph_without_label() {
-        let error = validate_node_binding(&None, &Some("products".to_string()))
-            .expect_err("node_graph without node_label must be rejected");
-        assert!(matches!(error, RociaDbError::Validation(_)));
-        assert!(error.to_string().contains("must be provided together"));
-        assert!(error.to_string().contains("node_graph=Some(\"products\")"));
-    }
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_CONNECT_TIMEOUT, Endpoint, OAUTH_HTTP_REQUEST_TIMEOUT, RociaDbBuilder,
+        RociaDbClient, WriteOptions, deadline_exceeded, is_local_deadline_expired, page_request,
+        resolve_connect_timeout, resolve_request_timeout, validate_host_path,
+    };
+    use crate::RociaDbError;
+    use crate::test_support::{lazy_test_client, lazy_test_client_with_request_timeout};
+    use std::time::Duration;
 
     #[test]
     fn client_is_send_sync_so_an_arc_needs_no_mutex() {
@@ -1625,281 +1284,30 @@ mod tests {
         assert_send_sync::<std::sync::Arc<RociaDbClient>>();
     }
 
-    // `build_put_node_requests` / `build_add_edge_requests` are the pure,
-    // network-free cores of `RociaDbClient::put_nodes` /
-    // `RociaDbClient::add_edges` (see their doc comments). These tests lock
-    // in the three properties an ordered `Vec<NodeInput>` / `Vec<EdgeInput>`
-    // batch input must have: caller order is preserved, duplicate keys are
-    // not merged, and each item gets its own idempotency key.
-
+    // `page_request`'s None-defaults case and its zero-limit rejection are
+    // exercised elsewhere (`graph::tests`), but neither covers the common
+    // case of a caller-supplied limit and cursor actually reaching the
+    // `PageRequest` unchanged — the one behavior every paginated RPC in this
+    // crate depends on.
     #[test]
-    fn put_node_requests_preserve_caller_order() {
-        // A `HashMap`-keyed batch input could not guarantee this —
-        // iteration order over a hash map is unspecified, so it could
-        // silently reorder `PutNode` calls relative to what the caller
-        // wrote.
-        let nodes = vec![
-            NodeInput {
-                node_id: "product:3".to_string(),
-                value: serde_json::json!({"n": 3}),
-                request_id: None,
-            },
-            NodeInput {
-                node_id: "product:1".to_string(),
-                value: serde_json::json!({"n": 1}),
-                request_id: None,
-            },
-            NodeInput {
-                node_id: "product:2".to_string(),
-                value: serde_json::json!({"n": 2}),
-                request_id: None,
-            },
-        ];
-        let requests =
-            build_put_node_requests("tenant", "catalog", nodes).expect("build must succeed");
-        let ids: Vec<&str> = requests.iter().map(|r| r.node_id.as_str()).collect();
-        assert_eq!(ids, vec!["product:3", "product:1", "product:2"]);
+    fn page_request_passes_through_an_explicit_limit_and_cursor_unchanged() {
+        let page = page_request(Some(75), Some("cursor-x"))
+            .expect("a positive limit with a cursor must be accepted")
+            .expect("a page request must always be produced");
+        assert_eq!(page.limit, Some(75));
+        assert_eq!(page.cursor, "cursor-x");
     }
 
     #[test]
-    fn put_node_requests_do_not_merge_duplicate_node_ids() {
-        let nodes = vec![
-            NodeInput {
-                node_id: "product:1".to_string(),
-                value: serde_json::json!({"n": 1}),
-                request_id: None,
-            },
-            NodeInput {
-                node_id: "product:1".to_string(),
-                value: serde_json::json!({"n": 2}),
-                request_id: None,
-            },
-        ];
-        let requests =
-            build_put_node_requests("tenant", "catalog", nodes).expect("build must succeed");
-        assert_eq!(
-            requests.len(),
-            2,
-            "a HashMap keyed by node_id would have collapsed this to one request"
-        );
-        assert_eq!(requests[0].node_id, "product:1");
-        assert_eq!(requests[1].node_id, "product:1");
-        assert_ne!(
-            requests[0].json, requests[1].json,
-            "each duplicate keeps its own payload"
-        );
+    fn write_options_default_to_no_request_id() {
+        assert_eq!(WriteOptions::new(), WriteOptions::default());
+        assert!(WriteOptions::new().request_id.is_none());
     }
 
     #[test]
-    fn put_node_requests_use_node_id_verbatim_with_no_label_recomposition() {
-        let nodes = vec![NodeInput {
-            node_id: "product:sku-1".to_string(),
-            value: serde_json::json!({}),
-            request_id: None,
-        }];
-        let requests =
-            build_put_node_requests("tenant", "catalog", nodes).expect("build must succeed");
-        assert_eq!(requests[0].node_id, "product:sku-1");
-    }
-
-    #[test]
-    fn put_node_requests_pass_through_caller_supplied_request_id() {
-        let nodes = vec![NodeInput {
-            node_id: "product:1".to_string(),
-            value: serde_json::json!({}),
-            request_id: Some("caller-chosen-id".to_string()),
-        }];
-        let requests =
-            build_put_node_requests("tenant", "catalog", nodes).expect("build must succeed");
-        assert_eq!(requests[0].request_id, "caller-chosen-id");
-    }
-
-    #[test]
-    fn put_node_requests_default_request_id_matches_the_single_item_put_node_prefix() {
-        // `put_nodes` (batch) and `put_node` (single-item) both issue
-        // `PutNode` calls, so an absent id must default to the exact same
-        // prefix on both paths: `put_node:<uuid>`.
-        let nodes = vec![
-            NodeInput {
-                node_id: "product:1".to_string(),
-                value: serde_json::json!({}),
-                request_id: None,
-            },
-            NodeInput {
-                node_id: "product:2".to_string(),
-                value: serde_json::json!({}),
-                request_id: None,
-            },
-        ];
-        let requests =
-            build_put_node_requests("tenant", "catalog", nodes).expect("build must succeed");
-        for request in &requests {
-            let uuid_part = request
-                .request_id
-                .strip_prefix("put_node:")
-                .expect("default request_id must use the put_node: prefix");
-            uuid::Uuid::parse_str(uuid_part).expect("suffix after the prefix must be a uuid");
-        }
-        assert_ne!(
-            requests[0].request_id, requests[1].request_id,
-            "each item without an explicit request_id must get its own generated id"
-        );
-    }
-
-    #[test]
-    fn add_edge_requests_preserve_caller_order() {
-        let edges = vec![
-            EdgeInput {
-                edge_id: "e3".to_string(),
-                from: "a".to_string(),
-                to: "b".to_string(),
-                label: "knows".to_string(),
-                value: serde_json::json!({}),
-                request_id: None,
-            },
-            EdgeInput {
-                edge_id: "e1".to_string(),
-                from: "b".to_string(),
-                to: "c".to_string(),
-                label: "knows".to_string(),
-                value: serde_json::json!({}),
-                request_id: None,
-            },
-            EdgeInput {
-                edge_id: "e2".to_string(),
-                from: "c".to_string(),
-                to: "d".to_string(),
-                label: "knows".to_string(),
-                value: serde_json::json!({}),
-                request_id: None,
-            },
-        ];
-        let requests =
-            build_add_edge_requests("tenant", "catalog", edges).expect("build must succeed");
-        let ids: Vec<&str> = requests.iter().map(|r| r.edge_id.as_str()).collect();
-        assert_eq!(ids, vec!["e3", "e1", "e2"]);
-    }
-
-    #[test]
-    fn add_edge_requests_do_not_merge_duplicate_edge_ids() {
-        let edges = vec![
-            EdgeInput {
-                edge_id: "e1".to_string(),
-                from: "a".to_string(),
-                to: "b".to_string(),
-                label: "knows".to_string(),
-                value: serde_json::json!({"v": 1}),
-                request_id: None,
-            },
-            EdgeInput {
-                edge_id: "e1".to_string(),
-                from: "a".to_string(),
-                to: "b".to_string(),
-                label: "knows".to_string(),
-                value: serde_json::json!({"v": 2}),
-                request_id: None,
-            },
-        ];
-        let requests =
-            build_add_edge_requests("tenant", "catalog", edges).expect("build must succeed");
-        assert_eq!(
-            requests.len(),
-            2,
-            "a HashMap keyed by edge_id would have collapsed this to one request"
-        );
-        assert_ne!(
-            requests[0].json, requests[1].json,
-            "each duplicate keeps its own payload"
-        );
-    }
-
-    #[test]
-    fn add_edge_requests_pass_through_caller_supplied_request_id() {
-        let edges = vec![EdgeInput {
-            edge_id: "e1".to_string(),
-            from: "a".to_string(),
-            to: "b".to_string(),
-            label: "knows".to_string(),
-            value: serde_json::json!({}),
-            request_id: Some("caller-chosen-id".to_string()),
-        }];
-        let requests =
-            build_add_edge_requests("tenant", "catalog", edges).expect("build must succeed");
-        assert_eq!(requests[0].request_id, "caller-chosen-id");
-    }
-
-    #[test]
-    fn add_edge_requests_default_request_id_stays_a_bare_uuid() {
-        // Unlike nodes, edges default to no prefix at all (a bare
-        // `Uuid::new_v4().to_string()`).
-        let edges = vec![
-            EdgeInput {
-                edge_id: "e1".to_string(),
-                from: "a".to_string(),
-                to: "b".to_string(),
-                label: "knows".to_string(),
-                value: serde_json::json!({}),
-                request_id: None,
-            },
-            EdgeInput {
-                edge_id: "e2".to_string(),
-                from: "b".to_string(),
-                to: "c".to_string(),
-                label: "knows".to_string(),
-                value: serde_json::json!({}),
-                request_id: None,
-            },
-        ];
-        let requests =
-            build_add_edge_requests("tenant", "catalog", edges).expect("build must succeed");
-        for request in &requests {
-            uuid::Uuid::parse_str(&request.request_id)
-                .expect("default request_id must be a bare uuid with no prefix");
-        }
-        assert_ne!(
-            requests[0].request_id, requests[1].request_id,
-            "each item without an explicit request_id must get its own generated id"
-        );
-    }
-
-    #[test]
-    fn document_page_exposes_items_next_cursor_and_total_count() {
-        let page = DocumentPage {
-            items: vec!["a", "b"],
-            next_cursor: Some("cursor-2".to_string()),
-            total_count: 42,
-        };
-        assert_eq!(page.items, vec!["a", "b"]);
-        assert_eq!(page.next_cursor.as_deref(), Some("cursor-2"));
-        assert_eq!(page.total_count, 42);
-    }
-
-    #[test]
-    fn document_page_has_no_next_cursor_on_the_last_page() {
-        let page: DocumentPage<i32> = DocumentPage {
-            items: vec![1, 2, 3],
-            next_cursor: None,
-            total_count: 3,
-        };
-        assert!(page.next_cursor.is_none());
-        assert_eq!(page.items, vec![1, 2, 3]);
-        assert_eq!(page.total_count, 3);
-    }
-
-    #[test]
-    fn document_page_derives_clone_and_equality() {
-        let page = DocumentPage {
-            items: vec![1],
-            next_cursor: None,
-            total_count: 1,
-        };
-        assert_eq!(page.clone(), page);
-        let different = DocumentPage {
-            items: vec![1],
-            next_cursor: None,
-            total_count: 2,
-        };
-        assert_ne!(page, different);
+    fn write_options_with_request_id_is_chainable_and_readable() {
+        let options = WriteOptions::new().with_request_id("retry-1");
+        assert_eq!(options.request_id.as_deref(), Some("retry-1"));
     }
 
     #[test]
@@ -1916,7 +1324,7 @@ mod tests {
     fn host_path_validation_rejects_a_host_carrying_a_leftover_path() {
         let error = validate_host_path("http://127.0.0.1:50051/v1")
             .expect_err("a host with a non-root path must be rejected");
-        assert!(matches!(error, RociaDbError::Connection { .. }));
+        assert!(matches!(error, RociaDbError::Config { .. }));
         assert!(
             error.to_string().contains("/v1"),
             "the error should name the offending path, got: {error}"
@@ -1924,8 +1332,41 @@ mod tests {
     }
 
     #[test]
+    fn host_path_validation_rejects_a_host_carrying_a_leftover_query_string() {
+        // A query string parses with `path() == "/"`, so without a
+        // dedicated check it would sail through the path-only validation
+        // and tonic would silently drop it when dialing.
+        let error = validate_host_path("http://127.0.0.1:50051?debug=1")
+            .expect_err("a host with a query string must be rejected");
+        assert!(matches!(error, RociaDbError::Config { .. }));
+        assert!(
+            error.to_string().contains("debug=1"),
+            "the error should name the offending query, got: {error}"
+        );
+    }
+
+    #[test]
+    fn host_path_validation_rejects_a_host_carrying_a_leftover_fragment() {
+        let error = validate_host_path("http://127.0.0.1:50051#note")
+            .expect_err("a host with a fragment must be rejected");
+        assert!(matches!(error, RociaDbError::Config { .. }));
+        assert!(
+            error.to_string().contains('#'),
+            "the error should mention the fragment, got: {error}"
+        );
+    }
+
+    #[test]
     fn default_connect_timeout_matches_the_typescript_sdk_default() {
         assert_eq!(DEFAULT_CONNECT_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn the_oauth_http_client_timeout_is_documented_and_finite() {
+        // The point of the constant is that it exists at all: a
+        // `reqwest::Client` with no timeout turns an unresponsive IdP into a
+        // permanent hang inside `build()` and every later refresh.
+        assert_eq!(OAUTH_HTTP_REQUEST_TIMEOUT, Duration::from_secs(30));
     }
 
     #[test]
@@ -1946,8 +1387,181 @@ mod tests {
     fn resolve_connect_timeout_rejects_zero() {
         let error = resolve_connect_timeout(Some(Duration::ZERO))
             .expect_err("a zero connect timeout must be rejected");
-        assert!(matches!(error, RociaDbError::Validation(_)));
+        assert!(matches!(error, RociaDbError::Config { .. }));
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn resolve_request_timeout_has_no_default_and_rejects_zero() {
+        // Unlike the connect timeout, an absent request timeout stays absent:
+        // the SDK must not invent a deadline for calls whose duration it
+        // cannot predict.
+        assert_eq!(
+            resolve_request_timeout(None).expect("an absent request timeout must be accepted"),
+            None
+        );
+        assert_eq!(
+            resolve_request_timeout(Some(Duration::from_secs(4)))
+                .expect("a positive explicit timeout must be accepted"),
+            Some(Duration::from_secs(4))
+        );
+        let error = resolve_request_timeout(Some(Duration::ZERO))
+            .expect_err("a zero request timeout must be rejected");
+        assert!(matches!(error, RociaDbError::Config { .. }));
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn a_deadline_surfaces_as_a_status_error_reporting_deadline_exceeded() {
+        let error = deadline_exceeded("failed to get document", Duration::from_millis(1500));
+        assert_eq!(error.code(), Some(tonic::Code::DeadlineExceeded));
+        let message = error.to_string();
+        assert!(
+            message.contains("failed to get document"),
+            "the operation must still be named, got: {message}"
+        );
+        assert!(
+            message.contains("1500ms"),
+            "the expired deadline should be readable, got: {message}"
+        );
+    }
+
+    #[test]
+    fn tonics_own_grpc_timeout_expiry_is_recognised_and_nothing_else_is() {
+        // This is the status tonic's client-side `grpc-timeout` layer
+        // produces: `CANCELLED`, not `DEADLINE_EXCEEDED`, which is exactly
+        // why `attempt` normalizes it. The assertion on the code documents
+        // tonic's mapping, so a version that changes it shows up here.
+        let from_tonic = tonic::Status::from_error(Box::new(tonic::TimeoutExpired(())));
+        assert_eq!(from_tonic.code(), tonic::Code::Cancelled);
+        assert!(
+            is_local_deadline_expired(&from_tonic),
+            "a status built from TimeoutExpired must be recognised through its source chain"
+        );
+
+        // A status the server sent carries no source at all, so a genuine
+        // server-sent CANCELLED — even one worded like tonic's — must pass
+        // through untouched.
+        assert!(!is_local_deadline_expired(&tonic::Status::cancelled(
+            "client cancelled the call"
+        )));
+        assert!(!is_local_deadline_expired(&tonic::Status::cancelled(
+            "Timeout expired"
+        )));
+        assert!(!is_local_deadline_expired(&tonic::Status::aborted(
+            "write conflict, retry"
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_request_timeout_fires_against_a_host_that_accepts_and_never_answers() {
+        // A plain TCP listener that accepts the connection and then says
+        // nothing: the HTTP/2 handshake never completes, so tonic's own
+        // `grpc-timeout` layer — which only arms once the connection is
+        // ready, inside `Connection::call` — never gets a chance to fire.
+        // Only the SDK's own `tokio::time::timeout` can end this call, which
+        // is precisely why it wraps the whole future rather than trusting
+        // the header alone.
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port");
+        let address = listener.local_addr().expect("the bound address");
+        let accepting = std::thread::spawn(move || {
+            // Hold the accepted socket open (dropping it would send a FIN
+            // and let the client fail early for the wrong reason) for longer
+            // than the deadline under test, then let the thread end.
+            let held = listener.incoming().next().and_then(std::result::Result::ok);
+            std::thread::sleep(Duration::from_secs(2));
+            drop(held);
+        });
+
+        let channel = Endpoint::from_shared(format!("http://{address}"))
+            .expect("a loopback address must parse as an endpoint")
+            .connect_lazy();
+        let client = RociaDbBuilder::new()
+            .disable_auth()
+            .request_timeout(Duration::from_millis(150))
+            .build_with_channel(channel)
+            .await
+            .expect("a lazy channel with auth disabled must build");
+
+        let started = std::time::Instant::now();
+        let error = client
+            .list_tenants(Some(1), None)
+            .await
+            .expect_err("a silent server must not let the call hang");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            error.code(),
+            Some(tonic::Code::DeadlineExceeded),
+            "an expired request timeout must surface as DEADLINE_EXCEEDED, got: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the deadline must fire promptly, took {elapsed:?}"
+        );
+        accepting
+            .join()
+            .expect("the listener thread must not panic");
+    }
+
+    #[tokio::test]
+    async fn a_request_timeout_bounds_a_unary_call_against_an_unreachable_host() {
+        // The channel is lazy and 127.0.0.1:1 refuses (or drops) the
+        // connection, so this exercises `attempt`'s deadline path end to
+        // end: whichever of the two mechanisms notices first, the error must
+        // report a gRPC code and come back promptly rather than hanging.
+        let client = lazy_test_client_with_request_timeout(Some(Duration::from_millis(50)));
+        let error = client
+            .list_tenants(Some(1), None)
+            .await
+            .expect_err("an unreachable host must fail");
+        assert!(
+            error.code().is_some(),
+            "a failed unary call must carry a gRPC status, got: {error}"
+        );
+    }
+
+    #[test]
+    fn builder_setters_are_chainable_from_a_temporary_and_from_a_binding() {
+        // The whole point of the owned (`self -> Self`) setter style: a
+        // chain started on a temporary stays usable, and a half-configured
+        // builder can be stored in a variable and extended later. Under the
+        // previous `&mut self -> &mut Self` shape the second form did not
+        // compile at all (it borrowed a dropped temporary), so this is a
+        // compile-time assertion first and a value check second.
+        let chained = RociaDbBuilder::new()
+            .host("http://127.0.0.1:50051")
+            .connect_timeout(Duration::from_secs(7))
+            .request_timeout(Duration::from_secs(9))
+            .tls_config(crate::ClientTlsConfig::new().with_native_roots())
+            .http2_keep_alive(Duration::from_secs(30), Duration::from_secs(5))
+            .disable_auth();
+        assert_eq!(chained.connect_timeout, Some(Duration::from_secs(7)));
+        assert_eq!(chained.request_timeout, Some(Duration::from_secs(9)));
+        assert!(chained.tls_config.is_some());
+        assert_eq!(
+            chained.http2_keep_alive,
+            Some((Duration::from_secs(30), Duration::from_secs(5)))
+        );
+
+        let partial = RociaDbBuilder::new().host("http://example.invalid:50051");
+        let finished = partial.disable_auth();
+        assert_eq!(
+            finished.host.as_deref(),
+            Some("http://example.invalid:50051")
+        );
+    }
+
+    #[test]
+    fn builder_defaults_leave_every_new_transport_setting_unset() {
+        // Each of these must stay opt-in: a default request deadline would
+        // break slow-but-healthy calls, a default keep-alive would add
+        // traffic nobody asked for, and `None` for the TLS config is what
+        // selects the documented native-roots default.
+        let builder = RociaDbBuilder::new();
+        assert_eq!(builder.request_timeout, None);
+        assert_eq!(builder.http2_keep_alive, None);
+        assert!(builder.tls_config.is_none());
     }
 
     #[test]
@@ -1956,12 +1570,10 @@ mod tests {
         // setter never validates, only `build()` does (via
         // `resolve_connect_timeout`, tested above) — so even a nonsensical
         // zero duration must be stored as-is here.
-        let mut builder = RociaDbBuilder::new();
-        builder.connect_timeout(Duration::ZERO);
+        let builder = RociaDbBuilder::new().connect_timeout(Duration::ZERO);
         assert_eq!(builder.connect_timeout, Some(Duration::ZERO));
 
-        let mut builder = RociaDbBuilder::new();
-        builder.connect_timeout(Duration::from_secs(42));
+        let builder = RociaDbBuilder::new().connect_timeout(Duration::from_secs(42));
         assert_eq!(builder.connect_timeout, Some(Duration::from_secs(42)));
     }
 
@@ -1969,39 +1581,84 @@ mod tests {
     async fn build_rejects_a_zero_connect_timeout_before_any_network_call() {
         // `validate_host_path` and the connect-timeout check both run
         // before `Endpoint::connect()`, so this must return promptly with
-        // `Validation` instead of hanging or failing against the
-        // (deliberately unreachable) host.
-        let mut builder = RociaDbBuilder::new();
-        builder
+        // `Config` instead of hanging or failing against the (deliberately
+        // unreachable) host.
+        let error = RociaDbBuilder::new()
             .host("http://127.0.0.1:1")
-            .connect_timeout(Duration::ZERO);
-        // `RociaDbClient` intentionally does not derive `Debug` (it would
-        // expose channel/interceptor internals), so `expect_err` cannot be
-        // used here — match instead.
-        let error = match builder.build().await {
-            Ok(_) => panic!("a zero connect timeout must fail build()"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, RociaDbError::Validation(_)));
+            .connect_timeout(Duration::ZERO)
+            .build()
+            .await
+            .expect_err("a zero connect timeout must fail build()");
+        assert!(matches!(error, RociaDbError::Config { .. }));
     }
 
     #[tokio::test]
     async fn build_rejects_a_host_with_a_leftover_path_before_any_network_call() {
-        let mut builder = RociaDbBuilder::new();
-        builder.host("http://127.0.0.1:1/v1");
-        let error = match builder.build().await {
-            Ok(_) => panic!("a host carrying a path must fail build()"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, RociaDbError::Connection { .. }));
+        let error = RociaDbBuilder::new()
+            .host("http://127.0.0.1:1/v1")
+            .build()
+            .await
+            .expect_err("a host carrying a path must fail build()");
+        assert!(matches!(error, RociaDbError::Config { .. }));
     }
 
-    // `BuilderAuthConfig`'s manual `Debug` impl must redact `client_secret`
-    // — a derived `Debug` would print it in clear text.
+    #[tokio::test]
+    async fn build_with_channel_skips_host_validation_and_dialing() {
+        // A host that `build()` rejects outright, on a lazy channel that
+        // never connects: `build_with_channel` must still produce a client,
+        // because neither the host string nor the dial is its business.
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = RociaDbBuilder::new()
+            .host("http://127.0.0.1:1/a/path?and=query")
+            .disable_auth()
+            .build_with_channel(channel)
+            .await
+            .expect("a caller-supplied channel must bypass host validation and dialing");
+        // The host is carried through purely as a `Debug` label.
+        let debug_output = format!("{client:?}");
+        assert!(debug_output.contains("http://127.0.0.1:1/a/path?and=query"));
+        assert!(debug_output.contains("auth_enabled: false"));
+    }
+
+    #[tokio::test]
+    async fn build_with_channel_still_validates_the_timeouts_it_uses() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let error = RociaDbBuilder::new()
+            .disable_auth()
+            .request_timeout(Duration::ZERO)
+            .build_with_channel(channel)
+            .await
+            .expect_err("a zero request timeout must fail build_with_channel()");
+        assert!(matches!(error, RociaDbError::Config { .. }));
+
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let error = RociaDbBuilder::new()
+            .disable_auth()
+            .connect_timeout(Duration::ZERO)
+            .build_with_channel(channel)
+            .await
+            .expect_err("a zero connect timeout must fail build_with_channel() too");
+        assert!(matches!(error, RociaDbError::Config { .. }));
+    }
+
+    #[tokio::test]
+    async fn build_with_channel_carries_the_request_timeout_onto_the_client() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = RociaDbBuilder::new()
+            .disable_auth()
+            .request_timeout(Duration::from_millis(250))
+            .build_with_channel(channel)
+            .await
+            .expect("a lazy channel with auth disabled must build");
+        assert_eq!(client.request_timeout, Some(Duration::from_millis(250)));
+    }
+
+    // `SecretString`'s own `Debug` redacts, which is what lets
+    // `BuilderAuthConfig` derive `Debug` instead of hand-writing one. Keep
+    // the assertion: it is the property that matters, whoever implements it.
     #[test]
     fn builder_debug_output_redacts_the_client_secret() {
-        let mut builder = RociaDbBuilder::new();
-        builder.auth_client_credentials(
+        let builder = RociaDbBuilder::new().auth_client_credentials(
             "https://idp.example.com/token",
             "client-123",
             "super-secret-value",
@@ -2012,7 +1669,7 @@ mod tests {
             "the raw client_secret must never appear in Debug output, got: {debug_output}"
         );
         assert!(
-            debug_output.contains("[redacted]"),
+            debug_output.to_ascii_lowercase().contains("redacted"),
             "the redaction placeholder must appear, got: {debug_output}"
         );
         // Non-sensitive fields must stay visible: only the secret is
@@ -2022,62 +1679,31 @@ mod tests {
         assert!(debug_output.contains("client-123"));
     }
 
-    #[test]
-    fn default_document_request_id_uses_the_put_document_prefix_with_a_fresh_uuid_each_time() {
-        let first = default_document_request_id("catalog");
-        let second = default_document_request_id("catalog");
-        let uuid_part = first
-            .strip_prefix("put_document:catalog:")
-            .expect("default request_id must use the put_document:{collection}: prefix");
-        uuid::Uuid::parse_str(uuid_part).expect("suffix after the prefix must be a uuid");
-        assert_ne!(
-            first, second,
-            "each call without an explicit request_id must get its own generated id"
+    #[tokio::test]
+    async fn client_debug_names_the_host_and_whether_auth_is_enabled() {
+        // `lazy_test_client()` needs a tokio runtime just to build its
+        // (never-dialed) channel, hence `#[tokio::test]`.
+        let client = lazy_test_client();
+        let debug_output = format!("{client:?}");
+        assert!(
+            debug_output.contains("http://127.0.0.1:1"),
+            "Debug must name the host the client was built for, got: {debug_output}"
         );
-    }
-
-    // `upload_file_chunked`'s pre-flight validation (file size, checksum
-    // length) must run — and fail — before the method ever touches the
-    // network, so these tests run against a client wired to an unreachable
-    // host and must still return promptly.
-
-    #[tokio::test]
-    async fn upload_file_chunked_rejects_an_oversized_file_before_any_network_call() {
-        let client = lazy_test_client();
-        let oversized = 5u64 * 1024 * 1024 * 1024 + 1; // 5 GiB + 1 byte
-        let result = client
-            .upload_file_chunked(
-                "tenant",
-                "bucket",
-                "file",
-                oversized,
-                vec![0u8; 32],
-                stream::empty::<Vec<u8>>(),
-                FileStreamUploadOptions::default(),
-            )
-            .await;
-        let error = result.expect_err("a file over the 5 GiB limit must be rejected");
-        assert!(matches!(error, RociaDbError::Validation(_)));
-        assert!(error.to_string().contains("5 GiB"));
-    }
-
-    #[tokio::test]
-    async fn upload_file_chunked_rejects_a_wrong_length_checksum_before_any_network_call() {
-        let client = lazy_test_client();
-        let result = client
-            .upload_file_chunked(
-                "tenant",
-                "bucket",
-                "file",
-                0,
-                vec![0u8; 10], // must be exactly 32 bytes (sha256)
-                stream::empty::<Vec<u8>>(),
-                FileStreamUploadOptions::default(),
-            )
-            .await;
-        let error = result.expect_err("a checksum that is not 32 bytes must be rejected");
-        assert!(matches!(error, RociaDbError::Validation(_)));
-        assert!(error.to_string().contains("32 bytes"));
+        assert!(
+            debug_output.contains("auth_enabled: false"),
+            "Debug must report whether auth is enabled, got: {debug_output}"
+        );
+        // Nothing credential-shaped may leak: the interceptor holds a live
+        // bearer token and the token manager its client secret, so neither
+        // the service clients nor the token manager may be printed.
+        assert!(
+            !debug_output.contains("BearerInterceptor"),
+            "Debug must not print the interceptor holding the bearer token, got: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains("TokenManager"),
+            "Debug must not print the token manager, got: {debug_output}"
+        );
     }
 
     #[tokio::test]
