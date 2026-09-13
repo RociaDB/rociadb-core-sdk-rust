@@ -207,6 +207,12 @@ impl RociaDbClient {
     /// checksum ahead of time, prefer
     /// [`RociaDbClient::upload_file_chunked`], which re-chunks and
     /// validates for you.
+    ///
+    /// [`RociaDbBuilder::request_timeout`](crate::RociaDbBuilder::request_timeout)
+    /// does **not** apply here, nor to any of the upload helpers built on
+    /// this method: how long a stream takes is a property of the caller's
+    /// own data rate, not of a single round trip. Wrap the call in a
+    /// `tokio::time::timeout` of your own if it needs a deadline.
     pub async fn upload_file_stream<S>(&self, requests: S) -> Result<()>
     where
         S: Stream<Item = UploadRequest> + Send + 'static,
@@ -406,6 +412,12 @@ impl RociaDbClient {
     /// guarantee, call [`RociaDbClient::stat_file`] yourself and compare
     /// its `checksum` against a SHA-256 digest you compute over the
     /// downloaded bytes — this crate does not do that comparison for you.
+    ///
+    /// [`RociaDbBuilder::request_timeout`](crate::RociaDbBuilder::request_timeout)
+    /// does **not** apply here, nor to [`RociaDbClient::download_file`]: how
+    /// long a transfer takes is a property of the file's size and the link,
+    /// not of a single round trip. Wrap the call in a `tokio::time::timeout`
+    /// of your own if it needs a deadline.
     pub async fn download_file_stream(
         &self,
         tenant_id: &str,

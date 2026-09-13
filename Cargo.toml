@@ -45,6 +45,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # `.proto` imports and prost maps it to `()`, so no generated item names a
 # `prost_types` type.
 prost = "0.14.1"
+# `SecretString` for the OAuth2 client secret and the bearer token: it redacts
+# itself in `Debug` output and zeroizes its heap buffer on drop, which is what
+# lets `RociaDbBuilder`, `TokenManagerInner` and `TokenResponse` derive `Debug`
+# instead of carrying hand-written redacting impls. The `serde` feature is
+# needed because `TokenResponse::access_token` is deserialized straight from the
+# IdP's JSON into a `SecretString`. MSRV 1.60, well under this crate's 1.88, and
+# its only dependency is `zeroize` (already in the graph via rustls).
+secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -70,7 +78,10 @@ uuid = { version = "1.19.0", features = ["v4"] }
 # `#[tokio::main]` in the crate documentation's examples defaults to the
 # multi-thread runtime, and `tests/` spawns tasks, so the test and doctest
 # builds need `rt-multi-thread` on top of the library's own feature set.
-tokio = { version = "1", features = ["rt-multi-thread"] }
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs: the retry and
+# token-refresh backoff tests advance a paused clock instead of sleeping for
+# real, so a schedule measured in seconds is still tested in microseconds.
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
 
 # `build.rs` reaches for exactly two crates: `protox`, a pure-Rust protobuf
 # compiler that replaces the `protoc` binary (and bundles the Google well-known

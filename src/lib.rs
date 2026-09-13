@@ -65,6 +65,58 @@
 //!   `cursor: Option<&str>`) and returns [`Page<T>`], or [`DocumentPage<T>`]
 //!   for the three document reads that also report a total count.
 //!
+//! # Authentication
+//!
+//! [`RociaDbBuilder`] enables OAuth2 client-credentials auth by default,
+//! reading `AUTH_TOKEN_URL`, `AUTH_CLIENT_ID` and `AUTH_CLIENT_SECRET` from
+//! the environment unless
+//! [`auth_client_credentials`](RociaDbBuilder::auth_client_credentials)
+//! supplies them. [`build`](RociaDbBuilder::build) fetches the first token
+//! and the client keeps it fresh from then on; the credentials and the token
+//! are held as [`SecretString`], so they are redacted by every formatter and
+//! zeroized when the client is dropped.
+//!
+//! Three things happen automatically, and none of them needs calling code:
+//!
+//! - **Scheduled refresh.** A background task refreshes the token after
+//!   about two thirds of its lifetime (400 seconds for the 600-second tokens
+//!   the IdP issues), and stops when the last clone of the client is
+//!   dropped. The cadence follows the lifetime the IdP reports, so it tracks
+//!   an IdP that changes it.
+//! - **Fast recovery from a failed refresh.** A refresh that fails is
+//!   retried after roughly 1 s, then 2 s, 4 s, 8 s, 16 s and 30 s (jittered,
+//!   capped at 30 s) until one succeeds, rather than waiting out the whole
+//!   regular interval — which would leave a long window in which every RPC
+//!   fails with `UNAUTHENTICATED`. See
+//!   [`TokenManager::spawn_refresh`](auth::TokenManager::spawn_refresh).
+//! - **Refresh-and-retry on `UNAUTHENTICATED`.** A unary RPC that comes back
+//!   `UNAUTHENTICATED` triggers one coalesced token refresh and is then
+//!   re-issued exactly once. A caller only sees that status when the second
+//!   attempt fails too, or when the refresh itself did.
+//!
+//! [`RociaDbClient::refresh_auth_token`] and
+//! [`RociaDbClient::invalidate_auth_token`] remain for driving a refresh out
+//! of band, and [`disable_auth`](RociaDbBuilder::disable_auth) turns the
+//! whole mechanism off for a controlled local deployment.
+//!
+//! # Timeouts, transport and retries
+//!
+//! - [`connect_timeout`](RociaDbBuilder::connect_timeout) bounds the dial (10
+//!   seconds by default), and
+//!   [`request_timeout`](RociaDbBuilder::request_timeout) puts a deadline on
+//!   every unary RPC (opt-in, no default).
+//! - [`tls_config`](RociaDbBuilder::tls_config) replaces the default
+//!   native-roots TLS setup, for a private CA or mTLS, and
+//!   [`http2_keep_alive`](RociaDbBuilder::http2_keep_alive) turns on HTTP/2
+//!   keep-alive pings for a connection held open across an idle NAT or load
+//!   balancer.
+//! - [`build_with_channel`](RociaDbBuilder::build_with_channel) takes a
+//!   [`Channel`] you built yourself — a custom connector, a Unix socket, a
+//!   load-balanced list — and still does all of the auth work above.
+//! - [`RetryPolicy`] and [`RociaDbClient::retry`] replay a call while it
+//!   fails with `ABORTED`, the one status the server expects callers to
+//!   retry (see [`RociaDbError::is_aborted`]).
+//!
 //! # Building
 //!
 //! No system dependency is required: `cargo build` on a bare Rust toolchain
@@ -100,6 +152,12 @@
 //! [`DownloadResponse`] — appear in public signatures and are re-exported at
 //! the crate root for that reason; depend on the re-exports: the `pb` module
 //! itself is private.
+//!
+//! The same caveat covers the four types re-exported straight from another
+//! crate so that configuring this one needs no extra direct dependency:
+//! [`Streaming`], [`Channel`] and [`ClientTlsConfig`] from `tonic`, and
+//! [`SecretString`] (with [`ExposeSecret`]) from `secrecy`. A major upgrade
+//! of either crate can reshape them without this SDK's own API changing.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -109,6 +167,7 @@ mod error;
 mod file;
 mod graph;
 pub(crate) mod pb;
+mod retry;
 mod tenant;
 
 pub use document::{
@@ -126,14 +185,30 @@ pub use graph::{Edge, EdgeInput, NeighborNode, NodeInput};
 pub use pb::upstream::v1::{
     CollectionInfo, DownloadResponse, Neighbor, StatResponse, UploadRequest,
 };
+pub use retry::RetryPolicy;
+/// Re-exported so callers can hold the OAuth2 client secret, and read the
+/// tokens this crate hands back, in a type that redacts itself in `Debug`
+/// output and zeroizes its buffer on drop — without taking `secrecy` as a
+/// direct dependency. [`ExposeSecret::expose_secret`] is the only way to read
+/// the bytes back. The crate documentation's stability caveat applies: a
+/// major `secrecy` upgrade can reshape these without the SDK's own API
+/// changing.
+pub use secrecy::{ExposeSecret, SecretString};
 /// Re-exported so callers do not need `tonic` as a direct dependency just to
 /// name the return type of [`RociaDbClient::download_file_stream`]. The same
 /// stability caveat applies: a major tonic upgrade can reshape this type
 /// without the SDK's own API changing.
 pub use tonic::codec::Streaming;
+/// Re-exported so callers do not need `tonic` as a direct dependency just to
+/// configure the builder: [`ClientTlsConfig`] for
+/// [`RociaDbBuilder::tls_config`] and [`Channel`] for
+/// [`RociaDbBuilder::build_with_channel`]. The same stability caveat applies:
+/// a major tonic upgrade can reshape these types without the SDK's own API
+/// changing.
+pub use tonic::transport::{Channel, ClientTlsConfig};
 
 use crate::auth::{BearerInterceptor, TokenManager, TokenRefreshGuard};
-use crate::error::{AuthResultExt, ConnectionResultExt, StatusResultExt};
+use crate::error::{AuthResultExt, ConfigResultExt, ConnectionResultExt, StatusResultExt};
 use crate::pb::upstream::v1::PageRequest;
 use crate::pb::upstream::v1::document_service_client::DocumentServiceClient;
 use crate::pb::upstream::v1::file_service_client::FileServiceClient;
@@ -144,7 +219,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::codegen::InterceptedService;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::Endpoint;
 use tracing::{debug, warn};
 
 /// Max concurrent in-flight requests for batch operations.
@@ -158,45 +233,33 @@ const AUTH_CLIENT_SECRET_ENV: &str = "AUTH_CLIENT_SECRET";
 /// [`RociaDbBuilder::connect_timeout`] was never called, so a host that
 /// never answers cannot hang `build()` forever.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Overall deadline applied to every request the OAuth2 HTTP client makes —
+/// the token fetch in [`RociaDbBuilder::build`] and every later refresh.
+///
+/// `reqwest::Client::new()` has no timeout of any kind, so an IdP that
+/// accepts the TCP connection and then never answers would hang `build()`,
+/// and every [`RociaDbClient::refresh_auth_token`] call after it, forever —
+/// the latter while holding the refresh lock, which would block every other
+/// task waiting to refresh too. Generous compared with a token endpoint's
+/// real latency (tens of milliseconds), because exceeding it fails the
+/// client's authentication outright: it exists to break a hang, not to
+/// enforce a service level.
+const OAUTH_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum BuilderAuthConfig {
     Enabled {
         token_url: Option<String>,
         client_id: Option<String>,
-        /// Never printed by this crate's own instrumentation (see
-        /// `BuilderAuthConfig`'s manual `Debug` impl below), but it is
-        /// still held as a plain `String` for as long as this builder (or
-        /// the `TokenManagerInner` it is handed to at `build()`) is alive,
-        /// so a core dump, an attached debugger, or plaintext left behind
-        /// in swapped-out memory could still recover it. Closing that gap
-        /// would need a `zeroize`- or `secrecy`-backed secret type, which
-        /// is a dependency call for this crate's maintainer to make on a
-        /// published crate rather than something to add unilaterally here.
-        client_secret: Option<String>,
+        /// A [`SecretString`], so `#[derive(Debug)]` on this enum prints a
+        /// redaction rather than the secret, and the buffer is zeroized
+        /// when the builder (and the `TokenManagerInner` it is cloned into
+        /// at `build()`) is dropped — closing the window in which a core
+        /// dump, an attached debugger, or swapped-out memory could recover
+        /// it.
+        client_secret: Option<SecretString>,
     },
     Disabled,
-}
-
-// Manual `Debug` impl instead of `#[derive(Debug)]`: a derived impl would
-// print `client_secret` in clear text, so any `format!("{:?}", ..)` or
-// debug-level log of a `RociaDbBuilder` would leak the OAuth2 secret.
-impl std::fmt::Debug for BuilderAuthConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Enabled {
-                token_url,
-                client_id,
-                client_secret: _,
-            } => f
-                .debug_struct("Enabled")
-                .field("token_url", token_url)
-                .field("client_id", client_id)
-                .field("client_secret", &"[redacted]")
-                .finish(),
-            Self::Disabled => f.write_str("Disabled"),
-        }
-    }
 }
 
 /// Builder for [`RociaDbClient`].
@@ -211,6 +274,13 @@ pub struct RociaDbBuilder {
     host: Option<String>,
     auth: BuilderAuthConfig,
     connect_timeout: Option<Duration>,
+    request_timeout: Option<Duration>,
+    /// `None` means "the default native-roots configuration"; see
+    /// [`RociaDbBuilder::tls_config`].
+    tls_config: Option<ClientTlsConfig>,
+    /// `(interval, timeout)` from [`RociaDbBuilder::http2_keep_alive`], or
+    /// `None` for tonic's default of no keep-alive pings at all.
+    http2_keep_alive: Option<(Duration, Duration)>,
 }
 
 /// gRPC client for document, graph, file, and tenant services.
@@ -236,6 +306,10 @@ pub struct RociaDbClient {
     /// An `Arc<str>` rather than a `String` so cloning the client stays
     /// allocation-free, as its documentation promises.
     host: Arc<str>,
+    /// Deadline applied to every unary RPC, from
+    /// [`RociaDbBuilder::request_timeout`]. `None` (the default) means no
+    /// client-side deadline at all.
+    request_timeout: Option<Duration>,
     /// `None` when auth is disabled. Used to service
     /// [`RociaDbClient::refresh_auth_token`].
     token_manager: Option<TokenManager>,
@@ -394,19 +468,19 @@ pub(crate) fn non_empty(value: String) -> Option<String> {
 /// has already vanished.
 fn validate_host_path(host: &str) -> Result<()> {
     if host.contains('#') {
-        return Err(RociaDbError::connection(format!(
+        return Err(RociaDbError::config(format!(
             "RociaDB host must contain only a hostname and port, got a fragment in {host:?}"
         )));
     }
-    let uri: http::Uri = host.parse().connection_context("invalid upstream host")?;
+    let uri: http::Uri = host.parse().config_context("invalid upstream host")?;
     let path = uri.path();
     if !path.is_empty() && path != "/" {
-        return Err(RociaDbError::connection(format!(
+        return Err(RociaDbError::config(format!(
             "RociaDB host must contain only a hostname and port, got path {path:?}"
         )));
     }
     if let Some(query) = uri.query() {
-        return Err(RociaDbError::connection(format!(
+        return Err(RociaDbError::config(format!(
             "RociaDB host must contain only a hostname and port, got query {query:?}"
         )));
     }
@@ -422,11 +496,73 @@ fn validate_host_path(host: &str) -> Result<()> {
 fn resolve_connect_timeout(explicit: Option<Duration>) -> Result<Duration> {
     let connect_timeout = explicit.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
     if connect_timeout.is_zero() {
-        return Err(RociaDbError::validation(
+        return Err(RociaDbError::config(
             "connect timeout must be greater than zero",
         ));
     }
     Ok(connect_timeout)
+}
+
+/// Resolve the per-RPC deadline [`RociaDbBuilder::build`] applies: whatever
+/// [`RociaDbBuilder::request_timeout`] was given, or `None` for "no
+/// client-side deadline". There is deliberately no default — unlike the
+/// connect timeout, a request deadline depends on what the caller's own
+/// calls do (a `query_documents` over a large collection is not a
+/// `get_document`), so guessing one would break slow-but-healthy calls.
+///
+/// A zero timeout is rejected, exactly as for the connect timeout: it would
+/// mean "every RPC fails instantly", which is never what a caller who
+/// reached for this method wanted.
+fn resolve_request_timeout(explicit: Option<Duration>) -> Result<Option<Duration>> {
+    if explicit.is_some_and(|timeout| timeout.is_zero()) {
+        return Err(RociaDbError::config(
+            "request timeout must be greater than zero",
+        ));
+    }
+    Ok(explicit)
+}
+
+/// Build the [`RociaDbError::Status`] a per-RPC deadline produces, carrying a
+/// real [`tonic::Status`] so [`RociaDbError::code`] reports
+/// [`tonic::Code::DeadlineExceeded`] like any other status.
+fn deadline_exceeded(operation: &'static str, timeout: Duration) -> RociaDbError {
+    RociaDbError::Status {
+        operation,
+        status: tonic::Status::deadline_exceeded(format!(
+            "the client-side request timeout of {}ms expired",
+            u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
+        )),
+    }
+}
+
+/// Whether `status` is `tonic`'s own report that the `grpc-timeout` header
+/// expired, rather than anything the server said.
+///
+/// tonic's client channel enforces that header locally, through a timeout
+/// layer of its own (`GrpcTimeout`, in `tonic::transport::service`) — but it
+/// maps the expiry to `CANCELLED`, not `DEADLINE_EXCEEDED`, and it covers the
+/// call only up to the response headers. A caller who set
+/// [`RociaDbBuilder::request_timeout`] should see one code for one cause
+/// whichever layer notices first, so this recognizes tonic's outcome and
+/// [`RociaDbClient::attempt`] reports it as the same [`deadline_exceeded`] as
+/// its own `tokio::time::timeout`.
+///
+/// The test is a walk of the status's source chain looking for
+/// [`tonic::TimeoutExpired`] rather than a match on the status message:
+/// `tonic::Status::try_from_error` keeps the error it was built from as the
+/// status's `source`, so the marker type is there to be found (nested inside
+/// a `tonic::transport::Error`) and nothing depends on the wording tonic
+/// chose. A status the server sent carries no source at all, so a genuine
+/// server-sent `CANCELLED` can never match.
+fn is_local_deadline_expired(status: &tonic::Status) -> bool {
+    let mut source = std::error::Error::source(status);
+    while let Some(error) = source {
+        if error.is::<tonic::TimeoutExpired>() {
+            return true;
+        }
+        source = error.source();
+    }
+    false
 }
 
 impl Default for RociaDbBuilder {
@@ -439,6 +575,9 @@ impl Default for RociaDbBuilder {
                 client_secret: None,
             },
             connect_timeout: None,
+            request_timeout: None,
+            tls_config: None,
+            http2_keep_alive: None,
         }
     }
 }
@@ -467,6 +606,17 @@ impl RociaDbBuilder {
     /// Configure OAuth2 client credentials for upstream auth, overriding
     /// the `AUTH_TOKEN_URL`, `AUTH_CLIENT_ID` and `AUTH_CLIENT_SECRET`
     /// environment variables [`build`](Self::build) would otherwise read.
+    ///
+    /// `client_secret` is wrapped in a [`SecretString`] the moment it
+    /// arrives, so from here on it is redacted in `Debug` output and
+    /// zeroized when the builder and the clients built from it are dropped.
+    /// The parameter stays `impl Into<String>` so the ordinary cases
+    /// (`&str`, `String`, `std::env::var(..)?`) keep working; pass an owned
+    /// `String` where you can, since it moves straight into the secret
+    /// instead of being copied out of a buffer nothing will scrub. A caller
+    /// already holding a `SecretString` hands over
+    /// `secret.expose_secret().to_string()` — one deliberate, visible
+    /// exposure, which is the point of the type.
     pub fn auth_client_credentials(
         mut self,
         token_url: impl Into<String>,
@@ -476,7 +626,7 @@ impl RociaDbBuilder {
         self.auth = BuilderAuthConfig::Enabled {
             token_url: Some(token_url.into()),
             client_id: Some(client_id.into()),
-            client_secret: Some(client_secret.into()),
+            client_secret: Some(SecretString::from(client_secret.into())),
         };
         self
     }
@@ -506,6 +656,107 @@ impl RociaDbBuilder {
         self
     }
 
+    /// Set a deadline for every unary RPC the client issues.
+    ///
+    /// Opt-in with no default: a request deadline depends on what the
+    /// caller's own calls do, so the SDK never invents one. The value is
+    /// stored as-is (a zero duration is rejected by
+    /// [`build`](Self::build), like the connect timeout, rather than here).
+    ///
+    /// # How it is enforced
+    ///
+    /// Two ways at once, per attempt:
+    ///
+    /// - the `grpc-timeout` header is set on the request, so the **server**
+    ///   learns the deadline and can abandon the work instead of finishing a
+    ///   call nobody is waiting for. tonic's client channel also enforces
+    ///   that header locally, but only up to the response headers;
+    /// - the whole call future is wrapped in a `tokio::time::timeout`, which
+    ///   additionally covers decoding the response message and its trailers.
+    ///
+    /// Either way the call fails with [`RociaDbError::Status`] whose
+    /// [`code`](RociaDbError::code) is
+    /// [`DeadlineExceeded`](tonic::Code::DeadlineExceeded).
+    ///
+    /// # What it does not cover
+    ///
+    /// The deadline is **per attempt**, not per call: when auth is enabled
+    /// and the first attempt comes back `UNAUTHENTICATED`, the refreshed
+    /// retry gets a fresh deadline of its own, so a single call can take up
+    /// to twice this long (see [`RociaDbClient::refresh_auth_token`]). The
+    /// same is true of each attempt made by
+    /// [`RociaDbClient::retry`].
+    ///
+    /// The file transfers are deliberately **not** covered — neither the two
+    /// streaming RPCs themselves ([`upload_file_stream`],
+    /// [`download_file_stream`]) nor the [`upload_file`],
+    /// [`upload_file_chunked`] and [`download_file`] helpers built on them.
+    /// How long a stream the caller is feeding or draining may take is a
+    /// property of that stream's own data rate, not of the SDK, and a
+    /// deadline meant for a single unary round trip would abort a perfectly
+    /// healthy multi-gigabyte transfer. Bound those with a
+    /// `tokio::time::timeout` of your own around the call.
+    ///
+    /// [`upload_file`]: RociaDbClient::upload_file
+    /// [`upload_file_chunked`]: RociaDbClient::upload_file_chunked
+    /// [`upload_file_stream`]: RociaDbClient::upload_file_stream
+    /// [`download_file`]: RociaDbClient::download_file
+    /// [`download_file_stream`]: RociaDbClient::download_file_stream
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    /// Replace the TLS configuration used when dialing the upstream host.
+    ///
+    /// Without this, [`build`](Self::build) uses
+    /// `ClientTlsConfig::new().with_native_roots()` — the operating system's
+    /// trust store, which is also what the OAuth2 HTTP client trusts. Supply
+    /// your own to add a private CA
+    /// ([`ca_certificate`](ClientTlsConfig::ca_certificate)), to present a
+    /// client certificate for mTLS
+    /// ([`identity`](ClientTlsConfig::identity)), or to override the name
+    /// the server's certificate is verified against
+    /// ([`domain_name`](ClientTlsConfig::domain_name)).
+    ///
+    /// **tonic only applies TLS to an `https://` host.** A configuration
+    /// passed here is stored on the endpoint either way, but it has no
+    /// effect on a `http://` host: the connector decides whether to wrap the
+    /// socket from the URI scheme alone, so a `http://` host silently stays
+    /// plaintext. If TLS matters, the host must say `https://`.
+    ///
+    /// Has no effect on [`build_with_channel`](Self::build_with_channel),
+    /// which does no dialing — configure TLS on the channel you build there.
+    pub fn tls_config(mut self, tls_config: ClientTlsConfig) -> Self {
+        self.tls_config = Some(tls_config);
+        self
+    }
+
+    /// Send HTTP/2 keep-alive pings on the connection, every `interval`,
+    /// closing it when a ping goes `timeout` unanswered.
+    ///
+    /// Off by default, which is tonic's own default. Turn it on for a client
+    /// that holds a connection open through something that silently drops
+    /// idle flows — a NAT, a stateful firewall, a cloud load balancer: with
+    /// no keep-alive the SDK only discovers the dead connection when the
+    /// next RPC fails on it. `keep_alive_while_idle(true)` is implied, so the
+    /// pings continue while no RPC is in flight, which is exactly when the
+    /// flow would otherwise be reaped.
+    ///
+    /// Pick an `interval` comfortably shorter than the idle timeout you are
+    /// working around (30 s against a 60 s NAT, say) and a `timeout` of a few
+    /// seconds. An `interval` far shorter than that wastes a round trip per
+    /// tick per connection, and some servers reject pings they consider too
+    /// frequent with an HTTP/2 `ENHANCE_YOUR_CALM`.
+    ///
+    /// Applies to [`build`](Self::build) only, like every other endpoint
+    /// setting: [`build_with_channel`](Self::build_with_channel) uses the
+    /// channel as given.
+    pub fn http2_keep_alive(mut self, interval: Duration, timeout: Duration) -> Self {
+        self.http2_keep_alive = Some((interval, timeout));
+        self
+    }
+
     /// Build a client connected to the upstream.
     ///
     /// Takes `&self`, so the same builder can be reused to produce several
@@ -514,14 +765,25 @@ impl RociaDbBuilder {
     /// When auth is enabled, this fetches the first token and starts a
     /// background task that refreshes it before it expires (the IdP's
     /// tokens are short-lived — 600 seconds today) for as long as the
-    /// returned `RociaDbClient` or any of its clones is kept alive. Call
-    /// [`RociaDbClient::refresh_auth_token`] after an `UNAUTHENTICATED`
-    /// error to force an out-of-band refresh.
+    /// returned `RociaDbClient` or any of its clones is kept alive; a
+    /// refresh that fails is retried on a short backoff until one succeeds.
+    /// Every unary RPC also refreshes and retries once on its own when the
+    /// server answers `UNAUTHENTICATED`, so
+    /// [`RociaDbClient::refresh_auth_token`] is only needed to drive a
+    /// refresh out of band.
+    ///
+    /// # Errors
+    ///
+    /// [`RociaDbError::Config`] for anything wrong with the configuration —
+    /// a missing or malformed host, a missing `AUTH_*` value, a zero
+    /// timeout, a TLS configuration the endpoint rejects — all detected
+    /// before any socket is opened. [`RociaDbError::Connection`] when the
+    /// dial itself fails, and [`RociaDbError::Auth`] when the IdP does.
     pub async fn build(&self) -> Result<RociaDbClient> {
         let host = self
             .host
             .as_ref()
-            .ok_or_else(|| RociaDbError::connection("missing upstream host"))?;
+            .ok_or_else(|| RociaDbError::config("missing upstream host"))?;
         debug!(
             host = %host,
             auth_enabled = !matches!(self.auth, BuilderAuthConfig::Disabled),
@@ -529,15 +791,93 @@ impl RociaDbBuilder {
         );
         validate_host_path(host)?;
         let connect_timeout = resolve_connect_timeout(self.connect_timeout)?;
-        let endpoint = Endpoint::from_shared(host.clone())
-            .connection_context("invalid upstream host")?
-            .tls_config(ClientTlsConfig::new().with_native_roots())
-            .connection_context("failed to configure TLS")?
+        let tls_config = self
+            .tls_config
+            .clone()
+            .unwrap_or_else(|| ClientTlsConfig::new().with_native_roots());
+        let mut endpoint = Endpoint::from_shared(host.clone())
+            .config_context("invalid upstream host")?
+            .tls_config(tls_config)
+            .config_context("failed to configure TLS")?
             .connect_timeout(connect_timeout);
+        if let Some((interval, timeout)) = self.http2_keep_alive {
+            endpoint = endpoint
+                .http2_keep_alive_interval(interval)
+                .keep_alive_timeout(timeout)
+                // Without this, tonic only pings while an RPC is in flight —
+                // which is never the case for the idle connection this
+                // setting exists to keep alive.
+                .keep_alive_while_idle(true);
+        }
         let channel = endpoint
             .connect()
             .await
             .connection_context("failed to connect to upstream")?;
+        self.build_on_channel(channel, host.clone(), connect_timeout)
+            .await
+    }
+
+    /// Build a client on a [`Channel`] the caller already has, skipping both
+    /// host validation and dialing.
+    ///
+    /// Everything auth-related still happens exactly as in
+    /// [`build`](Self::build): the first token is fetched, the background
+    /// refresh starts, and the bearer interceptor is installed on all four
+    /// service clients. What is skipped is only what belongs to the channel:
+    /// the host URL checks, the TLS configuration and the HTTP/2 keep-alive
+    /// settings, because the channel handed in has already decided all of
+    /// it.
+    ///
+    /// Use this for a transport `Endpoint` cannot express on its own: a
+    /// custom connector (`Endpoint::connect_with_connector`), a Unix domain
+    /// socket, a load-balanced `Channel::balance_list`, or an in-process
+    /// server in a test. A lazy channel
+    /// (`Endpoint::connect_lazy`) works too, and moves the first connection
+    /// attempt to the first RPC.
+    ///
+    /// Both timeouts are still read and still validated.
+    /// [`request_timeout`](Self::request_timeout) applies to every unary RPC
+    /// however the channel was built, and
+    /// [`connect_timeout`](Self::connect_timeout) is what the OAuth2 HTTP
+    /// client uses to reach the IdP — the one connection this method does
+    /// open itself.
+    ///
+    /// [`Debug`](std::fmt::Debug) on the returned client reports the host
+    /// *configured on the builder*, which here is only a label — the channel
+    /// decides where the requests actually go.
+    pub async fn build_with_channel(&self, channel: Channel) -> Result<RociaDbClient> {
+        let host = self
+            .host
+            .clone()
+            .unwrap_or_else(|| "<caller-supplied channel>".to_string());
+        debug!(
+            host = %host,
+            auth_enabled = !matches!(self.auth, BuilderAuthConfig::Disabled),
+            "building rocia db client on a caller-supplied channel"
+        );
+        let connect_timeout = resolve_connect_timeout(self.connect_timeout)?;
+        self.build_on_channel(channel, host, connect_timeout).await
+    }
+
+    /// The half of building a client that has nothing to do with the
+    /// channel: resolve the request timeout, set up authentication, and wrap
+    /// the channel in the four generated service clients.
+    ///
+    /// Shared by [`build`](Self::build) and
+    /// [`build_with_channel`](Self::build_with_channel) so the token-manager
+    /// setup — which is where the subtle parts are (environment fallbacks, a
+    /// timeout-carrying HTTP client, the background refresh guard the client
+    /// must keep alive) — exists exactly once.
+    ///
+    /// `connect_timeout` is passed in rather than re-resolved: both callers
+    /// have already validated it, `build` because it also dials with it.
+    async fn build_on_channel(
+        &self,
+        channel: Channel,
+        host: String,
+        connect_timeout: Duration,
+    ) -> Result<RociaDbClient> {
+        let request_timeout = resolve_request_timeout(self.request_timeout)?;
         let (interceptor, token_manager, token_refresh_guard) = match &self.auth {
             BuilderAuthConfig::Disabled => {
                 warn!(host = %host, "building rocia db client with auth disabled");
@@ -552,32 +892,43 @@ impl RociaDbBuilder {
                     .clone()
                     .or_else(|| env::var(AUTH_TOKEN_URL_ENV).ok())
                     .ok_or_else(|| {
-                        RociaDbError::connection("missing auth token url (set AUTH_TOKEN_URL)")
+                        RociaDbError::config("missing auth token url (set AUTH_TOKEN_URL)")
                     })?;
                 let client_id = client_id
                     .clone()
                     .or_else(|| env::var(AUTH_CLIENT_ID_ENV).ok())
                     .ok_or_else(|| {
-                        RociaDbError::connection("missing auth client id (set AUTH_CLIENT_ID)")
+                        RociaDbError::config("missing auth client id (set AUTH_CLIENT_ID)")
                     })?;
                 let client_secret = client_secret
                     .clone()
-                    .or_else(|| env::var(AUTH_CLIENT_SECRET_ENV).ok())
+                    .or_else(|| {
+                        env::var(AUTH_CLIENT_SECRET_ENV)
+                            .ok()
+                            .map(SecretString::from)
+                    })
                     .ok_or_else(|| {
-                        RociaDbError::connection(
-                            "missing auth client secret (set AUTH_CLIENT_SECRET)",
-                        )
+                        RociaDbError::config("missing auth client secret (set AUTH_CLIENT_SECRET)")
                     })?;
+
+                // Both timeouts matter: without them a token endpoint that
+                // accepts the connection and never answers would hang this
+                // `build()` — and every later refresh, each holding the
+                // refresh lock — indefinitely.
+                let http = reqwest::Client::builder()
+                    .connect_timeout(connect_timeout)
+                    .timeout(OAUTH_HTTP_REQUEST_TIMEOUT)
+                    .build()
+                    .config_context("failed to build the OAuth2 HTTP client")?;
 
                 // `token_url`/`client_id` are deliberately not logged here:
                 // they expose the auth infrastructure (IdP endpoint, OAuth2
                 // client identity) in any log pipeline configured at debug
                 // level.
                 debug!(host = %host, "initializing upstream token manager");
-                let token_manager =
-                    TokenManager::new(reqwest::Client::new(), token_url, client_id, client_secret)
-                        .await
-                        .auth_context("failed to initialize token manager")?;
+                let token_manager = TokenManager::new(http, token_url, client_id, client_secret)
+                    .await
+                    .auth_context("failed to initialize token manager")?;
                 let interceptor = token_manager.interceptor();
                 // Without a background refresh, the IdP token would simply
                 // expire after its `expires_in` (600s here). Start it now
@@ -606,6 +957,7 @@ impl RociaDbBuilder {
             upstream_file,
             upstream_tenant,
             host: Arc::from(host.as_str()),
+            request_timeout,
             token_manager,
             _token_refresh_guard: token_refresh_guard,
         })
@@ -615,11 +967,24 @@ impl RociaDbBuilder {
 impl RociaDbClient {
     /// Force an immediate refresh of the upstream auth token.
     ///
-    /// Call this after an RPC fails with `UNAUTHENTICATED` — the server
-    /// treats that status as the signal to renew the token, as opposed to
+    /// **Every unary RPC already does this for you**, once, whenever the
+    /// server answers `UNAUTHENTICATED`: the token is refreshed (coalesced
+    /// with any concurrent refresh) and the call is re-issued a single time,
+    /// so a caller normally sees that status only when the retry failed too.
+    /// A background task also refreshes the token before it expires, and
+    /// retries on a short backoff when a refresh fails.
+    ///
+    /// What is left for this method is the out-of-band cases: a token you
+    /// know has been revoked, a credential rotation you want to pick up
+    /// immediately, a streaming upload or download (neither of which is
+    /// retried automatically — the automatic path covers unary RPCs only)
+    /// that failed with `UNAUTHENTICATED`, or code that wants to pay the
+    /// refresh cost up front rather than on the next call.
+    ///
+    /// `UNAUTHENTICATED` is the renewal signal, as opposed to
     /// `PERMISSION_DENIED`, which means the token is valid but lacks the
-    /// required scope and retrying after a refresh will not help. A no-op
-    /// returning `Ok(())` when the client was built with
+    /// required scope — refreshing it will not help. A no-op returning
+    /// `Ok(())` when the client was built with
     /// [`RociaDbBuilder::disable_auth`].
     pub async fn refresh_auth_token(&self) -> Result<()> {
         match &self.token_manager {
@@ -647,8 +1012,9 @@ impl RociaDbClient {
         }
     }
 
-    /// Issue one unary RPC: wrap `message` in a [`tonic::Request`], hand it
-    /// to `call`, and map a non-OK [`tonic::Status`] into
+    /// Issue one unary RPC: wrap `message` in a [`tonic::Request`], apply
+    /// the per-RPC deadline, hand it to `call`, refresh-and-retry once on
+    /// `UNAUTHENTICATED`, and map a non-OK [`tonic::Status`] into
     /// [`RociaDbError::Status`] tagged with `operation`.
     ///
     /// Every unary call in the crate goes through here — including the ones
@@ -659,16 +1025,41 @@ impl RociaDbClient {
     /// nor a transparent replay applies to a stream the caller is feeding
     /// or draining.
     ///
-    /// That single choke point is the point: a per-call deadline and an
-    /// automatic refresh-and-retry on `UNAUTHENTICATED` are both properties
-    /// of "any unary RPC", and both belong here rather than repeated at
-    /// twenty call sites. `Req: Clone` is required for the same reason —
-    /// replaying a call means building its request a second time — even
-    /// though today's single attempt consumes `message` without cloning it.
+    /// That single choke point is the point: both behaviours below are
+    /// properties of "any unary RPC", and belong here rather than repeated
+    /// at twenty call sites.
+    ///
+    /// # Deadline
+    ///
+    /// When [`RociaDbBuilder::request_timeout`] was set, each attempt both
+    /// carries a `grpc-timeout` header (so the server can abandon the work)
+    /// and is wrapped in a `tokio::time::timeout` (which also covers
+    /// decoding the response body, unlike tonic's own header-phase
+    /// enforcement). Both paths surface the same
+    /// `DEADLINE_EXCEEDED`-carrying error.
+    ///
+    /// # Refresh-and-retry on `UNAUTHENTICATED`
+    ///
+    /// With auth enabled, a first attempt answered `UNAUTHENTICATED` — the
+    /// status the server uses to mean "renew your token" — triggers
+    /// [`TokenManager::refresh_now`](auth::TokenManager::refresh_now), which
+    /// coalesces with any refresh already in flight, and the call is
+    /// re-issued exactly once. Never more than once: a second
+    /// `UNAUTHENTICATED` against a token minted moments earlier is a
+    /// credential or scope problem that looping cannot fix. If the refresh
+    /// itself fails, the *original* `UNAUTHENTICATED` is returned (it
+    /// describes what the caller actually asked for) and the refresh failure
+    /// is reported as a `warn!`.
+    ///
+    /// This is why `Req: Clone`: the first attempt consumes `message`, so a
+    /// replay needs a copy made beforehand. The clone happens only when auth
+    /// is enabled — with `disable_auth()` no refresh exists, nothing can be
+    /// replayed, and every RPC in the crate would otherwise pay for a copy
+    /// that is never read.
     ///
     /// `call` takes the whole `tonic::Request` (not just the message) so
     /// this function stays the only place that touches per-call metadata
-    /// and extensions.
+    /// and extensions. It is `Fn`, not `FnOnce`, for the same replay reason.
     pub(crate) async fn unary<Req, Resp, F, Fut>(
         &self,
         operation: &'static str,
@@ -680,10 +1071,71 @@ impl RociaDbClient {
         F: Fn(tonic::Request<Req>) -> Fut,
         Fut: Future<Output = std::result::Result<tonic::Response<Resp>, tonic::Status>>,
     {
-        let response = call(tonic::Request::new(message))
-            .await
-            .status_context(operation)?;
-        Ok(response.into_inner())
+        let replay = self.token_manager.as_ref().map(|_| Clone::clone(&message));
+        let error = match self.attempt(operation, message, &call).await {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+        if !error.is_unauthenticated() {
+            return Err(error);
+        }
+        // A token manager is present exactly when auth is enabled, which is
+        // exactly when `replay` was cloned above — so this destructuring
+        // never falls through in practice, and returning the original error
+        // is the right answer if it ever did.
+        let (Some(manager), Some(replay)) = (&self.token_manager, replay) else {
+            return Err(error);
+        };
+        debug!(
+            operation,
+            "upstream rejected the call as unauthenticated; refreshing the token and retrying once"
+        );
+        if let Err(refresh_error) = manager.refresh_now().await {
+            warn!(
+                operation,
+                error = %refresh_error,
+                "refreshing the auth token after an UNAUTHENTICATED response failed; returning \
+                 the original error"
+            );
+            return Err(error);
+        }
+        self.attempt(operation, replay, &call).await
+    }
+
+    /// One attempt at a unary RPC, with the per-RPC deadline applied.
+    ///
+    /// Split out of [`RociaDbClient::unary`] because the refresh-and-retry
+    /// path needs to run it twice, and each attempt must get its own
+    /// deadline: a retry that inherited the first attempt's remaining budget
+    /// would routinely be born already expired.
+    async fn attempt<Req, Resp, F, Fut>(
+        &self,
+        operation: &'static str,
+        message: Req,
+        call: &F,
+    ) -> Result<Resp>
+    where
+        F: Fn(tonic::Request<Req>) -> Fut,
+        Fut: Future<Output = std::result::Result<tonic::Response<Resp>, tonic::Status>>,
+    {
+        let mut request = tonic::Request::new(message);
+        let Some(timeout) = self.request_timeout else {
+            return Ok(call(request).await.status_context(operation)?.into_inner());
+        };
+        // Tells the server the deadline (it can then stop work nobody is
+        // waiting for) and arms tonic's own client-side `grpc-timeout`
+        // layer, which covers the call up to the response headers.
+        request.set_timeout(timeout);
+        // The outer timeout additionally covers decoding the response
+        // message and reading its trailers, which happen after tonic's layer
+        // has already resolved.
+        match tokio::time::timeout(timeout, call(request)).await {
+            Err(_elapsed) => Err(deadline_exceeded(operation, timeout)),
+            Ok(Err(status)) if is_local_deadline_expired(&status) => {
+                Err(deadline_exceeded(operation, timeout))
+            }
+            Ok(outcome) => Ok(outcome.status_context(operation)?.into_inner()),
+        }
     }
 }
 
@@ -705,6 +1157,14 @@ pub(crate) mod test_support {
     /// gating ran too late, it would hang or fail against the unreachable
     /// `127.0.0.1:1` host instead of returning promptly.
     pub(crate) fn lazy_test_client() -> RociaDbClient {
+        lazy_test_client_with_request_timeout(None)
+    }
+
+    /// [`lazy_test_client`] with an explicit per-RPC deadline, for the tests
+    /// that exercise the deadline path in `RociaDbClient::attempt`.
+    pub(crate) fn lazy_test_client_with_request_timeout(
+        request_timeout: Option<std::time::Duration>,
+    ) -> RociaDbClient {
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         let interceptor = BearerInterceptor::disabled();
         RociaDbClient {
@@ -722,6 +1182,7 @@ pub(crate) mod test_support {
             ),
             upstream_tenant: TenantServiceClient::with_interceptor(channel, interceptor),
             host: Arc::from("http://127.0.0.1:1"),
+            request_timeout,
             token_manager: None,
             _token_refresh_guard: None,
         }
@@ -731,11 +1192,12 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CONNECT_TIMEOUT, RociaDbBuilder, RociaDbClient, WriteOptions, page_request,
-        resolve_connect_timeout, validate_host_path,
+        DEFAULT_CONNECT_TIMEOUT, Endpoint, OAUTH_HTTP_REQUEST_TIMEOUT, RociaDbBuilder,
+        RociaDbClient, WriteOptions, deadline_exceeded, is_local_deadline_expired, page_request,
+        resolve_connect_timeout, resolve_request_timeout, validate_host_path,
     };
     use crate::RociaDbError;
-    use crate::test_support::lazy_test_client;
+    use crate::test_support::{lazy_test_client, lazy_test_client_with_request_timeout};
     use std::time::Duration;
 
     #[test]
@@ -791,7 +1253,7 @@ mod tests {
     fn host_path_validation_rejects_a_host_carrying_a_leftover_path() {
         let error = validate_host_path("http://127.0.0.1:50051/v1")
             .expect_err("a host with a non-root path must be rejected");
-        assert!(matches!(error, RociaDbError::Connection { .. }));
+        assert!(matches!(error, RociaDbError::Config { .. }));
         assert!(
             error.to_string().contains("/v1"),
             "the error should name the offending path, got: {error}"
@@ -805,7 +1267,7 @@ mod tests {
         // and tonic would silently drop it when dialing.
         let error = validate_host_path("http://127.0.0.1:50051?debug=1")
             .expect_err("a host with a query string must be rejected");
-        assert!(matches!(error, RociaDbError::Connection { .. }));
+        assert!(matches!(error, RociaDbError::Config { .. }));
         assert!(
             error.to_string().contains("debug=1"),
             "the error should name the offending query, got: {error}"
@@ -816,7 +1278,7 @@ mod tests {
     fn host_path_validation_rejects_a_host_carrying_a_leftover_fragment() {
         let error = validate_host_path("http://127.0.0.1:50051#note")
             .expect_err("a host with a fragment must be rejected");
-        assert!(matches!(error, RociaDbError::Connection { .. }));
+        assert!(matches!(error, RociaDbError::Config { .. }));
         assert!(
             error.to_string().contains('#'),
             "the error should mention the fragment, got: {error}"
@@ -826,6 +1288,14 @@ mod tests {
     #[test]
     fn default_connect_timeout_matches_the_typescript_sdk_default() {
         assert_eq!(DEFAULT_CONNECT_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn the_oauth_http_client_timeout_is_documented_and_finite() {
+        // The point of the constant is that it exists at all: a
+        // `reqwest::Client` with no timeout turns an unresponsive IdP into a
+        // permanent hang inside `build()` and every later refresh.
+        assert_eq!(OAUTH_HTTP_REQUEST_TIMEOUT, Duration::from_secs(30));
     }
 
     #[test]
@@ -846,8 +1316,138 @@ mod tests {
     fn resolve_connect_timeout_rejects_zero() {
         let error = resolve_connect_timeout(Some(Duration::ZERO))
             .expect_err("a zero connect timeout must be rejected");
-        assert!(matches!(error, RociaDbError::Validation(_)));
+        assert!(matches!(error, RociaDbError::Config { .. }));
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn resolve_request_timeout_has_no_default_and_rejects_zero() {
+        // Unlike the connect timeout, an absent request timeout stays absent:
+        // the SDK must not invent a deadline for calls whose duration it
+        // cannot predict.
+        assert_eq!(
+            resolve_request_timeout(None).expect("an absent request timeout must be accepted"),
+            None
+        );
+        assert_eq!(
+            resolve_request_timeout(Some(Duration::from_secs(4)))
+                .expect("a positive explicit timeout must be accepted"),
+            Some(Duration::from_secs(4))
+        );
+        let error = resolve_request_timeout(Some(Duration::ZERO))
+            .expect_err("a zero request timeout must be rejected");
+        assert!(matches!(error, RociaDbError::Config { .. }));
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn a_deadline_surfaces_as_a_status_error_reporting_deadline_exceeded() {
+        let error = deadline_exceeded("failed to get document", Duration::from_millis(1500));
+        assert_eq!(error.code(), Some(tonic::Code::DeadlineExceeded));
+        let message = error.to_string();
+        assert!(
+            message.contains("failed to get document"),
+            "the operation must still be named, got: {message}"
+        );
+        assert!(
+            message.contains("1500ms"),
+            "the expired deadline should be readable, got: {message}"
+        );
+    }
+
+    #[test]
+    fn tonics_own_grpc_timeout_expiry_is_recognised_and_nothing_else_is() {
+        // This is the status tonic's client-side `grpc-timeout` layer
+        // produces: `CANCELLED`, not `DEADLINE_EXCEEDED`, which is exactly
+        // why `attempt` normalizes it. The assertion on the code documents
+        // tonic's mapping, so a version that changes it shows up here.
+        let from_tonic = tonic::Status::from_error(Box::new(tonic::TimeoutExpired(())));
+        assert_eq!(from_tonic.code(), tonic::Code::Cancelled);
+        assert!(
+            is_local_deadline_expired(&from_tonic),
+            "a status built from TimeoutExpired must be recognised through its source chain"
+        );
+
+        // A status the server sent carries no source at all, so a genuine
+        // server-sent CANCELLED — even one worded like tonic's — must pass
+        // through untouched.
+        assert!(!is_local_deadline_expired(&tonic::Status::cancelled(
+            "client cancelled the call"
+        )));
+        assert!(!is_local_deadline_expired(&tonic::Status::cancelled(
+            "Timeout expired"
+        )));
+        assert!(!is_local_deadline_expired(&tonic::Status::aborted(
+            "write conflict, retry"
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_request_timeout_fires_against_a_host_that_accepts_and_never_answers() {
+        // A plain TCP listener that accepts the connection and then says
+        // nothing: the HTTP/2 handshake never completes, so tonic's own
+        // `grpc-timeout` layer — which only arms once the connection is
+        // ready, inside `Connection::call` — never gets a chance to fire.
+        // Only the SDK's own `tokio::time::timeout` can end this call, which
+        // is precisely why it wraps the whole future rather than trusting
+        // the header alone.
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port");
+        let address = listener.local_addr().expect("the bound address");
+        let accepting = std::thread::spawn(move || {
+            // Hold the accepted socket open (dropping it would send a FIN
+            // and let the client fail early for the wrong reason) for longer
+            // than the deadline under test, then let the thread end.
+            let held = listener.incoming().next().and_then(std::result::Result::ok);
+            std::thread::sleep(Duration::from_secs(2));
+            drop(held);
+        });
+
+        let channel = Endpoint::from_shared(format!("http://{address}"))
+            .expect("a loopback address must parse as an endpoint")
+            .connect_lazy();
+        let client = RociaDbBuilder::new()
+            .disable_auth()
+            .request_timeout(Duration::from_millis(150))
+            .build_with_channel(channel)
+            .await
+            .expect("a lazy channel with auth disabled must build");
+
+        let started = std::time::Instant::now();
+        let error = client
+            .list_tenants(Some(1), None)
+            .await
+            .expect_err("a silent server must not let the call hang");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            error.code(),
+            Some(tonic::Code::DeadlineExceeded),
+            "an expired request timeout must surface as DEADLINE_EXCEEDED, got: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the deadline must fire promptly, took {elapsed:?}"
+        );
+        accepting
+            .join()
+            .expect("the listener thread must not panic");
+    }
+
+    #[tokio::test]
+    async fn a_request_timeout_bounds_a_unary_call_against_an_unreachable_host() {
+        // The channel is lazy and 127.0.0.1:1 refuses (or drops) the
+        // connection, so this exercises `attempt`'s deadline path end to
+        // end: whichever of the two mechanisms notices first, the error must
+        // report a gRPC code and come back promptly rather than hanging.
+        let client = lazy_test_client_with_request_timeout(Some(Duration::from_millis(50)));
+        let error = client
+            .list_tenants(Some(1), None)
+            .await
+            .expect_err("an unreachable host must fail");
+        assert!(
+            error.code().is_some(),
+            "a failed unary call must carry a gRPC status, got: {error}"
+        );
     }
 
     #[test]
@@ -861,8 +1461,17 @@ mod tests {
         let chained = RociaDbBuilder::new()
             .host("http://127.0.0.1:50051")
             .connect_timeout(Duration::from_secs(7))
+            .request_timeout(Duration::from_secs(9))
+            .tls_config(crate::ClientTlsConfig::new().with_native_roots())
+            .http2_keep_alive(Duration::from_secs(30), Duration::from_secs(5))
             .disable_auth();
         assert_eq!(chained.connect_timeout, Some(Duration::from_secs(7)));
+        assert_eq!(chained.request_timeout, Some(Duration::from_secs(9)));
+        assert!(chained.tls_config.is_some());
+        assert_eq!(
+            chained.http2_keep_alive,
+            Some((Duration::from_secs(30), Duration::from_secs(5)))
+        );
 
         let partial = RociaDbBuilder::new().host("http://example.invalid:50051");
         let finished = partial.disable_auth();
@@ -870,6 +1479,18 @@ mod tests {
             finished.host.as_deref(),
             Some("http://example.invalid:50051")
         );
+    }
+
+    #[test]
+    fn builder_defaults_leave_every_new_transport_setting_unset() {
+        // Each of these must stay opt-in: a default request deadline would
+        // break slow-but-healthy calls, a default keep-alive would add
+        // traffic nobody asked for, and `None` for the TLS config is what
+        // selects the documented native-roots default.
+        let builder = RociaDbBuilder::new();
+        assert_eq!(builder.request_timeout, None);
+        assert_eq!(builder.http2_keep_alive, None);
+        assert!(builder.tls_config.is_none());
     }
 
     #[test]
@@ -889,15 +1510,15 @@ mod tests {
     async fn build_rejects_a_zero_connect_timeout_before_any_network_call() {
         // `validate_host_path` and the connect-timeout check both run
         // before `Endpoint::connect()`, so this must return promptly with
-        // `Validation` instead of hanging or failing against the
-        // (deliberately unreachable) host.
+        // `Config` instead of hanging or failing against the (deliberately
+        // unreachable) host.
         let error = RociaDbBuilder::new()
             .host("http://127.0.0.1:1")
             .connect_timeout(Duration::ZERO)
             .build()
             .await
             .expect_err("a zero connect timeout must fail build()");
-        assert!(matches!(error, RociaDbError::Validation(_)));
+        assert!(matches!(error, RociaDbError::Config { .. }));
     }
 
     #[tokio::test]
@@ -907,11 +1528,63 @@ mod tests {
             .build()
             .await
             .expect_err("a host carrying a path must fail build()");
-        assert!(matches!(error, RociaDbError::Connection { .. }));
+        assert!(matches!(error, RociaDbError::Config { .. }));
     }
 
-    // `BuilderAuthConfig`'s manual `Debug` impl must redact `client_secret`
-    // — a derived `Debug` would print it in clear text.
+    #[tokio::test]
+    async fn build_with_channel_skips_host_validation_and_dialing() {
+        // A host that `build()` rejects outright, on a lazy channel that
+        // never connects: `build_with_channel` must still produce a client,
+        // because neither the host string nor the dial is its business.
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = RociaDbBuilder::new()
+            .host("http://127.0.0.1:1/a/path?and=query")
+            .disable_auth()
+            .build_with_channel(channel)
+            .await
+            .expect("a caller-supplied channel must bypass host validation and dialing");
+        // The host is carried through purely as a `Debug` label.
+        let debug_output = format!("{client:?}");
+        assert!(debug_output.contains("http://127.0.0.1:1/a/path?and=query"));
+        assert!(debug_output.contains("auth_enabled: false"));
+    }
+
+    #[tokio::test]
+    async fn build_with_channel_still_validates_the_timeouts_it_uses() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let error = RociaDbBuilder::new()
+            .disable_auth()
+            .request_timeout(Duration::ZERO)
+            .build_with_channel(channel)
+            .await
+            .expect_err("a zero request timeout must fail build_with_channel()");
+        assert!(matches!(error, RociaDbError::Config { .. }));
+
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let error = RociaDbBuilder::new()
+            .disable_auth()
+            .connect_timeout(Duration::ZERO)
+            .build_with_channel(channel)
+            .await
+            .expect_err("a zero connect timeout must fail build_with_channel() too");
+        assert!(matches!(error, RociaDbError::Config { .. }));
+    }
+
+    #[tokio::test]
+    async fn build_with_channel_carries_the_request_timeout_onto_the_client() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = RociaDbBuilder::new()
+            .disable_auth()
+            .request_timeout(Duration::from_millis(250))
+            .build_with_channel(channel)
+            .await
+            .expect("a lazy channel with auth disabled must build");
+        assert_eq!(client.request_timeout, Some(Duration::from_millis(250)));
+    }
+
+    // `SecretString`'s own `Debug` redacts, which is what lets
+    // `BuilderAuthConfig` derive `Debug` instead of hand-writing one. Keep
+    // the assertion: it is the property that matters, whoever implements it.
     #[test]
     fn builder_debug_output_redacts_the_client_secret() {
         let builder = RociaDbBuilder::new().auth_client_credentials(
@@ -925,7 +1598,7 @@ mod tests {
             "the raw client_secret must never appear in Debug output, got: {debug_output}"
         );
         assert!(
-            debug_output.contains("[redacted]"),
+            debug_output.to_ascii_lowercase().contains("redacted"),
             "the redaction placeholder must appear, got: {debug_output}"
         );
         // Non-sensitive fields must stay visible: only the secret is

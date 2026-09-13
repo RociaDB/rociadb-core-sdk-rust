@@ -12,10 +12,11 @@
 
 use futures::stream;
 use rociadb_sdk::{
-    DocumentPage, DocumentQueryFilter, DocumentQueryOperator, DocumentQuerySort,
-    DocumentQuerySortDirection, DocumentWriteOptions, Edge, EdgeInput, FileStreamUploadOptions,
-    FileUploadOptions, Neighbor, NeighborNode, NodeBinding, NodeInput, Page, Result,
-    RociaDbBuilder, RociaDbClient, StatResponse, UploadRequest, WriteOptions,
+    Channel, ClientTlsConfig, DocumentPage, DocumentQueryFilter, DocumentQueryOperator,
+    DocumentQuerySort, DocumentQuerySortDirection, DocumentWriteOptions, Edge, EdgeInput,
+    ExposeSecret, FileStreamUploadOptions, FileUploadOptions, Neighbor, NeighborNode, NodeBinding,
+    NodeInput, Page, Result, RetryPolicy, RociaDbBuilder, RociaDbClient, SecretString,
+    StatResponse, UploadRequest, WriteOptions,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -321,4 +322,101 @@ async fn the_builder_chains_both_ways() -> Result<()> {
     let _first = configured.build().await?;
     let _second = configured.build().await?;
     Ok(())
+}
+
+// The transport hooks added in 2.0 chain like every other setter, and the two
+// tonic types they need are re-exported here, so a caller configuring TLS or a
+// custom channel does not need `tonic` as a direct dependency.
+#[allow(dead_code)]
+async fn the_builder_exposes_the_transport_hooks() -> Result<()> {
+    let _tls_and_deadlines = RociaDbBuilder::new()
+        .host("https://rociadb.example.com:443")
+        .request_timeout(Duration::from_secs(10))
+        .tls_config(ClientTlsConfig::new().with_native_roots())
+        .http2_keep_alive(Duration::from_secs(30), Duration::from_secs(5))
+        .disable_auth()
+        .build()
+        .await?;
+
+    // A channel the caller built: `build_with_channel` skips dialing and host
+    // validation but keeps the auth wiring and the request deadline.
+    let channel: Channel = Channel::from_static("http://127.0.0.1:50051").connect_lazy();
+    let _on_a_channel = RociaDbBuilder::new()
+        .request_timeout(Duration::from_secs(10))
+        .disable_auth()
+        .build_with_channel(channel)
+        .await?;
+    Ok(())
+}
+
+// `SecretString` is re-exported so a caller can keep the client secret in a
+// redacting, zeroizing type of its own and still hand it to the builder.
+#[allow(dead_code)]
+async fn a_caller_can_hold_the_client_secret_as_a_secret_string() -> Result<()> {
+    let secret = SecretString::from(std::env::var("APP_CLIENT_SECRET").unwrap_or_default());
+    let _client = RociaDbBuilder::new()
+        .auth_client_credentials(
+            "https://idp.example.com/token",
+            "client-id",
+            secret.expose_secret().to_string(),
+        )
+        .build()
+        .await?;
+    Ok(())
+}
+
+// `retry` takes a closure rebuilding the call on every attempt, works through
+// an `Arc`, and composes with the options structs — including reusing one
+// `request_id` across attempts, which is what makes a replayed write safe.
+#[allow(dead_code)]
+async fn retries_through_an_arc(client: Arc<RociaDbClient>) -> Result<()> {
+    let policy = RetryPolicy::new()
+        .with_max_attempts(5)
+        .with_base_delay(Duration::from_millis(50))
+        .with_max_delay(Duration::from_secs(1))
+        .with_retry_unavailable(true);
+
+    let _: Value = client
+        .retry(&policy, || {
+            client.get_document("tenant", "products", "sku-1")
+        })
+        .await?;
+
+    let options = WriteOptions::new().with_request_id("import-7:sku-1");
+    client
+        .retry(&policy, || {
+            let options = options.clone();
+            async {
+                client
+                    .put_node(
+                        "tenant",
+                        "catalog",
+                        "product:sku-1",
+                        &json!({"sku": "sku-1"}),
+                        options,
+                    )
+                    .await
+            }
+        })
+        .await?;
+
+    let document_options = DocumentWriteOptions::new()
+        .with_request_id("import-7:doc:sku-1")
+        .with_node_binding(NodeBinding::new("product", "catalog"));
+    client
+        .retry(&RetryPolicy::default(), || {
+            let document_options = document_options.clone();
+            async {
+                client
+                    .put_document(
+                        "tenant",
+                        "products",
+                        "sku-1",
+                        &json!({"sku": "sku-1"}),
+                        document_options,
+                    )
+                    .await
+            }
+        })
+        .await
 }

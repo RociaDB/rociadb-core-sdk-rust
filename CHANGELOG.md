@@ -77,10 +77,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   success or `error!` on routine failure: a library hands the error back and
   lets the caller decide how to log it. Every RPC now emits exactly one
   `debug!` line with its identifying fields (tenant, collection/graph/bucket,
-  ids, counts) and no payloads. The three remaining `warn!` lines are
-  unchanged: `disable_auth()`, a non-`https` token URL, and a failed background
-  token refresh. A deployment that relied on the `info!`/`error!` lines must
-  lower its filter for this crate's target to `debug`.
+  ids, counts) and no payloads. The `warn!` lines are `disable_auth()`, a
+  non-`https` token URL, a failed background token refresh, a token response
+  with no `expires_in`, and a token refresh that failed after an
+  `UNAUTHENTICATED` response. A deployment that relied on the `info!`/`error!`
+  lines must lower its filter for this crate's target to `debug`.
+- **Secrets are `secrecy::SecretString`, not `String`.** The OAuth2 client
+  secret and the bearer token are redacted by every formatter and zeroized
+  when dropped, which changes three signatures in `auth`:
+
+  | 1.0 | 2.0 |
+  | --- | --- |
+  | `TokenManager::new(http, token_url: String, client_id: String, client_secret: String)` | `TokenManager::new(http, token_url: String, client_id: String, client_secret: SecretString)` |
+  | `fetch_token(http, token_url: &str, client_id: &str, client_secret: &str)` | `fetch_token(http, token_url: &str, client_id: &str, client_secret: &SecretString)` |
+  | `TokenResponse { access_token: String, .. }` | `TokenResponse { access_token: SecretString, .. }` (read it with `ExposeSecret::expose_secret`) |
+
+  `RociaDbBuilder::auth_client_credentials` keeps `impl Into<String>` and
+  wraps the secret on arrival, so builder code is unchanged. `SecretString`
+  and `ExposeSecret` are re-exported at the crate root.
+- **`TokenResponse` deserialization is lenient, and `expires_in` /
+  `token_type` are no longer required.** `expires_in` accepts a whole or
+  fractional JSON number, or either written as a string (`"3600"`), and when
+  absent assumes 300 seconds with a `warn!` instead of failing the whole
+  token fetch; `token_type` defaults to `"Bearer"` and its case is preserved
+  (RFC 6749 §7.1 makes it case-insensitive). A present `expires_in` that is
+  not a usable number at all is still an error. An IdP whose response was
+  previously rejected now works.
+- **New `RociaDbError::Config` variant**, and the errors that were mis-filed
+  under `Connection` and `Validation` moved into it. `Connection` now means a
+  genuine dial or transport failure only, and `Validation` a client-side data
+  rule on one call's arguments only.
+
+  | Failure | 1.0 variant | 2.0 variant |
+  | ------- | ----------- | ----------- |
+  | missing host, host with a path / query / fragment, unparseable host URL | `Connection` | `Config` |
+  | missing `AUTH_TOKEN_URL` / `AUTH_CLIENT_ID` / `AUTH_CLIENT_SECRET` | `Connection` | `Config` |
+  | a TLS configuration the endpoint rejects | `Connection` | `Config` |
+  | zero connect timeout (and the new zero request timeout) | `Validation` | `Config` |
+  | failed dial, DNS failure, refused connection | `Connection` | `Connection` |
+  | zero page limit, oversized file, chunk/size mismatch | `Validation` | `Validation` |
+
+  The internal `RociaDbError::connection(message)` constructor (no source)
+  is gone; `Config` has `RociaDbError::config` in its place. Code matching
+  on `Connection { .. }` for a configuration mistake must match
+  `Config { .. }` instead — the enum is `#[non_exhaustive]`, so a wildcard
+  arm keeps compiling either way.
 
 ### Added
 
@@ -114,6 +155,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `deny.toml`: RustSec advisories, a permissive-only licence allow-list,
   duplicate and wildcard bans as warnings, and crates.io as the only allowed
   source.
+- `RociaDbBuilder::request_timeout(Duration)`: a deadline for every unary
+  RPC. Opt-in, with no default. Each attempt both carries a `grpc-timeout`
+  header (so the server can abandon the work) and is wrapped in a
+  `tokio::time::timeout` (which also covers decoding the response body,
+  unlike tonic's own header-phase enforcement); either way the call fails
+  with a `Status` error whose `code()` is `DeadlineExceeded`. A zero value is
+  rejected by `build()`. The streaming upload and download paths are
+  deliberately not covered.
+- `RociaDbBuilder::tls_config(ClientTlsConfig)`, replacing the default
+  `ClientTlsConfig::new().with_native_roots()` — for a private CA, mTLS, or
+  an overridden verification domain. tonic only applies TLS to an `https://`
+  host.
+- `RociaDbBuilder::http2_keep_alive(interval, timeout)`, mapping to tonic's
+  `http2_keep_alive_interval` / `keep_alive_timeout` /
+  `keep_alive_while_idle(true)` — for a connection held open through
+  something that reaps idle flows.
+- `RociaDbBuilder::build_with_channel(Channel)`: build a client on a channel
+  the caller already has (custom connector, Unix socket, balanced list,
+  in-process test server), skipping host validation and dialing while keeping
+  the whole auth setup and the request deadline.
+- `RetryPolicy` (`#[non_exhaustive]`, `Debug + Clone + PartialEq + Eq +
+  Default`, with `new()`, `with_max_attempts`, `with_base_delay`,
+  `with_max_delay`, `with_retry_unavailable`) and
+  `RociaDbClient::retry(&policy, op)`, which replays a closure while it fails
+  with `ABORTED` (and `UNAVAILABLE` when enabled), waiting an exponentially
+  increasing, fully jittered delay between attempts and returning the last
+  error once the attempts are exhausted. The jitter is derived from a v4
+  UUID's random bytes, so no `rand` dependency was added.
+- `RociaDbError::is_not_found()` and `RociaDbError::is_invalid_argument()`,
+  alongside the existing `is_unauthenticated` / `is_permission_denied` /
+  `is_already_exists` / `is_aborted`.
+- Crate-root re-exports so configuring the SDK needs no extra direct
+  dependency: `Channel` and `ClientTlsConfig` (from `tonic`), `SecretString`
+  and `ExposeSecret` (from `secrecy`). The same stability caveat as
+  `Streaming` applies.
+- `secrecy` 0.10 as a dependency (MSRV 1.60, dual Apache-2.0/MIT, one
+  transitive crate — `zeroize`, already in the graph via rustls).
 - This changelog.
 
 ### Changed
@@ -139,10 +217,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   root, so the namespace is flat and `auth` is the only public module — the
   paths `rociadb_sdk::file::..` and `rociadb_sdk::graph::..` no longer exist.
 - Every unary RPC now goes through one private helper on the client, which
-  wraps the request and maps a failed `tonic::Status`. That single choke point
-  is where a per-call deadline and an automatic refresh-and-retry will be added
-  without touching twenty call sites. The two streaming RPCs (`Upload`,
-  `Download`) still call the generated client directly.
+  wraps the request, applies the per-call deadline, refreshes and retries once
+  on `UNAUTHENTICATED`, and maps a failed `tonic::Status` — so none of that is
+  repeated at twenty call sites. The two streaming RPCs (`Upload`, `Download`)
+  still call the generated client directly and get none of it.
 - The neighbor page size used while walking every page in
   `get_outgoing_neighbor_nodes` / `get_incoming_neighbor_nodes` is a documented
   named constant instead of a literal `50` repeated at two call sites. The
@@ -171,6 +249,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Updated `h2` to 0.4.19 in `Cargo.lock` for RUSTSEC-2026-0258 (unbounded empty
   DATA frames, reachable through both `tonic` and `reqwest`).
+- **A failed background token refresh no longer waits out the whole regular
+  interval.** It used to wait for the next tick — 400 seconds for the IdP's
+  600-second tokens — so a single failed refresh guaranteed a window in which
+  every RPC failed with `UNAUTHENTICATED`. Consecutive failures now back off
+  exponentially with jitter (roughly 1 s, 2 s, 4 s, 8 s, 16 s, then 30 s,
+  each drawn from the upper half of its ceiling) until one succeeds, then the
+  task returns to the normal cadence. `request_refresh()` keeps waking the
+  task during a backoff, and each failure is reported once as a `warn!`
+  carrying the error, the consecutive-failure count and the next delay.
+- **The OAuth2 HTTP client has timeouts.** It was built with
+  `reqwest::Client::new()`, which has none, so an IdP that accepted the TCP
+  connection and never answered could hang `build()` — and every later
+  `refresh_auth_token()`, each while holding the refresh lock — forever. It
+  now carries the builder's connect timeout and a 30-second request timeout.
+- **A unary RPC answered `UNAUTHENTICATED` now refreshes the token and
+  retries once, automatically**, when auth is enabled. The refresh is
+  coalesced with any already in flight; a refresh that itself fails is
+  reported as a `warn!` and the original `UNAUTHENTICATED` is returned; the
+  call is never retried more than once. Streaming uploads and downloads are
+  not covered — call `refresh_auth_token()` yourself there.
 
 ## [1.0.0] - 2026-09-01
 

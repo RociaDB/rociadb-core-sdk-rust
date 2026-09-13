@@ -17,7 +17,8 @@ pub type Result<T> = std::result::Result<T, RociaDbError>;
 /// metadata value — see [`RociaDbError::reason`], which also documents the
 /// one code whose `reason` does not simply name it. In particular the
 /// server treats `UNAUTHENTICATED` as a signal to refresh the auth token
-/// and retry (see [`RociaDbError::is_unauthenticated`] and
+/// and retry, which every unary call already does once on its own before
+/// this error is ever built (see [`RociaDbError::is_unauthenticated`] and
 /// [`crate::RociaDbClient::refresh_auth_token`]), whereas
 /// `PERMISSION_DENIED` is final — the token is valid but lacks the required
 /// scope, and retrying after a refresh will not help (see
@@ -26,7 +27,28 @@ pub type Result<T> = std::result::Result<T, RociaDbError>;
 /// code this SDK's own docs treat as an expected outcome to branch on (see
 /// [`RociaDbError::is_already_exists`]), and `ABORTED`, the one code every
 /// caller is expected to retry automatically — on any call, reads included
-/// (see [`RociaDbError::is_aborted`]).
+/// (see [`RociaDbError::is_aborted`], and
+/// [`crate::RociaDbClient::retry`] for a helper that does it for you).
+/// [`DEADLINE_EXCEEDED`](tonic::Code::DeadlineExceeded) is the one code the
+/// SDK itself can produce without the server saying anything: it is what a
+/// [`request_timeout`](crate::RociaDbBuilder::request_timeout) expiring looks
+/// like.
+///
+/// Three of the variants carry no gRPC status because nothing ever reached
+/// the server, and the boundary between them is the one worth knowing:
+/// [`RociaDbError::Config`] is a *configuration* mistake, raised by
+/// [`crate::RociaDbBuilder`] before any connection is attempted (a missing
+/// host, a host URL carrying a path, a missing `AUTH_*` value, a zero
+/// timeout, a TLS config the endpoint rejects);
+/// [`RociaDbError::Connection`] is a genuine dial or transport failure
+/// (DNS, a refused connection, a TLS handshake);
+/// [`RociaDbError::Validation`] is a client-side *data* rule checked on a
+/// per-call argument (a zero page limit, an oversized file, a chunk stream
+/// whose length disagrees with the declared size). A `Config` error is
+/// fixed by changing how the client is built, a `Connection` error by
+/// fixing the network or the server, a `Validation` error by changing the
+/// arguments of one call.
+///
 /// New variants may be added in a minor release: match on this enum with a
 /// wildcard arm to stay forward-compatible.
 #[non_exhaustive]
@@ -44,22 +66,53 @@ pub enum RociaDbError {
         status: tonic::Status,
     },
 
-    /// Failed to connect to, or configure, the upstream endpoint: invalid
-    /// host, TLS setup, connection refused, or missing builder
-    /// configuration (host, token URL, client id/secret).
+    /// The client is misconfigured, detected by
+    /// [`crate::RociaDbBuilder`] *before* any connection is attempted: a
+    /// missing host, a host URL carrying a path, query string or fragment, a
+    /// missing `AUTH_TOKEN_URL` / `AUTH_CLIENT_ID` / `AUTH_CLIENT_SECRET`, a
+    /// zero [`connect_timeout`](crate::RociaDbBuilder::connect_timeout) or
+    /// [`request_timeout`](crate::RociaDbBuilder::request_timeout), or a
+    /// [`ClientTlsConfig`](crate::ClientTlsConfig) the endpoint rejects.
+    ///
+    /// Nothing has been sent anywhere when this is returned, and retrying
+    /// the same `build()` will fail identically: the fix is always to change
+    /// the configuration. Contrast [`RociaDbError::Connection`], which means
+    /// the configuration was usable and the *dial* failed.
+    ///
+    /// As with [`RociaDbError::Connection`], [`Display`](std::fmt::Display)
+    /// folds in the underlying cause when one is present (a `http::Uri`
+    /// parse error, a tonic transport error from a rejected TLS config), and
+    /// leaves it out for the checks that need no cause of their own.
+    #[error("{message}{}", source_suffix(.source))]
+    Config {
+        /// Description of what is misconfigured, naming the offending value
+        /// where there is one.
+        message: String,
+        /// The underlying cause, when the check rejected a value by asking
+        /// another crate to parse or accept it rather than by inspecting it
+        /// directly.
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+
+    /// Failed to reach the upstream endpoint: DNS resolution, a refused or
+    /// reset connection, a connect timeout, or a TLS handshake failure.
+    ///
+    /// This is a genuine transport failure against a configuration that was
+    /// itself accepted — a configuration mistake is
+    /// [`RociaDbError::Config`] instead, and is reported without any dial
+    /// being attempted.
     ///
     /// [`Display`](std::fmt::Display) folds in the underlying cause
     /// whenever one is present, so a bare `.to_string()` (or a `%err`
     /// tracing field built from it, as the background token-refresh task
     /// does) already distinguishes a DNS failure from a TLS mismatch from a
     /// refused connection, instead of rendering the same message for all
-    /// three. The cause is absent only for the handful of internal call
-    /// sites that build this variant from a validation failure with no I/O
-    /// involved; call [`std::error::Error::source`] directly when you need
-    /// to match on the cause's concrete type rather than read it.
+    /// three. Call [`std::error::Error::source`] directly when you need to
+    /// match on the cause's concrete type rather than read it.
     #[error("{message}{}", source_suffix(.source))]
     Connection {
-        /// Description of what could not be connected to or configured.
+        /// Description of what could not be reached.
         message: String,
         /// The underlying cause, when the failure came from I/O or TLS
         /// rather than from a pure configuration check.
@@ -106,19 +159,23 @@ pub enum RociaDbError {
         source: serde_json::Error,
     },
 
-    /// A client-side validation rule was violated before any network call
-    /// was made (a zero page limit, a file size out of bounds, a chunk
-    /// stream whose total byte count does not match the declared
-    /// `size_bytes`, etc).
+    /// A client-side rule about the *data* of one call was violated before
+    /// any network call was made: a zero page limit, a file size out of
+    /// bounds, or a chunk stream whose total byte count does not match the
+    /// declared `size_bytes`.
+    ///
+    /// This is about the arguments of a single call, not about how the
+    /// client was built — a builder or environment mistake is
+    /// [`RociaDbError::Config`].
     #[error("{0}")]
     Validation(String),
 }
 
 /// Renders `": {source}"` when a cause is present, or an empty string when
-/// it is not, so [`RociaDbError::Connection`] and [`RociaDbError::Auth`]
-/// can interpolate an optional `#[source]` into their `Display` output
-/// without printing a stray `: ` for the internal call sites that build
-/// either variant with no cause attached.
+/// it is not, so [`RociaDbError::Config`], [`RociaDbError::Connection`] and
+/// [`RociaDbError::Auth`] can interpolate an optional `#[source]` into their
+/// `Display` output without printing a stray `: ` for the internal call
+/// sites that build such a variant with no cause attached.
 fn source_suffix(source: &Option<Box<dyn std::error::Error + Send + Sync>>) -> String {
     match source {
         Some(source) => format!(": {source}"),
@@ -169,9 +226,16 @@ impl RociaDbError {
         }
     }
 
-    /// True when the server rejected the call as unauthenticated. The
-    /// server treats this as a renewal signal: call
-    /// [`crate::RociaDbClient::refresh_auth_token`] and retry.
+    /// True when the server rejected the call as unauthenticated.
+    ///
+    /// The server treats this as a renewal signal, and every unary call in
+    /// this SDK already acts on it: the token is refreshed and the call
+    /// re-issued once before the error reaches you (see
+    /// [`crate::RociaDbClient::refresh_auth_token`]). Seeing it therefore
+    /// means the refreshed credential was rejected too — the client id or
+    /// secret is wrong, revoked, or not entitled to this deployment — so the
+    /// fix is in the configuration, not in another retry. The exception is a
+    /// streaming upload or download, which is not retried automatically.
     pub fn is_unauthenticated(&self) -> bool {
         self.code() == Some(tonic::Code::Unauthenticated)
     }
@@ -242,9 +306,48 @@ impl RociaDbError {
     /// a document already committed. None of this changes what to do:
     /// retry the same call, with backoff rather than a tight loop, since
     /// server-side contention absorbs conflicts in latency rather than
-    /// making them disappear.
+    /// making them disappear. [`crate::RociaDbClient::retry`] and
+    /// [`crate::RetryPolicy`] implement exactly that loop; because a replay
+    /// may land on a write that already happened, it must reuse the failed
+    /// attempt's `request_id` rather than mint a fresh one.
     pub fn is_aborted(&self) -> bool {
         self.code() == Some(tonic::Code::Aborted)
+    }
+
+    /// True when the server reports that the addressed item does not exist.
+    ///
+    /// Every read of a single item can return it —
+    /// [`get_document`](crate::RociaDbClient::get_document),
+    /// [`get_node`](crate::RociaDbClient::get_node),
+    /// [`get_edge`](crate::RociaDbClient::get_edge),
+    /// [`stat_file`](crate::RociaDbClient::stat_file),
+    /// [`download_file`](crate::RociaDbClient::download_file) — and so can a
+    /// delete of something already gone. It is an expected outcome to branch
+    /// on rather than an error to propagate blindly: "absent" is usually a
+    /// value in the caller's domain (`Option::None`), not a failure. Unlike
+    /// [`Self::is_aborted`], retrying the same call changes nothing.
+    ///
+    /// A paginated listing never reports this for an empty collection,
+    /// graph or bucket: it returns an empty page instead.
+    pub fn is_not_found(&self) -> bool {
+        self.code() == Some(tonic::Code::NotFound)
+    }
+
+    /// True when the server rejected the call's arguments.
+    ///
+    /// This is a bug in the caller, not a transient condition: a missing
+    /// required field, an identifier over the server's length limit, a page
+    /// limit above `limits.max_page_size`, an unparseable cursor, a query
+    /// filter the server cannot evaluate. Retrying the same call is
+    /// pointless — the arguments have to change.
+    ///
+    /// The SDK rejects some of these client-side before the round trip
+    /// (returning [`RociaDbError::Validation`] instead, see
+    /// [`crate::RociaDbClient::put_document`] and the page-limit check every
+    /// paginated read performs); this predicate covers the rules only the
+    /// server knows, including any it gains or tightens later.
+    pub fn is_invalid_argument(&self) -> bool {
+        self.code() == Some(tonic::Code::InvalidArgument)
     }
 }
 
@@ -253,8 +356,8 @@ impl RociaDbError {
         Self::Validation(message.into())
     }
 
-    pub(crate) fn connection(message: impl Into<String>) -> Self {
-        Self::Connection {
+    pub(crate) fn config(message: impl Into<String>) -> Self {
+        Self::Config {
             message: message.into(),
             source: None,
         }
@@ -274,7 +377,27 @@ impl<T> StatusResultExt<T> for std::result::Result<T, tonic::Status> {
     }
 }
 
-/// Extension trait wrapping any connection/config failure into
+/// Extension trait wrapping a configuration failure raised by another crate
+/// (an `http::Uri` that will not parse, a TLS config `tonic`'s `Endpoint`
+/// refuses) into [`RociaDbError::Config`]. Also accepts another
+/// [`RociaDbError`] as the source (see [`ConnectionResultExt`] for why).
+pub(crate) trait ConfigResultExt<T> {
+    fn config_context(self, message: &str) -> Result<T>;
+}
+
+impl<T, E> ConfigResultExt<T> for std::result::Result<T, E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    fn config_context(self, message: &str) -> Result<T> {
+        self.map_err(|source| RociaDbError::Config {
+            message: message.to_string(),
+            source: Some(Box::new(source)),
+        })
+    }
+}
+
+/// Extension trait wrapping a dial or transport failure into
 /// [`RociaDbError::Connection`]. Also accepts another [`RociaDbError`] as
 /// the source, so a higher-level step (for example "failed to initialize
 /// token manager") can nest a lower-level one without losing it.
@@ -446,6 +569,32 @@ mod tests {
     }
 
     #[test]
+    fn is_not_found_true_only_for_not_found_status() {
+        let missing = RociaDbError::Status {
+            operation: "failed to get document",
+            status: Status::not_found("document does not exist"),
+        };
+        assert!(missing.is_not_found());
+        assert!(
+            !missing.is_invalid_argument(),
+            "not_found must not also read as invalid_argument"
+        );
+    }
+
+    #[test]
+    fn is_invalid_argument_true_only_for_invalid_argument_status() {
+        let rejected = RociaDbError::Status {
+            operation: "failed to list documents",
+            status: Status::invalid_argument("page limit above limits.max_page_size"),
+        };
+        assert!(rejected.is_invalid_argument());
+        assert!(
+            !rejected.is_not_found(),
+            "invalid_argument must not also read as not_found"
+        );
+    }
+
+    #[test]
     fn is_unauthenticated_and_is_permission_denied_are_false_for_other_status_codes() {
         let not_found = RociaDbError::Status {
             operation: "failed to get node",
@@ -455,11 +604,12 @@ mod tests {
         assert!(!not_found.is_permission_denied());
         assert!(!not_found.is_already_exists());
         assert!(!not_found.is_aborted());
+        assert!(!not_found.is_invalid_argument());
     }
 
     #[test]
     fn non_status_variants_carry_no_grpc_code_reason_or_status() {
-        // `code`/`reason`/`status`/the four `is_*` predicates only make
+        // `code`/`reason`/`status`/the six `is_*` predicates only make
         // sense for a failed gRPC call; every other variant must report
         // "absent" rather than panicking or fabricating a value.
         let validation = RociaDbError::validation("page limit must be greater than zero");
@@ -470,6 +620,15 @@ mod tests {
         assert!(!validation.is_permission_denied());
         assert!(!validation.is_already_exists());
         assert!(!validation.is_aborted());
+        assert!(!validation.is_not_found());
+        assert!(!validation.is_invalid_argument());
+
+        let config = RociaDbError::config("missing upstream host");
+        assert_eq!(config.code(), None);
+        assert_eq!(config.reason(), None);
+        assert!(config.status().is_none());
+        assert!(!config.is_not_found());
+        assert!(!config.is_invalid_argument());
     }
 
     #[test]
@@ -483,11 +642,40 @@ mod tests {
     }
 
     #[test]
-    fn connection_constructor_produces_its_own_variant() {
-        let connection = RociaDbError::connection("invalid host URL");
-        assert!(matches!(connection, RociaDbError::Connection { .. }));
-        assert_eq!(connection.to_string(), "invalid host URL");
-        assert_eq!(connection.code(), None);
+    fn config_constructor_produces_its_own_variant_with_no_stray_source_suffix() {
+        let config = RociaDbError::config("invalid host URL");
+        assert!(matches!(config, RociaDbError::Config { .. }));
+        // No cause was attached, so `Display` must not print a dangling
+        // `": "` from the optional `#[source]` interpolation.
+        assert_eq!(config.to_string(), "invalid host URL");
+        assert_eq!(config.code(), None);
+        assert!(
+            std::error::Error::source(&config).is_none(),
+            "a pure configuration check attaches no cause"
+        );
+    }
+
+    #[test]
+    fn config_result_ext_wraps_the_source_and_folds_it_into_display() {
+        // The real call site: a host string `http::Uri` refuses to parse.
+        let parsed: std::result::Result<http::Uri, _> = "http://[::1".parse::<http::Uri>();
+        let error = parsed
+            .config_context("invalid upstream host")
+            .expect_err("an unparseable URI must map to Config");
+        assert!(matches!(error, RociaDbError::Config { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("invalid upstream host"),
+            "message should name the failed check, got: {message}"
+        );
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the underlying parse error must be preserved as the source"
+        );
+        assert!(
+            message.len() > "invalid upstream host".len(),
+            "Display must fold in the cause, got: {message}"
+        );
     }
 
     #[test]
