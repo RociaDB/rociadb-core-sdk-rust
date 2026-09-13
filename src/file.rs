@@ -1,111 +1,175 @@
 //! File upload/download helpers.
 //!
-//! The upstream server accepts upload chunks up to 1 MiB (1_048_576 bytes)
-//! per message — anything larger is rejected outright with
-//! `INVALID_ARGUMENT` — and on download reads chunks back until it has
-//! collected `size_bytes` bytes in total, without assuming any particular
-//! chunk size.
-//!
-//! [`RociaDbClient::upload_file`], [`RociaDbClient::upload_file_owned`] and
-//! [`RociaDbClient::upload_file_chunked`] all emit exactly-1-MiB chunks (the
-//! last one may be shorter): that is the largest message the server allows,
-//! so it is also the fewest possible messages for a given file, and it
-//! remains the only chunk size that is safe against a server older than
-//! `1.0.0-rc.16`.
-//!
-//! Only reach for [`RociaDbClient::upload_file_stream`] directly if you
-//! understand and reproduce the wire contract yourself; see its own docs
-//! for what it does and does not validate.
+//! The option types this module defines are re-exported at the crate root
+//! ([`crate::FileUploadOptions`], [`crate::FileStreamUploadOptions`]), and
+//! the RPCs are inherent methods on [`RociaDbClient`].
+//! [`RociaDbClient::upload_file_stream`] documents the server's upload wire
+//! contract in full — including the 1 MiB per-message cap every upload path
+//! here respects.
 use crate::error::StatusResultExt;
 use crate::pb::upstream::v1::{
     DeleteRequest, DownloadRequest, DownloadResponse, ListBucketsRequest, ListFilesRequest,
     StatRequest, StatResponse, UploadRequest,
 };
-use crate::{Page, Result, RociaDbClient, RociaDbError, non_empty, page_request};
+use crate::{
+    DEFAULT_PAGE_SIZE, Page, Result, RociaDbClient, RociaDbError, WriteOptions, non_empty,
+    page_request,
+};
 use futures::{Stream, StreamExt, stream};
 use sha2::{Digest, Sha256};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tonic::codec::Streaming;
+use tracing::debug;
 use uuid::Uuid;
 
 /// Size of every upload message the SDK emits, except the last one. Not
-/// configurable: see the module docs.
+/// configurable: see [`RociaDbClient::upload_file_stream`].
 const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB.
-
-/// Length in bytes of a SHA-256 digest, required by the server's checksum
-/// validation.
-const CHECKSUM_LEN: usize = 32;
 
 /// Server-side max file size (`limits.max_file_bytes`, 5 GiB default).
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
-/// Options applied to an ergonomic byte-buffer upload.
+/// Default MIME type recorded for a file whose uploader did not name one.
+const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// Options applied to [`RociaDbClient::upload_file`], the in-memory
+/// byte-buffer upload.
 ///
-/// There is intentionally no `chunk_size` knob: see the module docs for why
-/// 1 MiB is the only size worth using.
-#[derive(Debug, Clone)]
+/// There is intentionally no `chunk_size` knob: see
+/// [`RociaDbClient::upload_file_stream`] for why 1 MiB is the only size
+/// worth using.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileUploadOptions {
     /// MIME type recorded for the file. Defaults to
     /// `"application/octet-stream"`; the server records it as given and never
     /// inspects the bytes to confirm it.
     pub content_type: String,
-    /// SHA-256 digest of the uploaded bytes, as exactly 32 raw bytes. When
-    /// `None`, [`RociaDbClient::upload_file`] computes it from the buffer
-    /// automatically. When `Some`, it must be exactly 32 bytes or the
-    /// upload fails before any network call — the server rejects any other
-    /// length with `INVALID_ARGUMENT`.
-    pub checksum: Option<Vec<u8>>,
+    /// SHA-256 digest of the uploaded bytes. When `None`,
+    /// [`RociaDbClient::upload_file`] computes it from the buffer
+    /// automatically — which is almost always what you want; set it
+    /// explicitly only when the digest is already known from elsewhere (a
+    /// manifest, a previous pass over the same bytes).
+    ///
+    /// The server checks the length and nothing else: a digest that does
+    /// not match the bytes sent produces an upload that looks successful
+    /// while recording a checksum the stored file does not satisfy. The
+    /// `[u8; 32]` type takes the length half of that off the table at
+    /// compile time.
+    pub checksum: Option<[u8; 32]>,
     /// Idempotency key for the upload. When `None`, one is generated
-    /// automatically (`upload_file:<uuid>`). Provide it explicitly — and
-    /// reuse the same value on a retry — so an upload replayed after a
-    /// timeout is absorbed rather than performed twice.
+    /// automatically (`upload_file:<uuid>` — see the [idempotency key
+    /// defaults](WriteOptions#idempotency-key-defaults)). Provide it
+    /// explicitly — and reuse the same value on a retry — so an upload
+    /// replayed after a timeout is absorbed rather than performed twice.
     pub request_id: Option<String>,
 }
 
 impl Default for FileUploadOptions {
     fn default() -> Self {
         Self {
-            content_type: "application/octet-stream".to_string(),
+            content_type: DEFAULT_CONTENT_TYPE.to_string(),
             checksum: None,
             request_id: None,
         }
     }
 }
 
-/// Options applied to [`RociaDbClient::upload_file_chunked`].
+impl FileUploadOptions {
+    /// Options with every field at its default: `"application/octet-stream"`,
+    /// a checksum computed from the bytes being uploaded, and a generated
+    /// idempotency key.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `content_type` as the file's MIME type.
+    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = content_type.into();
+        self
+    }
+
+    /// Send `checksum` instead of computing the SHA-256 digest of the
+    /// uploaded bytes; see [`FileUploadOptions::checksum`].
+    pub fn with_checksum(mut self, checksum: [u8; 32]) -> Self {
+        self.checksum = Some(checksum);
+        self
+    }
+
+    /// Set the idempotency key for this upload; see the [idempotency key
+    /// defaults](WriteOptions#idempotency-key-defaults).
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+}
+
+/// Options applied to [`RociaDbClient::upload_file_chunked`], the streaming
+/// upload.
 ///
-/// Unlike [`FileUploadOptions`], there is no `checksum` field here: for a
-/// streaming upload the checksum cannot be computed automatically (the
-/// whole point is to never hold the complete file in memory), so
-/// [`RociaDbClient::upload_file_chunked`] takes it as its own required
-/// `checksum` parameter instead of folding it into this struct — keeping it
-/// there would wrongly suggest it is optional, the way it genuinely is on
-/// [`FileUploadOptions::checksum`].
-#[derive(Debug, Clone)]
+/// Unlike [`FileUploadOptions`], `size_bytes` and `checksum` are required
+/// rather than optional, which is why this type has no `Default` and its
+/// constructor takes both: the file's metadata travels on the first gRPC
+/// message, before a single byte has been read from the caller's stream, so
+/// neither value can be derived on the fly the way
+/// [`RociaDbClient::upload_file`] derives them from a complete in-memory
+/// buffer.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileStreamUploadOptions {
+    /// Exact total number of bytes the caller's stream will produce. The
+    /// upload fails with [`RociaDbError::Validation`] if the stream ends up
+    /// shorter or longer, and the server checks the same thing at the end of
+    /// the stream.
+    pub size_bytes: u64,
+    /// SHA-256 digest of the complete file. Hash the source ahead of time (a
+    /// first pass over the file, for example): a streaming upload cannot
+    /// compute this while sending, since the digest has to be on the first
+    /// message. As with [`FileUploadOptions::checksum`], the server checks
+    /// the length only.
+    pub checksum: [u8; 32],
     /// MIME type recorded for the file. Defaults to
     /// `"application/octet-stream"`; the server records it as given and never
     /// inspects the bytes to confirm it.
     pub content_type: String,
     /// Idempotency key for the upload. When `None`, one is generated
-    /// automatically (`upload_file:<uuid>`). Provide it explicitly — and
-    /// reuse the same value on a retry — so an upload replayed after a
-    /// timeout is absorbed rather than performed twice.
+    /// automatically (`upload_file:<uuid>` — see the [idempotency key
+    /// defaults](WriteOptions#idempotency-key-defaults)). Provide it
+    /// explicitly — and reuse the same value on a retry — so an upload
+    /// replayed after a timeout is absorbed rather than performed twice.
     pub request_id: Option<String>,
 }
 
-impl Default for FileStreamUploadOptions {
-    fn default() -> Self {
+impl FileStreamUploadOptions {
+    /// Options for a file of exactly `size_bytes` bytes whose SHA-256 digest
+    /// is `checksum`, with `"application/octet-stream"` as the MIME type and
+    /// a generated idempotency key.
+    pub fn new(size_bytes: u64, checksum: [u8; 32]) -> Self {
         Self {
-            content_type: "application/octet-stream".to_string(),
+            size_bytes,
+            checksum,
+            content_type: DEFAULT_CONTENT_TYPE.to_string(),
             request_id: None,
         }
+    }
+
+    /// Record `content_type` as the file's MIME type.
+    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = content_type.into();
+        self
+    }
+
+    /// Set the idempotency key for this upload; see the [idempotency key
+    /// defaults](WriteOptions#idempotency-key-defaults).
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
     }
 }
 
 impl RociaDbClient {
-    /// Upload a caller-built stream of protobuf `UploadRequest` messages.
+    /// Upload a caller-built stream of protobuf [`UploadRequest`] messages.
     ///
     /// This is a low-level escape hatch for genuine streaming uploads (data
     /// that never fits in memory). The SDK does **not** rechunk or compute
@@ -116,11 +180,11 @@ impl RociaDbClient {
     ///   the SHA-256 digest of the whole file, as exactly 32 raw bytes;
     /// - every message's `chunk` must not exceed 1 MiB (1_048_576 bytes) —
     ///   below that cap, the server accepts any size, sliced however the
-    ///   caller likes (see the module docs for why this SDK's own
-    ///   `upload_file`/`upload_file_chunked` still always choose exactly
-    ///   1 MiB chunks even though the server no longer requires it);
+    ///   caller likes;
     /// - `content_type` and `checksum` on messages after the first are
-    ///   ignored by the server and can be left empty.
+    ///   ignored by the server and can be left empty;
+    /// - `request_id`, if any, is read from the first message too; nothing
+    ///   is generated for you here, unlike every other write on this client.
     ///
     /// A `chunk` over 1 MiB, a checksum of the wrong length, or a
     /// mismatched `size_bytes` all fail the upload outright with
@@ -129,6 +193,13 @@ impl RociaDbClient {
     /// matches the bytes sent — only that it is 32 bytes long — so a wrong
     /// checksum can still produce an upload that looks successful while
     /// carrying bad data.
+    ///
+    /// **Why the SDK's own uploads always emit exactly 1 MiB chunks**: that
+    /// is the largest message the server allows, so it is also the fewest
+    /// possible messages for a given file, and it remains the only chunk
+    /// size that is safe against a server older than `1.0.0-rc.16`. Neither
+    /// [`RociaDbClient::upload_file`] nor
+    /// [`RociaDbClient::upload_file_chunked`] exposes a knob for it.
     ///
     /// For the common case — uploading an in-memory byte buffer — use
     /// [`RociaDbClient::upload_file`] instead, which builds a correct
@@ -140,83 +211,83 @@ impl RociaDbClient {
     where
         S: Stream<Item = UploadRequest> + Send + 'static,
     {
-        let mut upstream_file = self.upstream_file.clone();
-        upstream_file
-            .upload(requests)
+        debug!("uploading a caller-built file stream");
+        self.upload_raw(requests)
             .await
             .status_context("failed to upload file")?;
         Ok(())
     }
 
+    /// Issue the client-streaming `Upload` RPC and hand back the raw
+    /// [`tonic::Status`] on failure.
+    ///
+    /// The one place the generated file client's `upload` is called. Unlike
+    /// every unary RPC — which goes through [`RociaDbClient::unary`] — a
+    /// streaming upload gets no per-call deadline and no transparent replay:
+    /// the request stream is the caller's and can only be consumed once. The
+    /// status is left unmapped because
+    /// [`RociaDbClient::upload_file_chunked`] must decide between it and its
+    /// own client-side size-mismatch error before either is returned.
+    async fn upload_raw<S>(&self, requests: S) -> std::result::Result<(), tonic::Status>
+    where
+        S: Stream<Item = UploadRequest> + Send + 'static,
+    {
+        let mut upstream_file = self.upstream_file.clone();
+        upstream_file
+            .upload(requests)
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
     /// Upload an in-memory byte buffer, split into gRPC messages of the
     /// server's largest allowed chunk size.
     ///
-    /// The buffer is always split into 1 MiB (1_048_576-byte) chunks (the
-    /// last chunk may be shorter); not configurable, see the module docs
-    /// for why. When `options.checksum` is `None`, the SHA-256 digest of
-    /// `bytes` is computed and sent automatically; when it is `Some`, it
-    /// must be exactly 32 bytes or this returns an error before any
-    /// network call. Files over 5 GiB (`limits.max_file_bytes`, the server
-    /// default) are rejected client-side with a clear error instead of
-    /// failing partway through the upload.
+    /// The buffer is always split into 1 MiB (1_048_576-byte) chunks, the
+    /// last one possibly shorter; not configurable, see
+    /// [`RociaDbClient::upload_file_stream`] for why. When
+    /// [`FileUploadOptions::checksum`] is `None`, the SHA-256 digest of
+    /// `bytes` is computed and sent automatically. Files over 5 GiB
+    /// (`limits.max_file_bytes`, the server default) are rejected
+    /// client-side with a clear error instead of failing partway through the
+    /// upload.
     ///
-    /// `bytes` is only ever read here, never consumed, so this necessarily
-    /// copies it once to build the owned buffer the chunking step and the
-    /// underlying `'static` upload stream require. If you already own a
-    /// `Vec<u8>` — the common case for a file freshly read off disk or
-    /// assembled in memory — call [`RociaDbClient::upload_file_owned`]
-    /// instead: it accepts that `Vec<u8>` directly and moves it straight
-    /// into the chunking step with no copy, which matters as file size
-    /// approaches the 5 GiB ceiling above.
+    /// `bytes` is taken as `impl Into<Vec<u8>>`, so both ownership styles
+    /// are one call: a `Vec<u8>` you already hold — a file read off disk, a
+    /// buffer assembled in memory — is **moved** straight into the chunking
+    /// step with no copy, while a borrowed `&[u8]` (or `&[u8; N]`, or
+    /// `&str`) is **copied once** into the owned buffer that the chunking
+    /// step and the underlying `'static` upload stream require. That copy is
+    /// unavoidable for a borrowed buffer, and worth avoiding for a large
+    /// owned one: it doubles peak memory for the whole upload, since Rust's
+    /// drop scopes keep the original alive until the upload finishes.
+    ///
+    /// See the [idempotency key
+    /// defaults](WriteOptions#idempotency-key-defaults) for the key used
+    /// when [`FileUploadOptions::request_id`] is unset.
     pub async fn upload_file(
         &self,
         tenant_id: &str,
         bucket: &str,
         file_id: &str,
-        bytes: impl AsRef<[u8]>,
+        bytes: impl Into<Vec<u8>>,
         options: FileUploadOptions,
     ) -> Result<()> {
-        self.upload_file_owned(tenant_id, bucket, file_id, bytes.as_ref().to_vec(), options)
-            .await
-    }
-
-    /// Upload an in-memory byte buffer you already own, split into gRPC
-    /// messages of the server's largest allowed chunk size.
-    ///
-    /// Identical to [`RociaDbClient::upload_file`] in every respect —
-    /// chunking, automatic checksum computation, the 5 GiB size limit —
-    /// except that `bytes` is taken by value instead of by reference: a
-    /// `Vec<u8>` passed here is moved straight into the chunking step with
-    /// no intermediate copy, whereas `upload_file` must always copy its
-    /// borrowed buffer to build the owned `Vec<u8>` the chunking step and
-    /// the underlying `'static` upload stream require. For a caller who
-    /// already holds the file as an owned `Vec<u8>` — read off disk,
-    /// assembled in memory, or received from another API — that copy is
-    /// pure waste: it doubles peak memory for the whole upload, and Rust's
-    /// drop-scope rules keep the original buffer alive until the upload
-    /// finishes, so the doubled memory persists for the entire duration,
-    /// not just briefly. That waste becomes significant as file size
-    /// approaches the 5 GiB ceiling documented above. Prefer
-    /// [`RociaDbClient::upload_file`] only when you have a borrowed
-    /// `&[u8]` (or another type implementing `AsRef<[u8]>`) and no owned
-    /// buffer to give up — there, the copy is unavoidable regardless of
-    /// which method you call.
-    pub async fn upload_file_owned(
-        &self,
-        tenant_id: &str,
-        bucket: &str,
-        file_id: &str,
-        bytes: Vec<u8>,
-        options: FileUploadOptions,
-    ) -> Result<()> {
+        let bytes = bytes.into();
         let size_bytes = u64::try_from(bytes.len())
             .map_err(|_| RociaDbError::validation("file is too large"))?;
         validate_file_size(size_bytes)?;
 
-        let checksum = resolve_checksum(options.checksum, &bytes)?;
+        debug!(
+            tenant_id = tenant_id,
+            bucket = bucket,
+            file_id = file_id,
+            size_bytes = size_bytes,
+            "uploading file"
+        );
+        let checksum = resolve_checksum(options.checksum, &bytes);
         let request_id = options
             .request_id
-            .unwrap_or_else(|| format!("upload_file:{}", Uuid::new_v4()));
+            .unwrap_or_else(default_upload_file_request_id);
 
         let requests = chunk_upload_requests(
             tenant_id.to_string(),
@@ -227,7 +298,10 @@ impl RociaDbClient {
             checksum,
             request_id,
         );
-        self.upload_file_stream(stream::iter(requests)).await
+        self.upload_raw(stream::iter(requests))
+            .await
+            .status_context("failed to upload file")?;
+        Ok(())
     }
 
     /// Upload a stream of arbitrarily-sized byte chunks without buffering
@@ -238,50 +312,49 @@ impl RociaDbClient {
     /// [`RociaDbClient::upload_file_stream`] (a raw pass-through with zero
     /// validation, and the caller must already match the server's exact
     /// wire contract). `chunks` may be split however the source naturally
-    /// produces data — a `64 KiB` `AsyncRead` wrapper, protobuf messages
+    /// produces data — a 64 KiB `AsyncRead` wrapper, protobuf messages
     /// from another stream, anything — this method re-buffers internally
     /// and always emits exactly-1-MiB gRPC messages to the server (the last
     /// one may be shorter), the same chunking [`RociaDbClient::upload_file`]
-    /// produces from an in-memory buffer.
+    /// produces from an in-memory buffer. It never holds more than one
+    /// outgoing chunk's worth of bytes at a time, however `chunks` happens
+    /// to be sliced.
     ///
-    /// `size_bytes` must be the exact total the caller intends to send, and
-    /// `checksum` must already be the 32-byte SHA-256 digest of the
-    /// complete file: unlike [`RociaDbClient::upload_file`], neither can be
-    /// computed for you here, because file metadata travels on the first
-    /// gRPC message, before this method has read a single byte from
-    /// `chunks`. Hash the source ahead of time (a first pass over the file,
-    /// for example) if you only have raw bytes. `checksum` is validated to
-    /// be exactly 32 bytes before any network call.
-    ///
-    /// If `chunks` ends up producing more or fewer total bytes than
-    /// `size_bytes` declared, this fails with
+    /// [`FileStreamUploadOptions::size_bytes`] must be the exact total the
+    /// caller intends to send and [`FileStreamUploadOptions::checksum`] the
+    /// SHA-256 digest of the complete file; see that type for why neither
+    /// can be computed here. If `chunks` ends up producing more or fewer
+    /// total bytes than `size_bytes` declared, this fails with
     /// [`RociaDbError::Validation`] instead of silently sending a
     /// corrupt-on-download file: the server itself also checks this at the
     /// end of the stream, but catching it here gives a clearer, immediate
     /// error naming the actual byte counts involved.
     ///
     /// **Naming note**: despite matching the server's chunking contract,
-    /// this is not called `upload_file_stream` — that name was already
-    /// taken by the raw, zero-validation escape hatch above it.
-    #[allow(clippy::too_many_arguments)]
+    /// this is not called `upload_file_stream` — that name belongs to the
+    /// raw, zero-validation escape hatch above it.
     pub async fn upload_file_chunked<S>(
         &self,
         tenant_id: &str,
         bucket: &str,
         file_id: &str,
-        size_bytes: u64,
-        checksum: Vec<u8>,
         chunks: S,
         options: FileStreamUploadOptions,
     ) -> Result<()>
     where
         S: Stream<Item = Vec<u8>> + Send + 'static,
     {
-        validate_file_size(size_bytes)?;
-        require_checksum_len(&checksum)?;
+        validate_file_size(options.size_bytes)?;
+        debug!(
+            tenant_id = tenant_id,
+            bucket = bucket,
+            file_id = file_id,
+            size_bytes = options.size_bytes,
+            "uploading file from a chunk stream"
+        );
         let request_id = options
             .request_id
-            .unwrap_or_else(|| format!("upload_file:{}", Uuid::new_v4()));
+            .unwrap_or_else(default_upload_file_request_id);
 
         // Set by `rechunk_upload_requests` when the source produced a total
         // byte count that does not match `size_bytes`, since the outgoing
@@ -295,16 +368,15 @@ impl RociaDbClient {
             tenant_id.to_string(),
             bucket.to_string(),
             file_id.to_string(),
-            size_bytes,
+            options.size_bytes,
             options.content_type,
-            checksum,
+            options.checksum,
             request_id,
             chunks,
             Arc::clone(&error_slot),
         );
 
-        let mut upstream_file = self.upstream_file.clone();
-        let upload_result = upstream_file.upload(requests).await;
+        let upload_result = self.upload_raw(requests).await;
         if let Some(error) = error_slot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -321,17 +393,16 @@ impl RociaDbClient {
     /// This performs no integrity verification of its own — it is a thin
     /// wrapper that opens the raw gRPC download stream and hands it back
     /// as-is. That is a real asymmetry with the upload path: every upload
-    /// method on this client validates a SHA-256 checksum before (or, for
-    /// [`RociaDbClient::upload_file`]/[`RociaDbClient::upload_file_owned`],
-    /// as part of) sending any bytes, and [`StatResponse::checksum`]
-    /// exposes the checksum recorded for a stored file — but nothing on
-    /// the download side ever computes or checks a checksum against the
-    /// chunks the server sends back, and the server does not send one on
-    /// download for this method to check. The only protection you get is
-    /// whatever the transport itself already provides (TLS and HTTP/2
-    /// framing catch corruption or truncation in transit), which says
-    /// nothing about whether the bytes stored on the server still match
-    /// what was originally uploaded. If you need that end-to-end
+    /// method on this client sends a SHA-256 checksum with the file (and
+    /// [`RociaDbClient::upload_file`] computes it for you), and
+    /// [`StatResponse::checksum`] exposes the checksum recorded for a stored
+    /// file — but nothing on the download side ever computes or checks a
+    /// checksum against the chunks the server sends back, and the server
+    /// does not send one on download for this method to check. The only
+    /// protection you get is whatever the transport itself already provides
+    /// (TLS and HTTP/2 framing catch corruption or truncation in transit),
+    /// which says nothing about whether the bytes stored on the server still
+    /// match what was originally uploaded. If you need that end-to-end
     /// guarantee, call [`RociaDbClient::stat_file`] yourself and compare
     /// its `checksum` against a SHA-256 digest you compute over the
     /// downloaded bytes — this crate does not do that comparison for you.
@@ -341,6 +412,12 @@ impl RociaDbClient {
         bucket: &str,
         file_id: &str,
     ) -> Result<Streaming<DownloadResponse>> {
+        debug!(
+            tenant_id = tenant_id,
+            bucket = bucket,
+            file_id = file_id,
+            "downloading file"
+        );
         let mut upstream_file = self.upstream_file.clone();
         Ok(upstream_file
             .download(DownloadRequest {
@@ -390,16 +467,22 @@ impl RociaDbClient {
         bucket: &str,
         file_id: &str,
     ) -> Result<StatResponse> {
-        let mut upstream_file = self.upstream_file.clone();
-        Ok(upstream_file
-            .stat(StatRequest {
-                tenant_id: tenant_id.to_string(),
-                bucket: bucket.to_string(),
-                file_id: file_id.to_string(),
-            })
-            .await
-            .status_context("failed to stat file")?
-            .into_inner())
+        debug!(
+            tenant_id = tenant_id,
+            bucket = bucket,
+            file_id = file_id,
+            "reading file metadata"
+        );
+        let request = StatRequest {
+            tenant_id: tenant_id.to_string(),
+            bucket: bucket.to_string(),
+            file_id: file_id.to_string(),
+        };
+        self.unary("failed to stat file", request, |request| {
+            let mut upstream = self.upstream_file.clone();
+            async move { upstream.stat(request).await }
+        })
+        .await
     }
 
     /// Return one paginated page of bucket names holding at least one file.
@@ -409,15 +492,22 @@ impl RociaDbClient {
         limit: Option<u32>,
         cursor: Option<&str>,
     ) -> Result<Page<String>> {
-        let mut upstream_file = self.upstream_file.clone();
-        let response = upstream_file
-            .list_buckets(ListBucketsRequest {
-                tenant_id: tenant_id.to_string(),
-                page: page_request(limit, cursor)?,
+        debug!(
+            tenant_id = tenant_id,
+            limit = limit.unwrap_or(DEFAULT_PAGE_SIZE),
+            cursor = cursor.unwrap_or(""),
+            "listing buckets"
+        );
+        let request = ListBucketsRequest {
+            tenant_id: tenant_id.to_string(),
+            page: page_request(limit, cursor)?,
+        };
+        let response = self
+            .unary("failed to list buckets", request, |request| {
+                let mut upstream = self.upstream_file.clone();
+                async move { upstream.list_buckets(request).await }
             })
-            .await
-            .status_context("failed to list buckets")?
-            .into_inner();
+            .await?;
         Ok(Page {
             items: response.buckets,
             next_cursor: response.page.and_then(|page| non_empty(page.next_cursor)),
@@ -432,86 +522,85 @@ impl RociaDbClient {
         limit: Option<u32>,
         cursor: Option<&str>,
     ) -> Result<Page<String>> {
-        let mut upstream_file = self.upstream_file.clone();
-        let response = upstream_file
-            .list_files(ListFilesRequest {
-                tenant_id: tenant_id.to_string(),
-                bucket: bucket.to_string(),
-                page: page_request(limit, cursor)?,
+        debug!(
+            tenant_id = tenant_id,
+            bucket = bucket,
+            limit = limit.unwrap_or(DEFAULT_PAGE_SIZE),
+            cursor = cursor.unwrap_or(""),
+            "listing files"
+        );
+        let request = ListFilesRequest {
+            tenant_id: tenant_id.to_string(),
+            bucket: bucket.to_string(),
+            page: page_request(limit, cursor)?,
+        };
+        let response = self
+            .unary("failed to list files", request, |request| {
+                let mut upstream = self.upstream_file.clone();
+                async move { upstream.list_files(request).await }
             })
-            .await
-            .status_context("failed to list files")?
-            .into_inner();
+            .await?;
         Ok(Page {
             items: response.file_ids,
             next_cursor: response.page.and_then(|page| non_empty(page.next_cursor)),
         })
     }
 
-    /// Delete one stored file using an automatically generated idempotency key.
-    pub async fn delete_file(&self, tenant_id: &str, bucket: &str, file_id: &str) -> Result<()> {
-        self.delete_file_with_request_id(
-            tenant_id,
-            bucket,
-            file_id,
-            format!("delete_file:{}", Uuid::new_v4()),
-        )
-        .await
-    }
-
-    /// Delete one stored file with a caller-provided idempotency key.
-    pub async fn delete_file_with_request_id(
+    /// Delete one stored file.
+    ///
+    /// **Idempotent**, like [`RociaDbClient::delete_document`] and
+    /// [`RociaDbClient::delete_edge`]: deleting a `file_id` that does not
+    /// exist succeeds and touches nothing. Call
+    /// [`RociaDbClient::stat_file`] first when you need to know whether the
+    /// file was there.
+    ///
+    /// See the [idempotency key
+    /// defaults](WriteOptions#idempotency-key-defaults) for the key used
+    /// when [`WriteOptions::request_id`] is unset.
+    pub async fn delete_file(
         &self,
         tenant_id: &str,
         bucket: &str,
         file_id: &str,
-        request_id: impl Into<String>,
+        options: WriteOptions,
     ) -> Result<()> {
-        let mut upstream_file = self.upstream_file.clone();
-        upstream_file
-            .delete(DeleteRequest {
-                tenant_id: tenant_id.to_string(),
-                bucket: bucket.to_string(),
-                file_id: file_id.to_string(),
-                request_id: request_id.into(),
-            })
-            .await
-            .status_context("failed to delete file")?;
+        debug!(
+            tenant_id = tenant_id,
+            bucket = bucket,
+            file_id = file_id,
+            "deleting file"
+        );
+        let request = DeleteRequest {
+            tenant_id: tenant_id.to_string(),
+            bucket: bucket.to_string(),
+            file_id: file_id.to_string(),
+            request_id: options
+                .request_id
+                .unwrap_or_else(|| format!("delete_file:{}", Uuid::new_v4())),
+        };
+        self.unary("failed to delete file", request, |request| {
+            let mut upstream = self.upstream_file.clone();
+            async move { upstream.delete(request).await }
+        })
+        .await?;
         Ok(())
     }
 }
 
-/// Resolve the checksum to send: computes the SHA-256 digest of `bytes`
-/// automatically when `checksum` is `None`; when it is `Some`, validates it
-/// is exactly [`CHECKSUM_LEN`] bytes before returning it. Pure and
-/// network-free, so [`RociaDbClient::upload_file`] can fail fast on a bad
-/// checksum before any RPC — the server rejects any other length with
-/// `INVALID_ARGUMENT`.
-fn resolve_checksum(checksum: Option<Vec<u8>>, bytes: &[u8]) -> Result<Vec<u8>> {
-    match checksum {
-        Some(checksum) => {
-            require_checksum_len(&checksum)?;
-            Ok(checksum)
-        }
-        None => Ok(Sha256::digest(bytes).to_vec()),
-    }
+/// Default idempotency key for an `Upload` call, shared by
+/// [`RociaDbClient::upload_file`] and
+/// [`RociaDbClient::upload_file_chunked`] so the prefix never depends on
+/// which of the two produced the upload.
+fn default_upload_file_request_id() -> String {
+    format!("upload_file:{}", Uuid::new_v4())
 }
 
-/// Validate that `checksum` is exactly [`CHECKSUM_LEN`] bytes, before any
-/// network call. Shared by [`resolve_checksum`] (used by
-/// [`RociaDbClient::upload_file`], where the checksum is optional and
-/// computed automatically when absent) and
-/// [`RociaDbClient::upload_file_chunked`] (where it is a required
-/// parameter, since a streaming upload cannot compute it on the fly — see
-/// that method's docs).
-fn require_checksum_len(checksum: &[u8]) -> Result<()> {
-    if checksum.len() != CHECKSUM_LEN {
-        return Err(RociaDbError::validation(format!(
-            "checksum must be exactly {CHECKSUM_LEN} bytes (sha256), got {} bytes",
-            checksum.len()
-        )));
-    }
-    Ok(())
+/// Resolve the checksum to send: the caller's when they supplied one, or the
+/// SHA-256 digest of `bytes` computed here. Pure and network-free — and
+/// infallible, since `[u8; 32]` makes the length the compiler's business
+/// rather than a runtime check.
+fn resolve_checksum(checksum: Option<[u8; 32]>, bytes: &[u8]) -> [u8; 32] {
+    checksum.unwrap_or_else(|| Sha256::digest(bytes).into())
 }
 
 /// Validate that `size_bytes` does not exceed [`MAX_FILE_BYTES`] (5 GiB),
@@ -534,17 +623,20 @@ fn validate_file_size(size_bytes: u64) -> Result<()> {
 /// Only the first request carries the file metadata (`tenant_id`,
 /// `bucket`, `file_id`, `size_bytes`, `content_type`, `checksum`,
 /// `request_id`): the server only reads those fields off the first message
-/// of the stream (see module docs), so building them for every chunk would
-/// just be wasted clones. Requests are produced on demand as the returned
-/// iterator is polled by the outgoing stream, never collected into a `Vec`
-/// up front.
+/// of the stream (see [`RociaDbClient::upload_file_stream`]), so building
+/// them for every chunk would just be wasted clones. Requests are produced
+/// on demand as the returned iterator is polled by the outgoing stream,
+/// never collected into a `Vec` up front.
+///
+/// `checksum` is `[u8; 32]` up to here and becomes a `Vec<u8>` only at the
+/// wire boundary, where the protobuf field demands one.
 fn chunk_upload_requests(
     tenant_id: String,
     bucket: String,
     file_id: String,
     bytes: Vec<u8>,
     content_type: String,
-    checksum: Vec<u8>,
+    checksum: [u8; 32],
     request_id: String,
 ) -> impl Iterator<Item = UploadRequest> {
     let size_bytes = bytes.len() as u64;
@@ -572,7 +664,10 @@ fn chunk_upload_requests(
             file_id: file_id.take().unwrap_or_default(),
             size_bytes: if index == 0 { size_bytes } else { 0 },
             content_type: content_type.take().unwrap_or_default(),
-            checksum: checksum.take().unwrap_or_default(),
+            checksum: checksum
+                .take()
+                .map(|checksum| checksum.to_vec())
+                .unwrap_or_default(),
             chunk: bytes[start..end].to_vec(),
             request_id: request_id.take().unwrap_or_default(),
         }
@@ -587,7 +682,7 @@ struct UploadMetadata {
     bucket: String,
     file_id: String,
     content_type: String,
-    checksum: Vec<u8>,
+    checksum: [u8; 32],
     request_id: String,
 }
 
@@ -648,7 +743,7 @@ impl RechunkState {
                 file_id: metadata.file_id,
                 size_bytes: self.size_bytes,
                 content_type: metadata.content_type,
-                checksum: metadata.checksum,
+                checksum: metadata.checksum.to_vec(),
                 chunk,
                 request_id: metadata.request_id,
             },
@@ -753,7 +848,7 @@ fn rechunk_upload_requests<S>(
     file_id: String,
     size_bytes: u64,
     content_type: String,
-    checksum: Vec<u8>,
+    checksum: [u8; 32],
     request_id: String,
     chunks: S,
     error_slot: Arc<Mutex<Option<RociaDbError>>>,
@@ -856,22 +951,69 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECKSUM_LEN, DEFAULT_CHUNK_SIZE, FileStreamUploadOptions, FileUploadOptions,
-        MAX_FILE_BYTES, RechunkState, chunk_upload_requests, rechunk_upload_requests,
-        require_checksum_len, resolve_checksum, validate_file_size,
+        DEFAULT_CHUNK_SIZE, FileStreamUploadOptions, FileUploadOptions, MAX_FILE_BYTES,
+        RechunkState, chunk_upload_requests, default_upload_file_request_id,
+        rechunk_upload_requests, resolve_checksum, validate_file_size,
     };
     use crate::RociaDbError;
     use crate::pb::upstream::v1::UploadRequest;
+    use crate::test_support::lazy_test_client;
     use futures::executor::block_on;
     use futures::{StreamExt, stream};
     use std::sync::{Arc, Mutex};
 
+    /// Length of a SHA-256 digest. The production code no longer needs this
+    /// as a constant — `[u8; 32]` carries it — but the tests still assert
+    /// against the number itself.
+    const CHECKSUM_LEN: usize = 32;
+
     #[test]
     fn upload_options_have_safe_defaults() {
-        let options = FileUploadOptions::default();
+        let options = FileUploadOptions::new();
+        assert_eq!(options, FileUploadOptions::default());
         assert_eq!(options.content_type, "application/octet-stream");
         assert!(options.checksum.is_none());
         assert!(options.request_id.is_none());
+    }
+
+    #[test]
+    fn upload_options_setters_are_chainable_and_readable() {
+        let options = FileUploadOptions::new()
+            .with_content_type("text/csv")
+            .with_checksum([7u8; CHECKSUM_LEN])
+            .with_request_id("retry-1");
+        assert_eq!(options.content_type, "text/csv");
+        assert_eq!(options.checksum, Some([7u8; CHECKSUM_LEN]));
+        assert_eq!(options.request_id.as_deref(), Some("retry-1"));
+    }
+
+    #[test]
+    fn file_stream_upload_options_require_size_and_checksum_and_default_the_rest() {
+        let options = FileStreamUploadOptions::new(1234, [3u8; CHECKSUM_LEN]);
+        assert_eq!(options.size_bytes, 1234);
+        assert_eq!(options.checksum, [3u8; CHECKSUM_LEN]);
+        assert_eq!(options.content_type, "application/octet-stream");
+        assert!(options.request_id.is_none());
+
+        let options = options
+            .with_content_type("application/pdf")
+            .with_request_id("retry-2");
+        assert_eq!(options.content_type, "application/pdf");
+        assert_eq!(options.request_id.as_deref(), Some("retry-2"));
+        // The required fields survive the chained setters.
+        assert_eq!(options.size_bytes, 1234);
+        assert_eq!(options.checksum, [3u8; CHECKSUM_LEN]);
+    }
+
+    #[test]
+    fn default_upload_request_id_uses_the_upload_file_prefix_with_a_fresh_uuid_each_time() {
+        let first = default_upload_file_request_id();
+        let second = default_upload_file_request_id();
+        let uuid_part = first
+            .strip_prefix("upload_file:")
+            .expect("default request_id must use the upload_file: prefix");
+        uuid::Uuid::parse_str(uuid_part).expect("suffix after the prefix must be a uuid");
+        assert_ne!(first, second, "each call must mint a fresh idempotency key");
     }
 
     #[test]
@@ -883,7 +1025,7 @@ mod tests {
             "file".into(),
             bytes.clone(),
             "text/plain".into(),
-            vec![0u8; CHECKSUM_LEN],
+            [0u8; CHECKSUM_LEN],
             "stable-request".into(),
         )
         .collect();
@@ -916,7 +1058,7 @@ mod tests {
             "file".into(),
             Vec::new(),
             FileUploadOptions::default().content_type,
-            vec![0u8; CHECKSUM_LEN],
+            [0u8; CHECKSUM_LEN],
             "req".into(),
         )
         .collect();
@@ -926,9 +1068,9 @@ mod tests {
     }
 
     /// Asserts that chunking `total_bytes` matches the wire contract
-    /// described in the module docs: every chunk but the last is exactly
-    /// 1 MiB, the last is non-empty and no larger than 1 MiB, and the sum
-    /// of chunk bytes equals `size_bytes`.
+    /// described in [`crate::RociaDbClient::upload_file_stream`]: every
+    /// chunk but the last is exactly 1 MiB, the last is non-empty and no
+    /// larger than 1 MiB, and the sum of chunk bytes equals `size_bytes`.
     fn assert_chunking_matches_server_contract(total_bytes: usize) {
         let bytes = vec![9u8; total_bytes];
         let requests: Vec<_> = chunk_upload_requests(
@@ -937,7 +1079,7 @@ mod tests {
             "file".into(),
             bytes.clone(),
             "application/octet-stream".into(),
-            vec![0u8; CHECKSUM_LEN],
+            [0u8; CHECKSUM_LEN],
             "req".into(),
         )
         .collect();
@@ -1003,20 +1145,18 @@ mod tests {
         // crate's own `Sha256::digest` call, so a wiring mistake (wrong
         // input bytes, wrong algorithm) would be caught even if it still
         // happened to produce 32 bytes.
-        let checksum =
-            resolve_checksum(None, b"hello world").expect("default checksum must succeed");
-        assert_eq!(checksum.len(), CHECKSUM_LEN);
+        let checksum = resolve_checksum(None, b"hello world");
         assert_eq!(
-            checksum,
+            checksum.to_vec(),
             decode_hex("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
         );
     }
 
     #[test]
     fn resolve_checksum_is_deterministic_and_content_dependent() {
-        let first = resolve_checksum(None, b"payload-a").expect("checksum must succeed");
-        let second = resolve_checksum(None, b"payload-a").expect("checksum must succeed");
-        let different = resolve_checksum(None, b"payload-b").expect("checksum must succeed");
+        let first = resolve_checksum(None, b"payload-a");
+        let second = resolve_checksum(None, b"payload-a");
+        let different = resolve_checksum(None, b"payload-b");
         assert_eq!(first, second, "same bytes must yield the same checksum");
         assert_ne!(
             first, different,
@@ -1025,23 +1165,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_checksum_accepts_caller_supplied_32_bytes() {
-        let supplied = vec![7u8; CHECKSUM_LEN];
-        let checksum = resolve_checksum(Some(supplied.clone()), b"irrelevant")
-            .expect("a 32-byte checksum must be accepted as-is");
-        assert_eq!(checksum, supplied);
-    }
-
-    #[test]
-    fn resolve_checksum_rejects_wrong_length_before_any_network_call() {
-        let error = resolve_checksum(Some(vec![1u8; 10]), b"irrelevant")
-            .expect_err("a 10-byte checksum must be rejected");
-        assert!(matches!(error, RociaDbError::Validation(_)));
-        let message = error.to_string();
-        assert!(message.contains("32 bytes"));
-        assert!(
-            message.contains("got 10 bytes"),
-            "message should report the actual (wrong) length, got: {message}"
+    fn resolve_checksum_accepts_a_caller_supplied_digest_verbatim() {
+        let supplied = [7u8; CHECKSUM_LEN];
+        let checksum = resolve_checksum(Some(supplied), b"irrelevant");
+        assert_eq!(
+            checksum, supplied,
+            "a caller-supplied digest must be sent as-is, never recomputed"
         );
     }
 
@@ -1053,27 +1182,6 @@ mod tests {
     }
 
     #[test]
-    fn file_stream_upload_options_have_safe_defaults() {
-        let options = FileStreamUploadOptions::default();
-        assert_eq!(options.content_type, "application/octet-stream");
-        assert!(options.request_id.is_none());
-    }
-
-    #[test]
-    fn require_checksum_len_accepts_exactly_32_bytes() {
-        require_checksum_len(&[0u8; CHECKSUM_LEN]).expect("32 bytes must be accepted");
-    }
-
-    #[test]
-    fn require_checksum_len_rejects_wrong_length_before_any_network_call() {
-        let error = require_checksum_len(&[1u8; 10]).expect_err("10 bytes must be rejected");
-        assert!(matches!(error, RociaDbError::Validation(_)));
-        let message = error.to_string();
-        assert!(message.contains("32 bytes"));
-        assert!(message.contains("got 10 bytes"));
-    }
-
-    #[test]
     fn validate_file_size_accepts_exactly_the_5_gib_limit() {
         validate_file_size(MAX_FILE_BYTES).expect("exactly the limit must be accepted");
     }
@@ -1082,6 +1190,29 @@ mod tests {
     fn validate_file_size_rejects_one_byte_over_the_5_gib_limit() {
         let error = validate_file_size(MAX_FILE_BYTES + 1)
             .expect_err("one byte over the limit must be rejected");
+        assert!(matches!(error, RociaDbError::Validation(_)));
+        assert!(error.to_string().contains("5 GiB"));
+    }
+
+    // `upload_file_chunked`'s pre-flight size validation must run — and
+    // fail — before the method ever touches the network, so this runs
+    // against a client wired to an unreachable host and must still return
+    // promptly. (The checksum length is no longer validated at runtime:
+    // `[u8; 32]` makes a wrong length unrepresentable.)
+    #[tokio::test]
+    async fn upload_file_chunked_rejects_an_oversized_file_before_any_network_call() {
+        let client = lazy_test_client();
+        let oversized = MAX_FILE_BYTES + 1;
+        let error = client
+            .upload_file_chunked(
+                "tenant",
+                "bucket",
+                "file",
+                stream::empty::<Vec<u8>>(),
+                FileStreamUploadOptions::new(oversized, [0u8; CHECKSUM_LEN]),
+            )
+            .await
+            .expect_err("a file over the 5 GiB limit must be rejected");
         assert!(matches!(error, RociaDbError::Validation(_)));
         assert!(error.to_string().contains("5 GiB"));
     }
@@ -1104,7 +1235,7 @@ mod tests {
                 "file".into(),
                 size_bytes,
                 "application/octet-stream".into(),
-                vec![0u8; CHECKSUM_LEN],
+                [0u8; CHECKSUM_LEN],
                 "req".into(),
                 stream::iter(source_pieces),
                 Arc::clone(&error_slot),
@@ -1136,6 +1267,8 @@ mod tests {
         assert!(requests[1].tenant_id.is_empty());
         assert_eq!(requests[0].size_bytes, total as u64);
         assert_eq!(requests[1].size_bytes, 0);
+        assert_eq!(requests[0].checksum.len(), CHECKSUM_LEN);
+        assert!(requests[1].checksum.is_empty());
     }
 
     #[test]
@@ -1241,7 +1374,7 @@ mod tests {
                 "file".into(),
                 10,
                 "text/csv".into(),
-                vec![0u8; CHECKSUM_LEN],
+                [0u8; CHECKSUM_LEN],
                 "caller-request-id".into(),
                 stream::iter(vec![vec![1u8; 10]]),
                 Arc::clone(&error_slot),
@@ -1265,8 +1398,9 @@ mod tests {
         // already held the whole file as one in-memory `Vec<u8>` and
         // yielded it as a single stream item used to have that whole item
         // copied into `buffer` by one `Vec::extend` call, defeating the
-        // "never buffers more than one outgoing chunk" bound this module's
-        // docs promise. `RechunkState::ingest`/`RechunkState::drain_pending`
+        // "never buffers more than one outgoing chunk" bound
+        // `rechunk_upload_requests` promises.
+        // `RechunkState::ingest`/`RechunkState::drain_pending`
         // are exercised directly here (rather than through the async
         // `rechunk_upload_requests` pipeline) so `buffer.len()` can be
         // asserted at every intermediate step, not just inferred from the

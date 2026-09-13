@@ -1,6 +1,8 @@
-use crate::error::StatusResultExt;
+//! Tenant registry listing. One RPC, an inherent method on
+//! [`RociaDbClient`].
 use crate::pb::upstream::v1::ListTenantsRequest;
-use crate::{Page, Result, RociaDbClient, non_empty, page_request};
+use crate::{DEFAULT_PAGE_SIZE, Page, Result, RociaDbClient, non_empty, page_request};
+use tracing::debug;
 
 impl RociaDbClient {
     /// Return one paginated page of tenant ids known to the deployment.
@@ -40,14 +42,20 @@ impl RociaDbClient {
         limit: Option<u32>,
         cursor: Option<&str>,
     ) -> Result<Page<String>> {
-        let mut upstream_tenant = self.upstream_tenant.clone();
-        let response = upstream_tenant
-            .list_tenants(ListTenantsRequest {
-                page: page_request(limit, cursor)?,
+        debug!(
+            limit = limit.unwrap_or(DEFAULT_PAGE_SIZE),
+            cursor = cursor.unwrap_or(""),
+            "listing tenants"
+        );
+        let request = ListTenantsRequest {
+            page: page_request(limit, cursor)?,
+        };
+        let response = self
+            .unary("failed to list tenants", request, |request| {
+                let mut upstream = self.upstream_tenant.clone();
+                async move { upstream.list_tenants(request).await }
             })
-            .await
-            .status_context("failed to list tenants")?
-            .into_inner();
+            .await?;
         Ok(Page {
             items: response.tenant_ids,
             next_cursor: response.page.and_then(|page| non_empty(page.next_cursor)),

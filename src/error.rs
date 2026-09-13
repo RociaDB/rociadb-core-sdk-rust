@@ -107,9 +107,9 @@ pub enum RociaDbError {
     },
 
     /// A client-side validation rule was violated before any network call
-    /// was made (a null page limit, a checksum of the wrong length, an
-    /// incomplete `node_label`/`node_graph` pair, a file size out of
-    /// bounds, etc).
+    /// was made (a zero page limit, a file size out of bounds, a chunk
+    /// stream whose total byte count does not match the declared
+    /// `size_bytes`, etc).
     #[error("{0}")]
     Validation(String),
 }

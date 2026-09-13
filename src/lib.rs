@@ -8,7 +8,7 @@
 //! # Quick example
 //!
 //! ```rust,no_run
-//! use rociadb_sdk::RociaDbBuilder;
+//! use rociadb_sdk::{DocumentWriteOptions, NodeBinding, RociaDbBuilder};
 //! use serde_json::json;
 //!
 //! # #[tokio::main]
@@ -24,18 +24,46 @@
 //!     .await?;
 //!
 //! client
-//!     .create_document(
+//!     .put_document(
 //!         "tenant-1",
 //!         "products",
 //!         "sku-123",
-//!         json!({"sku": "sku-123"}),
-//!         Some("product".to_string()),
-//!         Some("products".to_string()),
+//!         &json!({"sku": "sku-123"}),
+//!         DocumentWriteOptions::new()
+//!             .with_node_binding(NodeBinding::new("product", "catalog")),
 //!     )
 //!     .await?;
+//!
+//! let product: serde_json::Value = client
+//!     .get_document("tenant-1", "products", "sku-123")
+//!     .await?;
+//! # let _ = product;
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # One method per operation
+//!
+//! There is exactly one method per server operation. Everything optional
+//! travels in an options or input struct passed as the last argument —
+//! never in a `_with_request_id` / `_with_node_binding` / `_as` sibling
+//! method:
+//!
+//! - [`WriteOptions`] for a write whose only tunable is its idempotency
+//!   key, [`DocumentWriteOptions`] for a document write (which can also
+//!   bind a graph node), and [`FileUploadOptions`] /
+//!   [`FileStreamUploadOptions`] for the two ergonomic upload paths. Each
+//!   is built with `new()` plus chainable `with_*` setters, and
+//!   [`WriteOptions`] documents — in one place — the idempotency key every
+//!   write generates when you do not supply one.
+//! - [`NodeInput`] and [`EdgeInput`] carry one node or edge to write, by
+//!   name rather than as a run of same-typed positional arguments.
+//! - Reads that decode a payload are generic over the target type:
+//!   `get_document::<Product>(..)`, `get_node::<Value>(..)`,
+//!   `get_edge::<Weight>(..)`.
+//! - Pagination stays positional (`limit: Option<u32>`,
+//!   `cursor: Option<&str>`) and returns [`Page<T>`], or [`DocumentPage<T>`]
+//!   for the three document reads that also report a total count.
 //!
 //! # Building
 //!
@@ -54,42 +82,42 @@
 //! # Where things live
 //!
 //! Document, graph, file and tenant calls are all inherent methods on
-//! [`RociaDbClient`], so the module list is short:
+//! [`RociaDbClient`], and every public type is re-exported at the crate
+//! root, so exactly one module is left to name:
 //!
 //! - [`auth`] — token acquisition and refresh, and the interceptors that
 //!   attach credentials to outgoing calls. Useful when you drive
 //!   authentication yourself rather than through the builder.
-//! - [`mod@file`] — the option types for uploads ([`FileUploadOptions`],
-//!   [`FileStreamUploadOptions`]) and the chunking rules the wire contract
-//!   imposes.
-//! - [`graph`] — the edge, page and node types graph reads return
-//!   ([`Edge`], [`NeighborPage`], [`NeighborNode`]).
 //!
 //! # Stability
 //!
-//! The public API follows semantic versioning from 1.0.0 onward, with one
-//! documented exception: the internal `pb` module holds code generated from
-//! the `.proto` files by prost and tonic, and is not covered by that promise.
-//! A routine prost or
-//! tonic upgrade can reshape those generated types without this SDK's own API
-//! changing. Five of them — [`CollectionInfo`], [`StatResponse`],
-//! [`Neighbor`], [`UploadRequest`] and [`DownloadResponse`] — appear in public
-//! signatures and are re-exported at the crate root for that reason; depend on
-//! the re-exports: the `pb` module itself is private.
+//! The public API follows semantic versioning, with one documented
+//! exception: the internal `pb` module holds code generated from the
+//! `.proto` files by prost and tonic, and is not covered by that promise. A
+//! routine prost or tonic upgrade can reshape those generated types without
+//! this SDK's own API changing. Five of them — [`CollectionInfo`],
+//! [`StatResponse`], [`Neighbor`], [`UploadRequest`] and
+//! [`DownloadResponse`] — appear in public signatures and are re-exported at
+//! the crate root for that reason; depend on the re-exports: the `pb` module
+//! itself is private.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod auth;
 mod document;
 mod error;
-pub mod file;
-pub mod graph;
+mod file;
+mod graph;
 pub(crate) mod pb;
 mod tenant;
 
+pub use document::{
+    DocumentPage, DocumentQueryFilter, DocumentQueryOperator, DocumentQuerySort,
+    DocumentQuerySortDirection, DocumentWriteOptions, NodeBinding,
+};
 pub use error::{Result, RociaDbError};
 pub use file::{FileStreamUploadOptions, FileUploadOptions};
-pub use graph::{Edge, NeighborNode, NeighborPage};
+pub use graph::{Edge, EdgeInput, NeighborNode, NodeInput};
 /// Generated protobuf types that appear directly in a public method signature,
 /// re-exported here so callers can name them without depending on the crate's
 /// private `pb` module. The stability caveat in the crate documentation applies
@@ -104,28 +132,20 @@ pub use pb::upstream::v1::{
 /// without the SDK's own API changing.
 pub use tonic::codec::Streaming;
 
-use crate::error::{AuthResultExt, ConnectionResultExt, JsonResultExt, StatusResultExt};
+use crate::auth::{BearerInterceptor, TokenManager, TokenRefreshGuard};
+use crate::error::{AuthResultExt, ConnectionResultExt, StatusResultExt};
+use crate::pb::upstream::v1::PageRequest;
 use crate::pb::upstream::v1::document_service_client::DocumentServiceClient;
 use crate::pb::upstream::v1::file_service_client::FileServiceClient;
 use crate::pb::upstream::v1::graph_service_client::GraphServiceClient;
 use crate::pb::upstream::v1::tenant_service_client::TenantServiceClient;
-use crate::pb::upstream::v1::{
-    AddEdgeRequest, FindByFieldRequest, GetDocRequest, GetNodeRequest, ListCollectionsRequest,
-    ListDocRequest, PageRequest, PageResponse, PutDocRequest, PutNodeRequest, QueryDocRequest,
-    QueryFilter, QueryOperator, QuerySort, SortDirection,
-};
-use auth::{BearerInterceptor, TokenManager, TokenRefreshGuard};
-use futures::{TryStreamExt, stream};
-use serde::{Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::env;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::codegen::InterceptedService;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
+use tracing::{debug, warn};
 
 /// Max concurrent in-flight requests for batch operations.
 const CONCURRENT_REQUESTS: usize = 10;
@@ -152,8 +172,7 @@ enum BuilderAuthConfig {
         /// in swapped-out memory could still recover it. Closing that gap
         /// would need a `zeroize`- or `secrecy`-backed secret type, which
         /// is a dependency call for this crate's maintainer to make on a
-        /// published 1.0 crate rather than something to add unilaterally
-        /// here.
+        /// published crate rather than something to add unilaterally here.
         client_secret: Option<String>,
     },
     Disabled,
@@ -180,7 +199,13 @@ impl std::fmt::Debug for BuilderAuthConfig {
     }
 }
 
-/// Builder for RociaDbClient.
+/// Builder for [`RociaDbClient`].
+///
+/// Every setter takes `self` and returns `Self`, so a whole configuration
+/// can be written as one chain from a temporary
+/// (`RociaDbBuilder::new().host("..").disable_auth()`), or kept in a
+/// variable and extended a step at a time. [`RociaDbBuilder::build`] takes
+/// `&self`, so one builder can produce several clients.
 #[derive(Debug)]
 pub struct RociaDbBuilder {
     host: Option<String>,
@@ -198,12 +223,19 @@ pub struct RociaDbBuilder {
 /// ([`RociaDbClient::put_nodes`], [`RociaDbClient::add_edges`]) always
 /// have. A shared `RociaDbClient` behind an `Arc` therefore needs no
 /// `Mutex` to be usable concurrently.
+///
+/// [`Debug`](std::fmt::Debug) reports the host the client was built for and
+/// whether auth is enabled — never a token, a client id, or a secret.
 #[derive(Clone)]
 pub struct RociaDbClient {
     upstream_document: DocumentServiceClient<InterceptedService<Channel, BearerInterceptor>>,
     upstream_graph: GraphServiceClient<InterceptedService<Channel, BearerInterceptor>>,
     upstream_file: FileServiceClient<InterceptedService<Channel, BearerInterceptor>>,
     upstream_tenant: TenantServiceClient<InterceptedService<Channel, BearerInterceptor>>,
+    /// Host this client was built for, kept only so `Debug` can name it.
+    /// An `Arc<str>` rather than a `String` so cloning the client stays
+    /// allocation-free, as its documentation promises.
+    host: Arc<str>,
     /// `None` when auth is disabled. Used to service
     /// [`RociaDbClient::refresh_auth_token`].
     token_manager: Option<TokenManager>,
@@ -213,8 +245,24 @@ pub struct RociaDbClient {
     _token_refresh_guard: Option<Arc<TokenRefreshGuard>>,
 }
 
+// Manual `Debug` impl instead of `#[derive(Debug)]`: a derived impl would
+// print the four generated service clients (channel internals, and a
+// `BearerInterceptor` holding the cached bearer token) and the
+// `TokenManager` behind them. Host plus "is auth on" is the whole of what a
+// caller can act on, and neither is a credential.
+impl std::fmt::Debug for RociaDbClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RociaDbClient")
+            .field("host", &self.host)
+            .field("auth_enabled", &self.token_manager.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// One page of listed items with the cursor for the next page.
 ///
+/// Returned by every paginated read except the three document reads that
+/// also report a total count, which return [`DocumentPage<T>`] instead.
 /// `next_cursor` is `None` once the server has no further page. The cursor
 /// is opaque and must be passed back unchanged.
 #[non_exhaustive]
@@ -227,37 +275,69 @@ pub struct Page<T> {
     pub next_cursor: Option<String>,
 }
 
-/// One page of document results, together with the total number of
-/// documents matching the request (before pagination). `items` and
-/// `next_cursor` follow the same contract as [`Page<T>`].
+/// Per-call options for a write whose only tunable is its idempotency key:
+/// [`RociaDbClient::delete_document`], [`RociaDbClient::put_node`],
+/// [`RociaDbClient::delete_edge`] and [`RociaDbClient::delete_file`].
 ///
-/// The cost of `total_count` is **not** the same across the three methods
-/// that produce it, because the server computes it differently for each:
-/// - [`RociaDbClient::list_documents`] (`ListDoc`): free — the server keeps
-///   a running per-collection counter updated on every write, so reading it
-///   costs nothing beyond the listing itself.
-/// - [`RociaDbClient::search_documents`] (`FindByField`): a count over the
-///   matching field-index entries.
-/// - [`RociaDbClient::query_documents`] (`QueryDoc`): expensive — the server
-///   only knows the total once it has filtered the *complete* candidate set
-///   for the query, so the cost scales with the number of candidates on
-///   every single call. Do not call this in a loop expecting a cheap
-///   number; fetch it once and cache it if the same query is issued
-///   repeatedly.
+/// A document write takes [`DocumentWriteOptions`] (a graph node binding on
+/// top of the key) and the two ergonomic uploads take
+/// [`FileUploadOptions`] / [`FileStreamUploadOptions`], but every one of
+/// them defaults its `request_id` the same way — stated once, below.
+///
+/// # Idempotency key defaults
+///
+/// The server deduplicates a write on `(tenant, operation, target,
+/// request_id)`, so a replay carrying the same `request_id` is recognized
+/// as the same write instead of being applied twice. Supply the key
+/// yourself — and reuse the same value on every retry — whenever a replay
+/// after a timeout must not write twice; markers expire after the server's
+/// `gc.request_ttl_secs` (24 hours by default).
+///
+/// Left unset, the SDK mints a fresh `"<operation>:<uuid>"` key on every
+/// call. That makes each call distinct, so it protects against a *network*
+/// replay of one call, not against the caller issuing the same logical
+/// write twice:
+///
+/// | Call | Generated `request_id` |
+/// | ---- | ---------------------- |
+/// | [`put_document`](RociaDbClient::put_document) | `put_document:{collection}:<uuid>` |
+/// | [`delete_document`](RociaDbClient::delete_document) | `delete_document:{collection}:<uuid>` |
+/// | [`put_node`](RociaDbClient::put_node), [`put_nodes`](RociaDbClient::put_nodes) | `put_node:<uuid>` |
+/// | [`add_edge`](RociaDbClient::add_edge), [`add_edges`](RociaDbClient::add_edges) | `add_edge:<uuid>` |
+/// | [`delete_edge`](RociaDbClient::delete_edge) | `delete_edge:<uuid>` |
+/// | [`upload_file`](RociaDbClient::upload_file), [`upload_file_chunked`](RociaDbClient::upload_file_chunked) | `upload_file:<uuid>` |
+/// | [`delete_file`](RociaDbClient::delete_file) | `delete_file:<uuid>` |
+///
+/// Two cases need a note beyond the table.
+/// [`put_document`](RociaDbClient::put_document) with a [`NodeBinding`]
+/// issues two writes and deliberately reuses the one `request_id` for both:
+/// the dedup scope includes the operation, so the `PutDoc` and `PutNode`
+/// markers cannot collide, and replaying the whole call stays idempotent.
+/// [`upload_file_stream`](RociaDbClient::upload_file_stream) generates
+/// nothing at all — it forwards whatever the caller put on the first
+/// message of the stream.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DocumentPage<T> {
-    /// The decoded documents on this page, in the order the server returned
-    /// them.
-    pub items: Vec<T>,
-    /// Cursor to pass back to fetch the page after this one, or `None` when
-    /// this is the last page.
-    pub next_cursor: Option<String>,
-    /// Total number of documents matching the request, before pagination.
-    /// It describes the same instant as `items` — both are taken from a
-    /// single state of the store — but nothing is promised from one call to
-    /// the next. See the type-level documentation for what it costs.
-    pub total_count: u64,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteOptions {
+    /// Idempotency key for the write. `None` lets the SDK generate one; see
+    /// the [idempotency key defaults](Self#idempotency-key-defaults).
+    pub request_id: Option<String>,
+}
+
+impl WriteOptions {
+    /// Options with every field at its default: no caller-supplied
+    /// idempotency key.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the idempotency key for this write; see the [idempotency key
+    /// defaults](Self#idempotency-key-defaults) for what happens without
+    /// one.
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
 }
 
 /// Build a `PageRequest` applying the SDK default page size.
@@ -293,425 +373,6 @@ pub(crate) fn page_request(
 /// Map the protobuf empty-string cursor to `None`.
 pub(crate) fn non_empty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
-}
-
-/// Decode one page of raw per-item JSON payloads into `T`, and map the
-/// page's cursor with [`non_empty`]. Shared by
-/// [`RociaDbClient::list_documents`], [`RociaDbClient::search_documents`]
-/// and [`RociaDbClient::query_documents`] — the three RPCs whose response
-/// shape is "a list of JSON blobs plus an optional `PageResponse`" — so
-/// the extraction rule is defined, and unit-tested, in exactly one place
-/// against a synthetic response instead of being copy-pasted three times
-/// and only ever exercised through a live gRPC call.
-///
-/// Decoding still stops at the first bad item: `collect` short-circuits, so
-/// a caller never receives a partial page alongside an error. What changes
-/// is the diagnostic — the returned `serde_json::Error`'s message is
-/// rewritten to lead with `"item <index>: "`, naming the zero-based
-/// position of the offending item within the page, because a page can hold
-/// dozens of items and "one of them failed to parse" leaves the caller
-/// nothing to act on.
-fn decode_document_page<T>(
-    json: Vec<Vec<u8>>,
-    page: Option<PageResponse>,
-) -> std::result::Result<(Vec<T>, Option<String>), serde_json::Error>
-where
-    T: DeserializeOwned,
-{
-    let items = json
-        .into_iter()
-        .enumerate()
-        .map(|(index, data)| {
-            serde_json::from_slice::<T>(&data).map_err(|error| {
-                <serde_json::Error as serde::de::Error>::custom(format!("item {index}: {error}"))
-            })
-        })
-        .collect::<std::result::Result<Vec<T>, serde_json::Error>>()?;
-    Ok((items, page.and_then(|page| non_empty(page.next_cursor))))
-}
-
-/// Validate that `node_label` and `node_graph` are either both set or both
-/// absent, before any network call. Pulled out of
-/// [`RociaDbClient::create_document`] as a pure function so the rule is
-/// unit-testable without a live client.
-fn validate_node_binding(node_label: &Option<String>, node_graph: &Option<String>) -> Result<()> {
-    if node_label.is_some() != node_graph.is_some() {
-        return Err(RociaDbError::validation(format!(
-            "node_label and node_graph must be provided together (got node_label={:?}, node_graph={:?})",
-            node_label, node_graph
-        )));
-    }
-    Ok(())
-}
-
-/// A document's graph node binding, the named-field alternative to the
-/// `node_label`/`node_graph` parameter pair on
-/// [`RociaDbClient::create_document`] and
-/// [`RociaDbClient::create_document_with_request_id`].
-///
-/// Those two parameters are adjacent, identically-typed (`Option<String>`)
-/// positional arguments in a six- and seven-argument call respectively, and
-/// the internal validation this SDK runs on them only checks that both are
-/// present or both are absent — never that they weren't swapped. A
-/// transposed call therefore compiles, passes that check, and silently
-/// writes the graph node under the wrong `node_id`/`graph` pairing, with no
-/// error anywhere. Passing a single `Option<NodeBinding>` to
-/// [`RociaDbClient::create_document_with_node_binding`] or
-/// [`RociaDbClient::create_document_with_node_binding_and_request_id`]
-/// instead closes that gap two ways: `label` and `graph` are no longer two
-/// of several same-typed arguments sitting next to each other in a long
-/// call, and "label without graph" or "graph without label" stops being
-/// representable at all — there is exactly one `Option` to be `Some` or
-/// `None`, not two that must be kept in sync by hand.
-///
-/// [`NodeBinding::new`] still takes `label` then `graph` positionally, the
-/// same shape [`NodeInput::new`] and [`EdgeInput::new`] already use for
-/// their own constructors, so this does not make a `label`/`graph`
-/// transposition impossible — it narrows where one can happen down to this
-/// one dedicated two-argument call, out from among the other four
-/// arguments `create_document` takes alongside it.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeBinding {
-    /// Label prefixed to the document id to form the graph node id, as
-    /// `"{label}:{document_id}"`.
-    pub label: String,
-    /// Name of the graph the node is written to.
-    pub graph: String,
-}
-
-impl NodeBinding {
-    /// Bind to `label` within `graph`. See [`NodeBinding`] for why passing
-    /// this instead of the equivalent `node_label`/`node_graph` pair guards
-    /// against a transposed call.
-    pub fn new(label: impl Into<String>, graph: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-            graph: graph.into(),
-        }
-    }
-}
-
-/// Decompose a [`NodeBinding`] option into the `(node_label, node_graph)`
-/// pair [`RociaDbClient::create_document_with_request_id`] expects. Pulled
-/// out as a pure function, the same way [`validate_node_binding`] is pulled
-/// out of [`RociaDbClient::create_document`], so this mapping is
-/// unit-testable without a live client: `label` and `graph` are the same
-/// two `String`s [`validate_node_binding`] guards, just carried as one
-/// value instead of two, and a future edit that swapped which field feeds
-/// which side of the pair would still compile clean.
-fn node_binding_to_pair(node_binding: Option<NodeBinding>) -> (Option<String>, Option<String>) {
-    match node_binding {
-        Some(NodeBinding { label, graph }) => (Some(label), Some(graph)),
-        None => (None, None),
-    }
-}
-
-/// Supported document query operators exposed by the SDK.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DocumentQueryOperator {
-    /// The field equals the single value given.
-    Eq,
-    /// The field equals any one of the values given.
-    In,
-    /// The field contains the single value given as a case-insensitive
-    /// substring. A term shorter than three characters is not indexable, and
-    /// the server refuses a query in which no filter is indexable with
-    /// `INVALID_ARGUMENT` rather than serving it from a full scan — pair a
-    /// short term with an [`Eq`](Self::Eq) or [`In`](Self::In) filter on
-    /// another field.
-    Contains,
-}
-
-impl DocumentQueryOperator {
-    fn as_proto(self) -> i32 {
-        match self {
-            Self::Eq => QueryOperator::Eq as i32,
-            Self::In => QueryOperator::In as i32,
-            Self::Contains => QueryOperator::Contains as i32,
-        }
-    }
-}
-
-/// Supported document sort directions exposed by the SDK.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DocumentQuerySortDirection {
-    /// Ascending order.
-    Asc,
-    /// Descending order.
-    Desc,
-}
-
-impl DocumentQuerySortDirection {
-    fn as_proto(self) -> i32 {
-        match self {
-            Self::Asc => SortDirection::Asc as i32,
-            Self::Desc => SortDirection::Desc as i32,
-        }
-    }
-}
-
-/// Filter definition for `QueryDoc`. Every filter of a query is combined
-/// with logical AND.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq)]
-pub struct DocumentQueryFilter {
-    /// Name of the document field to compare.
-    pub field: String,
-    /// How `field` is compared against `values`.
-    pub operator: DocumentQueryOperator,
-    /// Values to compare against, each serialized to JSON before being sent.
-    /// How many the server expects depends on `operator`:
-    /// [`Eq`](DocumentQueryOperator::Eq) and
-    /// [`Contains`](DocumentQueryOperator::Contains) take one,
-    /// [`In`](DocumentQueryOperator::In) takes the set to match.
-    pub values: Vec<Value>,
-}
-
-impl DocumentQueryFilter {
-    /// Build a filter on `field`, comparing it against `values` with
-    /// `operator`. How many values an operator expects is the server's
-    /// contract, not the SDK's: `Eq` takes one, `In` takes the set to match.
-    pub fn new(
-        field: impl Into<String>,
-        operator: DocumentQueryOperator,
-        values: Vec<Value>,
-    ) -> Self {
-        Self {
-            field: field.into(),
-            operator,
-            values,
-        }
-    }
-}
-
-/// Sort definition for `QueryDoc`. A query's sort list is applied in the
-/// order given, and results are always tie-broken by document id, so the
-/// ordering is total and stable across pages.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq)]
-pub struct DocumentQuerySort {
-    /// Name of the document field to sort on.
-    pub field: String,
-    /// Direction to sort `field` in.
-    pub direction: DocumentQuerySortDirection,
-}
-
-impl DocumentQuerySort {
-    /// Sort on `field` in `direction`.
-    pub fn new(field: impl Into<String>, direction: DocumentQuerySortDirection) -> Self {
-        Self {
-            field: field.into(),
-            direction,
-        }
-    }
-}
-
-/// One node to upsert, used by [`RociaDbClient::put_nodes`].
-///
-/// `node_id` is the **complete** node id (for example `"product:sku-1"`),
-/// not a `(label, id)` pair for the SDK to reassemble: `label:id` remains a
-/// usage convention, not something the server enforces or the SDK
-/// recomposes.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq)]
-pub struct NodeInput {
-    /// Complete id of the node to upsert, for example `"product:sku-1"`.
-    pub node_id: String,
-    /// Properties to store on the node. The server requires a JSON object
-    /// here, never a scalar or an array.
-    pub value: Value,
-    /// Idempotency key for this item's `PutNode` call. When `None`, one is
-    /// generated automatically (`put_node:<uuid>` — the same prefix
-    /// [`RociaDbClient::put_node`] uses for a single-item write, so a
-    /// `PutNode` call always carries the same default prefix regardless of
-    /// which path produced it). Provide it explicitly — and reuse the same
-    /// value on a retry — so a batch replayed after a timeout resumes
-    /// safely: the server deduplicates on `(tenant, operation, target,
-    /// request_id)`, so a repeated `request_id` is recognized as the same
-    /// write rather than a new one.
-    pub request_id: Option<String>,
-}
-
-impl NodeInput {
-    /// Upsert `value` at `node_id`, letting the SDK generate the
-    /// idempotency key. Chain [`NodeInput::with_request_id`] to supply your
-    /// own — which is what makes a retried batch safe to replay.
-    pub fn new(node_id: impl Into<String>, value: Value) -> Self {
-        Self {
-            node_id: node_id.into(),
-            value,
-            request_id: None,
-        }
-    }
-
-    /// Set the idempotency key for this item; see [`NodeInput::request_id`].
-    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
-        self.request_id = Some(request_id.into());
-        self
-    }
-}
-
-/// One edge to upsert, used by [`RociaDbClient::add_edges`] and
-/// [`RociaDbClient::add_edge_with_input`].
-///
-/// `edge_id` is raw and must not be prefixed with `label`.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq)]
-pub struct EdgeInput {
-    /// Id of the edge to upsert. Raw: do not prefix it with `label`.
-    pub edge_id: String,
-    /// Id of the node the edge starts from. It must already exist, or the
-    /// write fails with `NOT_FOUND`.
-    pub from: String,
-    /// Id of the node the edge points to. It must already exist, or the
-    /// write fails with `NOT_FOUND`.
-    pub to: String,
-    /// Type of relation the edge carries. A `(from, label, to)` triplet names
-    /// at most one edge: a second edge over a triplet another edge already
-    /// holds fails with `ALREADY_EXISTS`, while reusing the same `edge_id`
-    /// over its own triplet replaces the edge's properties.
-    pub label: String,
-    /// Properties to store on the edge.
-    pub value: Value,
-    /// Idempotency key for this item's `AddEdge` call. When `None`, one is
-    /// generated automatically (a bare UUID, with no prefix). See
-    /// [`NodeInput::request_id`] for why reusing it on a retry matters.
-    pub request_id: Option<String>,
-}
-
-impl EdgeInput {
-    /// Upsert an edge `label` carrying `value`, running `from` -> `to`,
-    /// letting the SDK generate the idempotency key. Chain
-    /// [`EdgeInput::with_request_id`] to supply your own. `edge_id` is raw:
-    /// do not prefix it with `label`.
-    pub fn new(
-        edge_id: impl Into<String>,
-        from: impl Into<String>,
-        to: impl Into<String>,
-        label: impl Into<String>,
-        value: Value,
-    ) -> Self {
-        Self {
-            edge_id: edge_id.into(),
-            from: from.into(),
-            to: to.into(),
-            label: label.into(),
-            value,
-            request_id: None,
-        }
-    }
-
-    /// Set the idempotency key for this item; see [`EdgeInput::request_id`].
-    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
-        self.request_id = Some(request_id.into());
-        self
-    }
-}
-
-/// Build the ordered `PutNodeRequest` batch for [`RociaDbClient::put_nodes`].
-/// Pulled out as a pure, network-free function — the same way
-/// [`crate::file::chunk_upload_requests`] is for uploads — so the batch's
-/// wire shape is unit-testable without a live client: item order is
-/// preserved (`nodes` is consumed via `into_iter` in the order given),
-/// duplicate `node_id`s are not merged (each `NodeInput` becomes exactly
-/// one `PutNodeRequest`), and `request_id` is passed through unchanged or
-/// defaulted to `put_node:<uuid>` when absent — the same default prefix
-/// [`RociaDbClient::put_node`] uses for a single-item write, so every
-/// `PutNode` call defaults consistently regardless of whether it went
-/// through the batch or single-item path.
-fn build_put_node_requests(
-    tenant_id: &str,
-    graph_name: &str,
-    nodes: Vec<NodeInput>,
-) -> Result<Vec<PutNodeRequest>> {
-    nodes
-        .into_iter()
-        .map(|node| {
-            let json = serde_json::to_vec(&node.value).encode_context("node json")?;
-            Ok(PutNodeRequest {
-                tenant_id: tenant_id.to_string(),
-                graph: graph_name.to_string(),
-                node_id: node.node_id,
-                json,
-                request_id: node
-                    .request_id
-                    .unwrap_or_else(|| format!("put_node:{}", Uuid::new_v4())),
-            })
-        })
-        .collect()
-}
-
-/// Build the ordered `AddEdgeRequest` batch for [`RociaDbClient::add_edges`].
-/// Same rationale and guarantees as [`build_put_node_requests`]: order
-/// preserved, duplicate `edge_id`s not merged, `request_id` passed through
-/// unchanged or defaulted to a bare UUID (no prefix) when absent.
-fn build_add_edge_requests(
-    tenant_id: &str,
-    graph_name: &str,
-    edges: Vec<EdgeInput>,
-) -> Result<Vec<AddEdgeRequest>> {
-    edges
-        .into_iter()
-        .map(|edge| {
-            let json = serde_json::to_vec(&edge.value).encode_context("edge json")?;
-            debug!(
-                tenant_id = tenant_id,
-                graph = graph_name,
-                edge_id = edge.edge_id,
-                from = edge.from,
-                to = edge.to,
-                label = edge.label,
-                "prepared graph edge upsert"
-            );
-            Ok(AddEdgeRequest {
-                tenant_id: tenant_id.to_string(),
-                graph: graph_name.to_string(),
-                edge_id: edge.edge_id,
-                from: edge.from,
-                to: edge.to,
-                label: edge.label,
-                json,
-                request_id: edge
-                    .request_id
-                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
-            })
-        })
-        .collect()
-}
-
-/// Split an ordered batch into groups sharing the same `key`, preserving
-/// each group's internal order (the order `items` were given in). Used by
-/// [`RociaDbClient::put_nodes`] and [`RociaDbClient::add_edges`] to let
-/// items with different keys (`node_id`/`edge_id`) fan out fully
-/// concurrently while items sharing a key are dispatched strictly one after
-/// another — see those methods' doc comments for why that matters for a
-/// batch carrying a duplicate id. Which group runs before which is
-/// unconstrained (a `HashMap` is used, so that order is arbitrary): only
-/// the order *within* a group is a guarantee, because only that order is
-/// one the caller can actually observe (items with different ids are
-/// applied to unrelated server-side state, so nothing distinguishes one
-/// interleaving of them from another).
-fn group_preserving_order<T>(items: Vec<T>, key: impl Fn(&T) -> &str) -> Vec<Vec<T>> {
-    let mut groups: HashMap<String, Vec<T>> = HashMap::new();
-    for item in items {
-        groups.entry(key(&item).to_string()).or_default().push(item);
-    }
-    groups.into_values().collect()
-}
-
-/// Default idempotency key for the `PutDoc` write issued by
-/// [`RociaDbClient::create_document`] when the caller does not use
-/// [`RociaDbClient::create_document_with_request_id`] directly. Pulled out
-/// as a pure, network-free function — the same reason
-/// [`build_put_node_requests`] and [`build_add_edge_requests`] exist — so
-/// the exact default prefix (`put_document:{collection}:<uuid>`, matching
-/// [`RociaDbClient::put_document`]'s own default) is unit-testable without
-/// a live client or a network call.
-fn default_document_request_id(collection_name: &str) -> String {
-    format!("put_document:{}:{}", collection_name, Uuid::new_v4())
 }
 
 /// Reject a `host` URL that carries anything beyond a hostname and port,
@@ -783,24 +444,35 @@ impl Default for RociaDbBuilder {
 }
 
 impl RociaDbBuilder {
-    /// Create a builder with default settings.
+    /// Create a builder with default settings: host
+    /// `http://127.0.0.1:50051`, auth enabled and read from the
+    /// `AUTH_TOKEN_URL`, `AUTH_CLIENT_ID` and `AUTH_CLIENT_SECRET`
+    /// environment variables unless
+    /// [`auth_client_credentials`](Self::auth_client_credentials) supplies
+    /// them.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Set the upstream host (ex: http://127.0.0.1:50051).
-    pub fn host(&mut self, host: impl Into<String>) -> &mut Self {
+    /// Set the upstream host (for example `http://127.0.0.1:50051`).
+    ///
+    /// Only a scheme, host and port are accepted; a path, query string or
+    /// fragment is rejected by [`build`](Self::build) rather than silently
+    /// dropped when dialing.
+    pub fn host(mut self, host: impl Into<String>) -> Self {
         self.host = Some(host.into());
         self
     }
 
-    /// Configure OAuth2 client credentials for upstream auth.
+    /// Configure OAuth2 client credentials for upstream auth, overriding
+    /// the `AUTH_TOKEN_URL`, `AUTH_CLIENT_ID` and `AUTH_CLIENT_SECRET`
+    /// environment variables [`build`](Self::build) would otherwise read.
     pub fn auth_client_credentials(
-        &mut self,
+        mut self,
         token_url: impl Into<String>,
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
-    ) -> &mut Self {
+    ) -> Self {
         self.auth = BuilderAuthConfig::Enabled {
             token_url: Some(token_url.into()),
             client_id: Some(client_id.into()),
@@ -810,7 +482,10 @@ impl RociaDbBuilder {
     }
 
     /// Disable auth headers on outgoing requests.
-    pub fn disable_auth(&mut self) -> &mut Self {
+    ///
+    /// Intended for a controlled local or test deployment only:
+    /// [`build`](Self::build) emits a `warn!` when it takes effect.
+    pub fn disable_auth(mut self) -> Self {
         self.auth = BuilderAuthConfig::Disabled;
         self
     }
@@ -818,19 +493,23 @@ impl RociaDbBuilder {
     /// Set the deadline used while connecting to the upstream host.
     ///
     /// The value is stored as-is here (no validation), the same way
-    /// [`RociaDbBuilder::host`] and
-    /// [`RociaDbBuilder::auth_client_credentials`] never validate before
-    /// [`RociaDbBuilder::build`] — validation (rejecting a zero timeout)
-    /// happens there instead. When this is never called, `build()` applies
-    /// a 10-second default unconditionally: without any timeout at all,
-    /// `.connect().await` could hang forever against a host with slow
-    /// DNS/TCP, which is a robustness gap rather than a mere convenience.
-    pub fn connect_timeout(&mut self, timeout: Duration) -> &mut Self {
+    /// [`host`](Self::host) and
+    /// [`auth_client_credentials`](Self::auth_client_credentials) never
+    /// validate before [`build`](Self::build) — validation (rejecting a
+    /// zero timeout) happens there instead. When this is never called,
+    /// `build()` applies a 10-second default unconditionally: without any
+    /// timeout at all, `.connect().await` could hang forever against a host
+    /// with slow DNS/TCP, which is a robustness gap rather than a mere
+    /// convenience.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
         self
     }
 
     /// Build a client connected to the upstream.
+    ///
+    /// Takes `&self`, so the same builder can be reused to produce several
+    /// clients.
     ///
     /// When auth is enabled, this fetches the first token and starts a
     /// background task that refreshes it before it expires (the IdP's
@@ -843,7 +522,11 @@ impl RociaDbBuilder {
             .host
             .as_ref()
             .ok_or_else(|| RociaDbError::connection("missing upstream host"))?;
-        info!(host = %host, "building rocia db client");
+        debug!(
+            host = %host,
+            auth_enabled = !matches!(self.auth, BuilderAuthConfig::Disabled),
+            "building rocia db client"
+        );
         validate_host_path(host)?;
         let connect_timeout = resolve_connect_timeout(self.connect_timeout)?;
         let endpoint = Endpoint::from_shared(host.clone())
@@ -901,7 +584,7 @@ impl RociaDbBuilder {
                 // and keep the guard alive inside the client for as long as
                 // it (or any clone of it) exists.
                 let refresh_interval = token_manager.refresh_interval();
-                info!(
+                debug!(
                     host = %host,
                     refresh_interval_secs = refresh_interval.as_secs(),
                     "starting background token refresh"
@@ -917,12 +600,12 @@ impl RociaDbBuilder {
         let upstream_file =
             FileServiceClient::with_interceptor(channel.clone(), interceptor.clone());
         let upstream_tenant = TenantServiceClient::with_interceptor(channel, interceptor);
-        info!(host = %host, "rocia db client ready");
         Ok(RociaDbClient {
             upstream_document,
             upstream_graph,
             upstream_file,
             upstream_tenant,
+            host: Arc::from(host.as_str()),
             token_manager,
             _token_refresh_guard: token_refresh_guard,
         })
@@ -963,913 +646,55 @@ impl RociaDbClient {
             manager.request_refresh();
         }
     }
-}
 
-impl RociaDbClient {
-    /// Create or update a document, and optionally a graph node reference.
+    /// Issue one unary RPC: wrap `message` in a [`tonic::Request`], hand it
+    /// to `call`, and map a non-OK [`tonic::Status`] into
+    /// [`RociaDbError::Status`] tagged with `operation`.
     ///
-    /// `node_label` and `node_graph` must be provided together: if only one
-    /// of them is set, this returns an error before any network call.
+    /// Every unary call in the crate goes through here — including the ones
+    /// the batch helpers ([`RociaDbClient::put_nodes`],
+    /// [`RociaDbClient::add_edges`]) and the neighbor-node fan-out issue
+    /// one per item. Only the two streaming RPCs (`Upload`, `Download`) call
+    /// the generated client directly, because neither a per-call deadline
+    /// nor a transparent replay applies to a stream the caller is feeding
+    /// or draining.
     ///
-    /// `node_label` and `node_graph` are adjacent, same-typed parameters, so
-    /// a call that transposes them compiles and passes that check while
-    /// writing the graph node under the wrong `node_id`/`graph` pairing —
-    /// see [`NodeBinding`] for the full risk. When that matters more than
-    /// the extra type, prefer
-    /// [`RociaDbClient::create_document_with_node_binding`], which takes the
-    /// pair as one [`NodeBinding`] value instead.
+    /// That single choke point is the point: a per-call deadline and an
+    /// automatic refresh-and-retry on `UNAUTHENTICATED` are both properties
+    /// of "any unary RPC", and both belong here rather than repeated at
+    /// twenty call sites. `Req: Clone` is required for the same reason —
+    /// replaying a call means building its request a second time — even
+    /// though today's single attempt consumes `message` without cloning it.
     ///
-    /// This call is **not atomic**: the document is written first, and the
-    /// graph node binding (when requested) is written second. If the node
-    /// write fails, the document is left in place without its node
-    /// binding — callers that need both or neither must handle that
-    /// themselves (for example by retrying the node write, or by treating
-    /// a document without its expected node as needing repair).
-    pub async fn create_document(
+    /// `call` takes the whole `tonic::Request` (not just the message) so
+    /// this function stays the only place that touches per-call metadata
+    /// and extensions.
+    pub(crate) async fn unary<Req, Resp, F, Fut>(
         &self,
-        tenant_id: &str,
-        collection_name: &str,
-        document_id: &str,
-        value: Value,
-        node_label: Option<String>,
-        node_graph: Option<String>,
-    ) -> Result<()> {
-        let request_id = default_document_request_id(collection_name);
-        self.create_document_with_request_id(
-            tenant_id,
-            collection_name,
-            document_id,
-            &value,
-            node_label,
-            node_graph,
-            request_id,
-        )
-        .await
-    }
-
-    /// Same as [`RociaDbClient::create_document`], with a caller-provided
-    /// idempotency key for the document write (the `PutDoc` call only — the
-    /// graph node binding, when requested, keeps generating its own key,
-    /// exactly as it already does in [`RociaDbClient::create_document`]).
-    /// Reuse the same `request_id` on a retry so the server recognizes a
-    /// repeated write instead of applying it twice.
-    ///
-    /// Unlike [`RociaDbClient::create_document`], `value` is generic over
-    /// any `Serialize` type — consistent with
-    /// [`RociaDbClient::put_document_with_request_id`],
-    /// [`RociaDbClient::put_node_with_request_id`], and
-    /// [`RociaDbClient::add_edge_with_request_id`] — rather than requiring
-    /// the caller to pre-serialize into `serde_json::Value` first.
-    ///
-    /// `node_label` and `node_graph` carry the same transposition risk here
-    /// as on [`RociaDbClient::create_document`] — see [`NodeBinding`].
-    /// Prefer
-    /// [`RociaDbClient::create_document_with_node_binding_and_request_id`]
-    /// when that risk matters more than the extra type.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_document_with_request_id<T: Serialize + ?Sized>(
-        &self,
-        tenant_id: &str,
-        collection_name: &str,
-        document_id: &str,
-        value: &T,
-        node_label: Option<String>,
-        node_graph: Option<String>,
-        request_id: impl Into<String>,
-    ) -> Result<()> {
-        validate_node_binding(&node_label, &node_graph)?;
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            document_id = document_id,
-            has_node_binding = node_label.is_some() && node_graph.is_some(),
-            "upserting document"
-        );
-        let json = serde_json::to_vec(value)
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    document_id = document_id,
-                    error = %error,
-                    "failed to encode document json"
-                );
-            })
-            .encode_context("document json")?;
-        let doc = PutDocRequest {
-            tenant_id: tenant_id.to_string(),
-            collection: collection_name.to_string(),
-            id: document_id.to_string(),
-            json,
-            request_id: request_id.into(),
-        };
-        let mut upstream_document = self.upstream_document.clone();
-        upstream_document
-            .put_doc(doc)
-            .await
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    document_id = document_id,
-                    error = %error,
-                    "failed to upsert document"
-                );
-            })
-            .status_context("failed to upsert document")?;
-        info!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            document_id = document_id,
-            "document upserted"
-        );
-        if let (Some(label), Some(graph)) = (node_label, node_graph) {
-            debug!(
-                tenant_id = tenant_id,
-                collection = collection_name,
-                document_id = document_id,
-                graph = %graph,
-                label = %label,
-                "upserting graph node binding for document"
-            );
-            let json = serde_json::to_vec(&json!({
-                "collection": collection_name,
-                "id": document_id,
-            }))
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    document_id = document_id,
-                    graph = %graph,
-                    label = %label,
-                    error = %error,
-                    "failed to encode node json"
-                );
-            })
-            .encode_context("node json")?;
-            let req = PutNodeRequest {
-                tenant_id: tenant_id.to_string(),
-                graph: graph.clone(),
-                node_id: format!("{}:{}", label, document_id),
-                json,
-                request_id: format!("put_node:{}", Uuid::new_v4()),
-            };
-            let mut upstream_graph = self.upstream_graph.clone();
-            upstream_graph
-                .put_node(req)
-                .await
-                .inspect_err(|error| {
-                    error!(
-                        tenant_id = tenant_id,
-                        collection = collection_name,
-                        document_id = document_id,
-                        graph = %graph,
-                        label = %label,
-                        error = %error,
-                        "failed to upsert graph node binding"
-                    );
-                })
-                .status_context("failed to upsert graph node binding")?;
-            info!(
-                tenant_id = tenant_id,
-                collection = collection_name,
-                document_id = document_id,
-                graph = %graph,
-                label = %label,
-                "graph node binding upserted"
-            );
-        }
-        Ok(())
-    }
-
-    /// Same as [`RociaDbClient::create_document`], but takes the node
-    /// binding as a single [`NodeBinding`] instead of the adjacent
-    /// `node_label`/`node_graph` parameters — see [`NodeBinding`] for why
-    /// that removes the risk of a transposed call silently writing the
-    /// graph node under the wrong pairing.
-    pub async fn create_document_with_node_binding(
-        &self,
-        tenant_id: &str,
-        collection_name: &str,
-        document_id: &str,
-        value: Value,
-        node_binding: Option<NodeBinding>,
-    ) -> Result<()> {
-        let request_id = default_document_request_id(collection_name);
-        self.create_document_with_node_binding_and_request_id(
-            tenant_id,
-            collection_name,
-            document_id,
-            &value,
-            node_binding,
-            request_id,
-        )
-        .await
-    }
-
-    /// Same as [`RociaDbClient::create_document_with_request_id`], but takes
-    /// the node binding as a single [`NodeBinding`] instead of the adjacent
-    /// `node_label`/`node_graph` parameters — see [`NodeBinding`] for why
-    /// that removes the risk of a transposed call silently writing the
-    /// graph node under the wrong pairing.
-    pub async fn create_document_with_node_binding_and_request_id<T: Serialize + ?Sized>(
-        &self,
-        tenant_id: &str,
-        collection_name: &str,
-        document_id: &str,
-        value: &T,
-        node_binding: Option<NodeBinding>,
-        request_id: impl Into<String>,
-    ) -> Result<()> {
-        let (node_label, node_graph) = node_binding_to_pair(node_binding);
-        self.create_document_with_request_id(
-            tenant_id,
-            collection_name,
-            document_id,
-            value,
-            node_label,
-            node_graph,
-            request_id,
-        )
-        .await
-    }
-
-    /// Find documents whose `search_field` equals `value` (`FindByField`).
-    ///
-    /// `total_count` on the returned [`DocumentPage`] is a count over the
-    /// matching field-index entries — see [`DocumentPage`] for how this
-    /// compares to [`RociaDbClient::list_documents`] and
-    /// [`RociaDbClient::query_documents`].
-    pub async fn search_documents<T>(
-        &self,
-        tenant_id: &str,
-        collection_name: &str,
-        search_field: &str,
-        value: &(impl Serialize + ?Sized),
-        limit: Option<u32>,
-        cursor: Option<&str>,
-    ) -> Result<DocumentPage<T>>
+        operation: &'static str,
+        message: Req,
+        call: F,
+    ) -> Result<Resp>
     where
-        T: DeserializeOwned,
+        Req: Clone,
+        F: Fn(tonic::Request<Req>) -> Fut,
+        Fut: Future<Output = std::result::Result<tonic::Response<Resp>, tonic::Status>>,
     {
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            search_field = search_field,
-            limit = limit.unwrap_or(DEFAULT_PAGE_SIZE),
-            cursor = cursor.unwrap_or(""),
-            "searching documents by field"
-        );
-        let page = page_request(limit, cursor)?;
-
-        let value_json = serde_json::to_vec(value)
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    search_field = search_field,
-                    error = %error,
-                    "failed to encode search value"
-                );
-            })
-            .encode_context("search value")?;
-
-        let mut upstream_document = self.upstream_document.clone();
-        let result = upstream_document
-            .find_by_field(FindByFieldRequest {
-                tenant_id: tenant_id.to_string(),
-                collection: collection_name.to_string(),
-                field: search_field.to_string(),
-                value_json,
-                page,
-            })
+        let response = call(tonic::Request::new(message))
             .await
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    search_field = search_field,
-                    error = %error,
-                    "failed to search documents"
-                );
-            })
-            .status_context("failed to search documents")?
-            .into_inner();
-
-        let (resp, next_cursor) = decode_document_page::<T>(result.json, result.page)
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    search_field = search_field,
-                    error = %error,
-                    "failed to decode search results"
-                );
-            })
-            .decode_context("search results")?;
-
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            search_field = search_field,
-            result_count = resp.len(),
-            total_count = result.total_count,
-            next_cursor = next_cursor.as_deref().unwrap_or(""),
-            "document search completed"
-        );
-
-        Ok(DocumentPage {
-            items: resp,
-            next_cursor,
-            total_count: result.total_count,
-        })
-    }
-
-    /// Return one paginated page of every document in `collection_name`
-    /// (`ListDoc`).
-    ///
-    /// `total_count` on the returned [`DocumentPage`] is **free**: the
-    /// server keeps a running per-collection counter updated on every
-    /// write, so reading it costs nothing beyond the listing itself — see
-    /// [`DocumentPage`] for how this compares to
-    /// [`RociaDbClient::search_documents`] and
-    /// [`RociaDbClient::query_documents`].
-    pub async fn list_documents<T>(
-        &self,
-        tenant_id: &str,
-        collection_name: &str,
-        limit: Option<u32>,
-        cursor: Option<&str>,
-    ) -> Result<DocumentPage<T>>
-    where
-        T: DeserializeOwned,
-    {
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            limit = limit.unwrap_or(DEFAULT_PAGE_SIZE),
-            cursor = cursor.unwrap_or(""),
-            "listing documents"
-        );
-        let page = page_request(limit, cursor)?;
-        let mut upstream_document = self.upstream_document.clone();
-        let result = upstream_document
-            .list_doc(ListDocRequest {
-                tenant_id: tenant_id.to_string(),
-                collection: collection_name.to_string(),
-                page,
-            })
-            .await
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    error = %error,
-                    "failed to list documents"
-                );
-            })
-            .status_context("failed to list documents")?
-            .into_inner();
-
-        let (resp, next_cursor) = decode_document_page::<T>(result.json, result.page)
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    error = %error,
-                    "failed to decode listed documents"
-                );
-            })
-            .decode_context("listed documents")?;
-
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            result_count = resp.len(),
-            total_count = result.total_count,
-            next_cursor = next_cursor.as_deref().unwrap_or(""),
-            "document listing completed"
-        );
-
-        Ok(DocumentPage {
-            items: resp,
-            next_cursor,
-            total_count: result.total_count,
-        })
-    }
-
-    /// List the document collections holding at least one document. Each
-    /// `CollectionInfo` carries its document count.
-    pub async fn list_collections(
-        &self,
-        tenant_id: &str,
-        limit: Option<u32>,
-        cursor: Option<&str>,
-    ) -> Result<Page<CollectionInfo>> {
-        debug!(
-            tenant_id = tenant_id,
-            limit = limit.unwrap_or(DEFAULT_PAGE_SIZE),
-            cursor = cursor.unwrap_or(""),
-            "listing collections"
-        );
-        let mut upstream_document = self.upstream_document.clone();
-        let result = upstream_document
-            .list_collections(ListCollectionsRequest {
-                tenant_id: tenant_id.to_string(),
-                page: page_request(limit, cursor)?,
-            })
-            .await
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    error = %error,
-                    "failed to list collections"
-                );
-            })
-            .status_context("failed to list collections")?
-            .into_inner();
-
-        Ok(Page {
-            items: result.collections,
-            next_cursor: result.page.and_then(|page| non_empty(page.next_cursor)),
-        })
-    }
-
-    /// Execute a paginated multi-filter document query.
-    ///
-    /// The underlying server applies filters with logical AND and uses the
-    /// provided sort list in order. The returned `next_cursor` is an opaque
-    /// server cursor that should be fed back unchanged.
-    ///
-    /// `total_count` on the returned [`DocumentPage`] is **expensive**: the
-    /// server only knows it after filtering the complete candidate set for
-    /// the query, so the cost scales with the number of candidates on every
-    /// call — never call this in a loop just to get a count; see
-    /// [`DocumentPage`] for the full comparison with
-    /// [`RociaDbClient::list_documents`] and
-    /// [`RociaDbClient::search_documents`].
-    pub async fn query_documents<T>(
-        &self,
-        tenant_id: &str,
-        collection_name: &str,
-        filters: &[DocumentQueryFilter],
-        sort: &[DocumentQuerySort],
-        limit: Option<u32>,
-        cursor: Option<&str>,
-    ) -> Result<DocumentPage<T>>
-    where
-        T: DeserializeOwned,
-    {
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            filter_count = filters.len(),
-            sort_count = sort.len(),
-            limit = limit.unwrap_or(DEFAULT_PAGE_SIZE),
-            cursor = cursor.unwrap_or(""),
-            "querying documents"
-        );
-
-        let page = page_request(limit, cursor)?;
-
-        let proto_filters = filters
-            .iter()
-            .map(|filter| -> Result<QueryFilter> {
-                Ok(QueryFilter {
-                    field: filter.field.clone(),
-                    operator: filter.operator.as_proto(),
-                    values_json: filter
-                        .values
-                        .iter()
-                        .map(serde_json::to_vec)
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .inspect_err(|error| {
-                            error!(
-                                tenant_id = tenant_id,
-                                collection = collection_name,
-                                field = %filter.field,
-                                error = %error,
-                                "failed to encode query filter value"
-                            );
-                        })
-                        .encode_context("query filter value")?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let proto_sort = sort
-            .iter()
-            .map(|sort| QuerySort {
-                field: sort.field.clone(),
-                direction: sort.direction.as_proto(),
-            })
-            .collect::<Vec<_>>();
-
-        let mut upstream_document = self.upstream_document.clone();
-        let result = upstream_document
-            .query_doc(QueryDocRequest {
-                tenant_id: tenant_id.to_string(),
-                collection: collection_name.to_string(),
-                filters: proto_filters,
-                sort: proto_sort,
-                page,
-            })
-            .await
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    error = %error,
-                    "failed to query documents"
-                );
-            })
-            .status_context("failed to query documents")?
-            .into_inner();
-
-        let (resp, next_cursor) = decode_document_page::<T>(result.json, result.page)
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    error = %error,
-                    "failed to decode queried documents"
-                );
-            })
-            .decode_context("queried documents")?;
-
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            result_count = resp.len(),
-            total_count = result.total_count,
-            next_cursor = next_cursor.as_deref().unwrap_or(""),
-            "document query completed"
-        );
-
-        Ok(DocumentPage {
-            items: resp,
-            next_cursor,
-            total_count: result.total_count,
-        })
-    }
-
-    /// Fetch a single document by id and decode its JSON payload into `T`
-    /// (`GetDoc`).
-    ///
-    /// Unlike [`search_documents`](Self::search_documents),
-    /// [`list_documents`](Self::list_documents) and
-    /// [`query_documents`](Self::query_documents), this returns the value
-    /// directly rather than a [`DocumentPage`]: there is nothing to paginate
-    /// when fetching by id.
-    pub async fn get_document<T>(
-        &self,
-        tenant_id: &str,
-        collection_name: &str,
-        document_id: &str,
-    ) -> Result<T>
-    where
-        T: DeserializeOwned,
-    {
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            document_id = document_id,
-            "loading document"
-        );
-        let mut upstream_document = self.upstream_document.clone();
-        let result = upstream_document
-            .get_doc(GetDocRequest {
-                tenant_id: tenant_id.to_string(),
-                collection: collection_name.to_string(),
-                id: document_id.to_string(),
-            })
-            .await
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    document_id = document_id,
-                    error = %error,
-                    "failed to load document"
-                );
-            })
-            .status_context("failed to load document")?
-            .into_inner();
-
-        let resp = serde_json::from_slice::<T>(&result.json)
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    collection = collection_name,
-                    document_id = document_id,
-                    error = %error,
-                    "failed to decode document"
-                );
-            })
-            .decode_context("document")?;
-        debug!(
-            tenant_id = tenant_id,
-            collection = collection_name,
-            document_id = document_id,
-            "document loaded"
-        );
-
-        Ok(resp)
-    }
-
-    /// Upsert a batch of nodes in a graph with bounded concurrency (at most
-    /// 10 `PutNode` calls in flight at once). `nodes` is consumed in the
-    /// order the caller provides — duplicate `node_id`s are **not** merged,
-    /// both are sent. Items with different `node_id`s run fully
-    /// concurrently against each other (up to the 10-in-flight bound), but
-    /// items sharing a `node_id` are dispatched strictly one after another,
-    /// in the order given: the next `PutNode` call for that id is not sent
-    /// until the previous one's response comes back. That makes
-    /// last-item-wins genuinely true for a duplicate id — the caller's last
-    /// write really is the last one the server applies — rather than a race
-    /// between two in-flight calls whose completion order the network, not
-    /// the caller, decides.
-    ///
-    /// **This batch is not atomic and stops at the first error**: on
-    /// failure, in-flight requests are cancelled and the error does not say
-    /// which items had already succeeded. To resume after a failure, replay
-    /// the same `nodes` sequence with the same [`NodeInput::request_id`]
-    /// values you used the first time — the server deduplicates on
-    /// `(tenant, operation, target, request_id)`, so already-applied writes
-    /// are recognized and skipped rather than reapplied, and only the
-    /// writes that never landed actually happen.
-    pub async fn put_nodes(
-        &self,
-        tenant_id: &str,
-        graph_name: &str,
-        nodes: impl IntoIterator<Item = NodeInput>,
-    ) -> Result<()> {
-        let nodes: Vec<NodeInput> = nodes.into_iter().collect();
-        debug!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            node_count = nodes.len(),
-            "upserting graph nodes batch"
-        );
-        let requests = build_put_node_requests(tenant_id, graph_name, nodes)?;
-        let groups = group_preserving_order(requests, |request| request.node_id.as_str());
-        stream::iter(groups.into_iter().map(Ok::<_, RociaDbError>))
-            .try_for_each_concurrent(CONCURRENT_REQUESTS, |group| {
-                let mut upstream = self.upstream_graph.clone();
-                async move {
-                    for node in group {
-                        let node_id = node.node_id.clone();
-                        upstream
-                            .put_node(node)
-                            .await
-                            .status_context("failed to upsert node")
-                            .map_err(|error| {
-                                error!(
-                                    graph = graph_name,
-                                    node_id = node_id,
-                                    error = %error,
-                                    "failed to upsert graph node"
-                                );
-                                error
-                            })?;
-                    }
-                    Ok(())
-                }
-            })
-            .await?;
-        info!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            "graph nodes batch upserted"
-        );
-        Ok(())
-    }
-
-    /// Fetch a node and decode its JSON payload. `node_id` uses the
-    /// `label:id` format.
-    pub async fn get_node(
-        &self,
-        tenant_id: &str,
-        graph_name: &str,
-        node_id: &str,
-    ) -> Result<Value> {
-        debug!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            node_id = node_id,
-            "loading graph node"
-        );
-        let mut upstream_graph = self.upstream_graph.clone();
-        let resp = upstream_graph
-            .get_node(GetNodeRequest {
-                tenant_id: tenant_id.to_string(),
-                graph: graph_name.to_string(),
-                node_id: node_id.to_string(),
-            })
-            .await
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    graph = graph_name,
-                    node_id = node_id,
-                    error = %error,
-                    "failed to load graph node"
-                );
-            })
-            .status_context("failed to load graph node")?
-            .into_inner();
-        let value = serde_json::from_slice(&resp.json)
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    graph = graph_name,
-                    node_id = node_id,
-                    error = %error,
-                    "failed to decode node json"
-                );
-            })
-            .decode_context("node json")?;
-        debug!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            node_id = node_id,
-            "graph node loaded"
-        );
-        Ok(value)
-    }
-
-    /// Fetch an edge by id, with its properties as a `serde_json::Value`.
-    ///
-    /// The convenience counterpart of
-    /// [`RociaDbClient::get_edge_as`], which decodes into a type of your
-    /// choosing; see it for what the read guarantees and what `NOT_FOUND`
-    /// means here.
-    pub async fn get_edge(
-        &self,
-        tenant_id: &str,
-        graph_name: &str,
-        edge_id: &str,
-    ) -> Result<Edge<Value>> {
-        debug!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            edge_id = edge_id,
-            "loading graph edge"
-        );
-        let edge = self
-            .get_edge_as(tenant_id, graph_name, edge_id)
-            .await
-            .inspect_err(|error| {
-                error!(
-                    tenant_id = tenant_id,
-                    graph = graph_name,
-                    edge_id = edge_id,
-                    error = %error,
-                    "failed to load graph edge"
-                );
-            })?;
-        debug!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            edge_id = edge_id,
-            "graph edge loaded"
-        );
-        Ok(edge)
-    }
-
-    /// Upsert a batch of edges with bounded concurrency (at most 10
-    /// `AddEdge` calls in flight at once). `edges` is consumed in the order
-    /// the caller provides — duplicate `edge_id`s are **not** merged, both
-    /// are sent. Items with different `edge_id`s run fully concurrently
-    /// against each other (up to the 10-in-flight bound), but items sharing
-    /// an `edge_id` are dispatched strictly one after another, in the order
-    /// given: the next `AddEdge` call for that id is not sent until the
-    /// previous one's response comes back. That makes last-item-wins
-    /// genuinely true for a duplicate id — the caller's last write really is
-    /// the last one the server applies — rather than a race between two
-    /// in-flight calls whose completion order the network, not the caller,
-    /// decides.
-    ///
-    /// The server returns `NOT_FOUND` for any edge whose `from` or `to`
-    /// node does not already exist in `graph_name`: create both endpoint
-    /// nodes before adding an edge between them. It returns
-    /// `ALREADY_EXISTS` for any edge that would be a *second* one over a
-    /// `(from, label, to)` triplet another edge already holds — see
-    /// [`RociaDbClient::add_edge`].
-    ///
-    /// **This batch is not atomic and stops at the first error**: on
-    /// failure, in-flight requests are cancelled and the error does not say
-    /// which items had already succeeded. To resume after a failure, replay
-    /// the same `edges` sequence with the same [`EdgeInput::request_id`]
-    /// values you used the first time — the server deduplicates on
-    /// `(tenant, operation, target, request_id)`, so already-applied writes
-    /// are recognized and skipped rather than reapplied, and only the
-    /// writes that never landed actually happen.
-    pub async fn add_edges(
-        &self,
-        tenant_id: &str,
-        graph_name: &str,
-        edges: impl IntoIterator<Item = EdgeInput>,
-    ) -> Result<()> {
-        let edges: Vec<EdgeInput> = edges.into_iter().collect();
-        debug!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            edge_count = edges.len(),
-            "upserting graph edges batch"
-        );
-        let requests = build_add_edge_requests(tenant_id, graph_name, edges)?;
-        let groups = group_preserving_order(requests, |request| request.edge_id.as_str());
-        stream::iter(groups.into_iter().map(Ok::<_, RociaDbError>))
-            .try_for_each_concurrent(CONCURRENT_REQUESTS, |group| {
-                let mut upstream = self.upstream_graph.clone();
-                async move {
-                    for edge in group {
-                        let edge_id = edge.edge_id.clone();
-                        let from = edge.from.clone();
-                        let to = edge.to.clone();
-                        let label = edge.label.clone();
-                        upstream
-                            .add_edge(edge)
-                            .await
-                            .status_context("failed to add edge")
-                            .map_err(|error| {
-                                error!(
-                                    graph = graph_name,
-                                    edge_id = edge_id,
-                                    from = from,
-                                    to = to,
-                                    label = label,
-                                    error = %error,
-                                    "failed to upsert graph edge"
-                                );
-                                error
-                            })?;
-                    }
-                    Ok(())
-                }
-            })
-            .await?;
-        info!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            "graph edges batch upserted"
-        );
-
-        Ok(())
-    }
-
-    /// Delete an edge by id.
-    ///
-    /// **Idempotent**: deleting an `edge_id` that does not exist succeeds
-    /// rather than returning `NOT_FOUND`. See
-    /// [`RociaDbClient::delete_edge_with_request_id`] for what that costs a
-    /// caller who wanted to be told.
-    pub async fn delete_edge(
-        &self,
-        tenant_id: &str,
-        graph_name: &str,
-        edge_id: &str,
-    ) -> Result<()> {
-        debug!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            edge_id = edge_id,
-            "deleting graph edge"
-        );
-        self.delete_edge_with_request_id(
-            tenant_id,
-            graph_name,
-            edge_id,
-            format!("delete_edge:{}", Uuid::new_v4()),
-        )
-        .await?;
-        info!(
-            tenant_id = tenant_id,
-            graph = graph_name,
-            edge_id = edge_id,
-            "graph edge deleted"
-        );
-        Ok(())
+            .status_context(operation)?;
+        Ok(response.into_inner())
     }
 }
 
+/// Helpers shared by the unit tests of several modules.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::{
-        BearerInterceptor, DEFAULT_CONNECT_TIMEOUT, DocumentPage, DocumentQueryFilter,
-        DocumentQueryOperator, DocumentQuerySort, DocumentQuerySortDirection,
-        DocumentServiceClient, EdgeInput, FileServiceClient, GraphServiceClient, NodeBinding,
-        NodeInput, PageResponse, QueryOperator, RociaDbBuilder, RociaDbClient, SortDirection,
-        TenantServiceClient, build_add_edge_requests, build_put_node_requests,
-        decode_document_page, default_document_request_id, group_preserving_order,
-        node_binding_to_pair, page_request, resolve_connect_timeout, validate_host_path,
-        validate_node_binding,
+        BearerInterceptor, DocumentServiceClient, FileServiceClient, GraphServiceClient,
+        RociaDbClient, TenantServiceClient,
     };
-    use crate::{FileStreamUploadOptions, RociaDbError};
-    use futures::stream;
-    use std::time::Duration;
+    use std::sync::Arc;
     use tonic::transport::Endpoint;
 
     /// A `RociaDbClient` wired to a channel that never actually dials
@@ -1879,7 +704,7 @@ mod tests {
     /// ever reaching the network — if such a test regressed and the
     /// gating ran too late, it would hang or fail against the unreachable
     /// `127.0.0.1:1` host instead of returning promptly.
-    fn lazy_test_client() -> RociaDbClient {
+    pub(crate) fn lazy_test_client() -> RociaDbClient {
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         let interceptor = BearerInterceptor::disabled();
         RociaDbClient {
@@ -1896,56 +721,22 @@ mod tests {
                 interceptor.clone(),
             ),
             upstream_tenant: TenantServiceClient::with_interceptor(channel, interceptor),
+            host: Arc::from("http://127.0.0.1:1"),
             token_manager: None,
             _token_refresh_guard: None,
         }
     }
+}
 
-    #[test]
-    fn node_binding_accepts_both_absent() {
-        validate_node_binding(&None, &None).expect("both absent must be accepted");
-    }
-
-    #[test]
-    fn node_binding_accepts_both_present() {
-        validate_node_binding(&Some("product".to_string()), &Some("products".to_string()))
-            .expect("both present must be accepted");
-    }
-
-    #[test]
-    fn node_binding_rejects_label_without_graph() {
-        let error = validate_node_binding(&Some("product".to_string()), &None)
-            .expect_err("node_label without node_graph must be rejected");
-        assert!(matches!(error, RociaDbError::Validation(_)));
-        assert!(error.to_string().contains("must be provided together"));
-        assert!(error.to_string().contains("node_label=Some(\"product\")"));
-    }
-
-    #[test]
-    fn node_binding_rejects_graph_without_label() {
-        let error = validate_node_binding(&None, &Some("products".to_string()))
-            .expect_err("node_graph without node_label must be rejected");
-        assert!(matches!(error, RociaDbError::Validation(_)));
-        assert!(error.to_string().contains("must be provided together"));
-        assert!(error.to_string().contains("node_graph=Some(\"products\")"));
-    }
-
-    #[test]
-    fn node_binding_to_pair_keeps_label_and_graph_apart() {
-        // Asserting each side of the pair individually (rather than just
-        // that the call compiles) is the point: `label` and `graph` are
-        // both `String`, so a future edit that swapped which field feeds
-        // which side of the returned tuple would still type-check and pass
-        // a test that only checked shape, not value.
-        let (label, graph) = node_binding_to_pair(Some(NodeBinding::new("product", "catalog")));
-        assert_eq!(label.as_deref(), Some("product"));
-        assert_eq!(graph.as_deref(), Some("catalog"));
-    }
-
-    #[test]
-    fn node_binding_to_pair_maps_absent_to_both_absent() {
-        assert_eq!(node_binding_to_pair(None), (None, None));
-    }
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_CONNECT_TIMEOUT, RociaDbBuilder, RociaDbClient, WriteOptions, page_request,
+        resolve_connect_timeout, validate_host_path,
+    };
+    use crate::RociaDbError;
+    use crate::test_support::lazy_test_client;
+    use std::time::Duration;
 
     #[test]
     fn client_is_send_sync_so_an_arc_needs_no_mutex() {
@@ -1975,431 +766,15 @@ mod tests {
     }
 
     #[test]
-    fn document_query_operator_as_proto_maps_every_variant_to_the_generated_constant() {
-        // A swapped match arm here would silently send the wrong filter
-        // semantics to the server with no client-side error, so each
-        // variant is checked against the exact generated constant rather
-        // than just checking that `as_proto` returns *something*.
-        assert_eq!(
-            DocumentQueryOperator::Eq.as_proto(),
-            QueryOperator::Eq as i32
-        );
-        assert_eq!(
-            DocumentQueryOperator::In.as_proto(),
-            QueryOperator::In as i32
-        );
-        assert_eq!(
-            DocumentQueryOperator::Contains.as_proto(),
-            QueryOperator::Contains as i32
-        );
+    fn write_options_default_to_no_request_id() {
+        assert_eq!(WriteOptions::new(), WriteOptions::default());
+        assert!(WriteOptions::new().request_id.is_none());
     }
 
     #[test]
-    fn document_query_sort_direction_as_proto_maps_every_variant_to_the_generated_constant() {
-        assert_eq!(
-            DocumentQuerySortDirection::Asc.as_proto(),
-            SortDirection::Asc as i32
-        );
-        assert_eq!(
-            DocumentQuerySortDirection::Desc.as_proto(),
-            SortDirection::Desc as i32
-        );
-    }
-
-    #[test]
-    fn document_query_filter_and_sort_support_equality_comparison() {
-        let filter_a = DocumentQueryFilter::new(
-            "sku",
-            DocumentQueryOperator::Eq,
-            vec![serde_json::json!("sku-1")],
-        );
-        let filter_b = DocumentQueryFilter::new(
-            "sku",
-            DocumentQueryOperator::Eq,
-            vec![serde_json::json!("sku-1")],
-        );
-        let filter_c = DocumentQueryFilter::new(
-            "sku",
-            DocumentQueryOperator::Eq,
-            vec![serde_json::json!("sku-2")],
-        );
-        assert_eq!(filter_a, filter_b);
-        assert_ne!(filter_a, filter_c);
-
-        let sort_a = DocumentQuerySort::new("sku", DocumentQuerySortDirection::Asc);
-        let sort_b = DocumentQuerySort::new("sku", DocumentQuerySortDirection::Asc);
-        let sort_c = DocumentQuerySort::new("sku", DocumentQuerySortDirection::Desc);
-        assert_eq!(sort_a, sort_b);
-        assert_ne!(sort_a, sort_c);
-    }
-
-    // `build_put_node_requests` / `build_add_edge_requests` are the pure,
-    // network-free cores of `RociaDbClient::put_nodes` /
-    // `RociaDbClient::add_edges` (see their doc comments). These tests lock
-    // in the three properties an ordered `Vec<NodeInput>` / `Vec<EdgeInput>`
-    // batch input must have: caller order is preserved, duplicate keys are
-    // not merged, and each item gets its own idempotency key.
-
-    #[test]
-    fn put_node_requests_preserve_caller_order() {
-        // A `HashMap`-keyed batch input could not guarantee this —
-        // iteration order over a hash map is unspecified, so it could
-        // silently reorder `PutNode` calls relative to what the caller
-        // wrote.
-        let nodes = vec![
-            NodeInput {
-                node_id: "product:3".to_string(),
-                value: serde_json::json!({"n": 3}),
-                request_id: None,
-            },
-            NodeInput {
-                node_id: "product:1".to_string(),
-                value: serde_json::json!({"n": 1}),
-                request_id: None,
-            },
-            NodeInput {
-                node_id: "product:2".to_string(),
-                value: serde_json::json!({"n": 2}),
-                request_id: None,
-            },
-        ];
-        let requests =
-            build_put_node_requests("tenant", "catalog", nodes).expect("build must succeed");
-        let ids: Vec<&str> = requests.iter().map(|r| r.node_id.as_str()).collect();
-        assert_eq!(ids, vec!["product:3", "product:1", "product:2"]);
-    }
-
-    #[test]
-    fn put_node_requests_do_not_merge_duplicate_node_ids() {
-        let nodes = vec![
-            NodeInput {
-                node_id: "product:1".to_string(),
-                value: serde_json::json!({"n": 1}),
-                request_id: None,
-            },
-            NodeInput {
-                node_id: "product:1".to_string(),
-                value: serde_json::json!({"n": 2}),
-                request_id: None,
-            },
-        ];
-        let requests =
-            build_put_node_requests("tenant", "catalog", nodes).expect("build must succeed");
-        assert_eq!(
-            requests.len(),
-            2,
-            "a HashMap keyed by node_id would have collapsed this to one request"
-        );
-        assert_eq!(requests[0].node_id, "product:1");
-        assert_eq!(requests[1].node_id, "product:1");
-        assert_ne!(
-            requests[0].json, requests[1].json,
-            "each duplicate keeps its own payload"
-        );
-    }
-
-    #[test]
-    fn put_node_requests_use_node_id_verbatim_with_no_label_recomposition() {
-        let nodes = vec![NodeInput {
-            node_id: "product:sku-1".to_string(),
-            value: serde_json::json!({}),
-            request_id: None,
-        }];
-        let requests =
-            build_put_node_requests("tenant", "catalog", nodes).expect("build must succeed");
-        assert_eq!(requests[0].node_id, "product:sku-1");
-    }
-
-    #[test]
-    fn put_node_requests_pass_through_caller_supplied_request_id() {
-        let nodes = vec![NodeInput {
-            node_id: "product:1".to_string(),
-            value: serde_json::json!({}),
-            request_id: Some("caller-chosen-id".to_string()),
-        }];
-        let requests =
-            build_put_node_requests("tenant", "catalog", nodes).expect("build must succeed");
-        assert_eq!(requests[0].request_id, "caller-chosen-id");
-    }
-
-    #[test]
-    fn put_node_requests_default_request_id_matches_the_single_item_put_node_prefix() {
-        // `put_nodes` (batch) and `put_node` (single-item) both issue
-        // `PutNode` calls, so an absent id must default to the exact same
-        // prefix on both paths: `put_node:<uuid>`.
-        let nodes = vec![
-            NodeInput {
-                node_id: "product:1".to_string(),
-                value: serde_json::json!({}),
-                request_id: None,
-            },
-            NodeInput {
-                node_id: "product:2".to_string(),
-                value: serde_json::json!({}),
-                request_id: None,
-            },
-        ];
-        let requests =
-            build_put_node_requests("tenant", "catalog", nodes).expect("build must succeed");
-        for request in &requests {
-            let uuid_part = request
-                .request_id
-                .strip_prefix("put_node:")
-                .expect("default request_id must use the put_node: prefix");
-            uuid::Uuid::parse_str(uuid_part).expect("suffix after the prefix must be a uuid");
-        }
-        assert_ne!(
-            requests[0].request_id, requests[1].request_id,
-            "each item without an explicit request_id must get its own generated id"
-        );
-    }
-
-    #[test]
-    fn add_edge_requests_preserve_caller_order() {
-        let edges = vec![
-            EdgeInput {
-                edge_id: "e3".to_string(),
-                from: "a".to_string(),
-                to: "b".to_string(),
-                label: "knows".to_string(),
-                value: serde_json::json!({}),
-                request_id: None,
-            },
-            EdgeInput {
-                edge_id: "e1".to_string(),
-                from: "b".to_string(),
-                to: "c".to_string(),
-                label: "knows".to_string(),
-                value: serde_json::json!({}),
-                request_id: None,
-            },
-            EdgeInput {
-                edge_id: "e2".to_string(),
-                from: "c".to_string(),
-                to: "d".to_string(),
-                label: "knows".to_string(),
-                value: serde_json::json!({}),
-                request_id: None,
-            },
-        ];
-        let requests =
-            build_add_edge_requests("tenant", "catalog", edges).expect("build must succeed");
-        let ids: Vec<&str> = requests.iter().map(|r| r.edge_id.as_str()).collect();
-        assert_eq!(ids, vec!["e3", "e1", "e2"]);
-    }
-
-    #[test]
-    fn add_edge_requests_do_not_merge_duplicate_edge_ids() {
-        let edges = vec![
-            EdgeInput {
-                edge_id: "e1".to_string(),
-                from: "a".to_string(),
-                to: "b".to_string(),
-                label: "knows".to_string(),
-                value: serde_json::json!({"v": 1}),
-                request_id: None,
-            },
-            EdgeInput {
-                edge_id: "e1".to_string(),
-                from: "a".to_string(),
-                to: "b".to_string(),
-                label: "knows".to_string(),
-                value: serde_json::json!({"v": 2}),
-                request_id: None,
-            },
-        ];
-        let requests =
-            build_add_edge_requests("tenant", "catalog", edges).expect("build must succeed");
-        assert_eq!(
-            requests.len(),
-            2,
-            "a HashMap keyed by edge_id would have collapsed this to one request"
-        );
-        assert_ne!(
-            requests[0].json, requests[1].json,
-            "each duplicate keeps its own payload"
-        );
-    }
-
-    #[test]
-    fn add_edge_requests_pass_through_caller_supplied_request_id() {
-        let edges = vec![EdgeInput {
-            edge_id: "e1".to_string(),
-            from: "a".to_string(),
-            to: "b".to_string(),
-            label: "knows".to_string(),
-            value: serde_json::json!({}),
-            request_id: Some("caller-chosen-id".to_string()),
-        }];
-        let requests =
-            build_add_edge_requests("tenant", "catalog", edges).expect("build must succeed");
-        assert_eq!(requests[0].request_id, "caller-chosen-id");
-    }
-
-    #[test]
-    fn add_edge_requests_default_request_id_stays_a_bare_uuid() {
-        // Unlike nodes, edges default to no prefix at all (a bare
-        // `Uuid::new_v4().to_string()`).
-        let edges = vec![
-            EdgeInput {
-                edge_id: "e1".to_string(),
-                from: "a".to_string(),
-                to: "b".to_string(),
-                label: "knows".to_string(),
-                value: serde_json::json!({}),
-                request_id: None,
-            },
-            EdgeInput {
-                edge_id: "e2".to_string(),
-                from: "b".to_string(),
-                to: "c".to_string(),
-                label: "knows".to_string(),
-                value: serde_json::json!({}),
-                request_id: None,
-            },
-        ];
-        let requests =
-            build_add_edge_requests("tenant", "catalog", edges).expect("build must succeed");
-        for request in &requests {
-            uuid::Uuid::parse_str(&request.request_id)
-                .expect("default request_id must be a bare uuid with no prefix");
-        }
-        assert_ne!(
-            requests[0].request_id, requests[1].request_id,
-            "each item without an explicit request_id must get its own generated id"
-        );
-    }
-
-    #[test]
-    fn group_preserving_order_keeps_each_groups_relative_order() {
-        // `put_nodes`/`add_edges` rely on this: different keys may come back
-        // in any order (backed by a `HashMap`), but the items sharing one
-        // key must stay in the exact order they were given in, since that
-        // order becomes the order the batch dispatch applies them in.
-        let items = vec![("a", 1), ("b", 1), ("a", 2), ("a", 3), ("b", 2)];
-        let groups = group_preserving_order(items, |item| item.0);
-
-        let values_for = |key: &str| -> Vec<i32> {
-            groups
-                .iter()
-                .find(|group| group.first().is_some_and(|item| item.0 == key))
-                .map(|group| group.iter().map(|item| item.1).collect())
-                .unwrap_or_default()
-        };
-        assert_eq!(values_for("a"), vec![1, 2, 3]);
-        assert_eq!(values_for("b"), vec![1, 2]);
-        assert_eq!(
-            groups.iter().map(Vec::len).sum::<usize>(),
-            5,
-            "every item must land in exactly one group"
-        );
-    }
-
-    // `decode_document_page` is the shared, network-free core of
-    // `list_documents`, `search_documents` and `query_documents`'s response
-    // handling (see its doc comment). Feeding it a synthetic response shape
-    // directly exercises the real extraction logic those three RPCs run,
-    // rather than only re-checking Rust's own field-access semantics on a
-    // hand-built `DocumentPage`.
-
-    #[test]
-    fn decode_document_page_decodes_items_and_extracts_the_cursor() {
-        let json = vec![
-            serde_json::to_vec(&serde_json::json!({"n": 1})).expect("encode must succeed"),
-            serde_json::to_vec(&serde_json::json!({"n": 2})).expect("encode must succeed"),
-        ];
-        let page = Some(PageResponse {
-            next_cursor: "cursor-2".to_string(),
-        });
-        let (items, next_cursor) = decode_document_page::<serde_json::Value>(json, page)
-            .expect("well-formed items must decode");
-        assert_eq!(
-            items,
-            vec![serde_json::json!({"n": 1}), serde_json::json!({"n": 2})]
-        );
-        assert_eq!(next_cursor.as_deref(), Some("cursor-2"));
-    }
-
-    #[test]
-    fn decode_document_page_maps_the_servers_empty_cursor_convention_to_none() {
-        let page = Some(PageResponse {
-            next_cursor: String::new(),
-        });
-        let (items, next_cursor) = decode_document_page::<serde_json::Value>(vec![], page)
-            .expect("an empty page must still decode");
-        assert!(items.is_empty());
-        assert!(
-            next_cursor.is_none(),
-            "an empty next_cursor means \"no further page\" and must map to None — \
-             the same rule list_documents/search_documents/query_documents depend on \
-             to know when to stop paginating"
-        );
-    }
-
-    #[test]
-    fn decode_document_page_with_no_page_message_has_no_cursor() {
-        let (items, next_cursor) = decode_document_page::<serde_json::Value>(vec![], None)
-            .expect("a missing page message must still decode");
-        assert!(items.is_empty());
-        assert!(next_cursor.is_none());
-    }
-
-    #[test]
-    fn decode_document_page_names_the_failing_items_position() {
-        // `collect` still short-circuits on the first bad item — this only
-        // checks that the resulting error names *which* item broke, instead
-        // of just saying that something in the page failed to parse.
-        let json = vec![
-            serde_json::to_vec(&serde_json::json!({"n": 1})).expect("encode must succeed"),
-            b"{ not valid json".to_vec(),
-            serde_json::to_vec(&serde_json::json!({"n": 3})).expect("encode must succeed"),
-        ];
-        let error = decode_document_page::<serde_json::Value>(json, None)
-            .expect_err("a malformed item must fail to decode");
-        assert!(
-            error.to_string().contains("item 1"),
-            "the error must name the zero-based index of the item that failed, got: {error}"
-        );
-    }
-
-    #[test]
-    fn document_page_exposes_items_next_cursor_and_total_count() {
-        let page = DocumentPage {
-            items: vec!["a", "b"],
-            next_cursor: Some("cursor-2".to_string()),
-            total_count: 42,
-        };
-        assert_eq!(page.items, vec!["a", "b"]);
-        assert_eq!(page.next_cursor.as_deref(), Some("cursor-2"));
-        assert_eq!(page.total_count, 42);
-    }
-
-    #[test]
-    fn document_page_has_no_next_cursor_on_the_last_page() {
-        let page: DocumentPage<i32> = DocumentPage {
-            items: vec![1, 2, 3],
-            next_cursor: None,
-            total_count: 3,
-        };
-        assert!(page.next_cursor.is_none());
-        assert_eq!(page.items, vec![1, 2, 3]);
-        assert_eq!(page.total_count, 3);
-    }
-
-    #[test]
-    fn document_page_derives_clone_and_equality() {
-        let page = DocumentPage {
-            items: vec![1],
-            next_cursor: None,
-            total_count: 1,
-        };
-        assert_eq!(page.clone(), page);
-        let different = DocumentPage {
-            items: vec![1],
-            next_cursor: None,
-            total_count: 2,
-        };
-        assert_ne!(page, different);
+    fn write_options_with_request_id_is_chainable_and_readable() {
+        let options = WriteOptions::new().with_request_id("retry-1");
+        assert_eq!(options.request_id.as_deref(), Some("retry-1"));
     }
 
     #[test]
@@ -2476,17 +851,37 @@ mod tests {
     }
 
     #[test]
+    fn builder_setters_are_chainable_from_a_temporary_and_from_a_binding() {
+        // The whole point of the owned (`self -> Self`) setter style: a
+        // chain started on a temporary stays usable, and a half-configured
+        // builder can be stored in a variable and extended later. Under the
+        // previous `&mut self -> &mut Self` shape the second form did not
+        // compile at all (it borrowed a dropped temporary), so this is a
+        // compile-time assertion first and a value check second.
+        let chained = RociaDbBuilder::new()
+            .host("http://127.0.0.1:50051")
+            .connect_timeout(Duration::from_secs(7))
+            .disable_auth();
+        assert_eq!(chained.connect_timeout, Some(Duration::from_secs(7)));
+
+        let partial = RociaDbBuilder::new().host("http://example.invalid:50051");
+        let finished = partial.disable_auth();
+        assert_eq!(
+            finished.host.as_deref(),
+            Some("http://example.invalid:50051")
+        );
+    }
+
+    #[test]
     fn builder_connect_timeout_setter_stores_the_value_unvalidated() {
         // Mirrors `RociaDbBuilder::host` / `auth_client_credentials`: the
         // setter never validates, only `build()` does (via
         // `resolve_connect_timeout`, tested above) — so even a nonsensical
         // zero duration must be stored as-is here.
-        let mut builder = RociaDbBuilder::new();
-        builder.connect_timeout(Duration::ZERO);
+        let builder = RociaDbBuilder::new().connect_timeout(Duration::ZERO);
         assert_eq!(builder.connect_timeout, Some(Duration::ZERO));
 
-        let mut builder = RociaDbBuilder::new();
-        builder.connect_timeout(Duration::from_secs(42));
+        let builder = RociaDbBuilder::new().connect_timeout(Duration::from_secs(42));
         assert_eq!(builder.connect_timeout, Some(Duration::from_secs(42)));
     }
 
@@ -2496,28 +891,22 @@ mod tests {
         // before `Endpoint::connect()`, so this must return promptly with
         // `Validation` instead of hanging or failing against the
         // (deliberately unreachable) host.
-        let mut builder = RociaDbBuilder::new();
-        builder
+        let error = RociaDbBuilder::new()
             .host("http://127.0.0.1:1")
-            .connect_timeout(Duration::ZERO);
-        // `RociaDbClient` intentionally does not derive `Debug` (it would
-        // expose channel/interceptor internals), so `expect_err` cannot be
-        // used here — match instead.
-        let error = match builder.build().await {
-            Ok(_) => panic!("a zero connect timeout must fail build()"),
-            Err(error) => error,
-        };
+            .connect_timeout(Duration::ZERO)
+            .build()
+            .await
+            .expect_err("a zero connect timeout must fail build()");
         assert!(matches!(error, RociaDbError::Validation(_)));
     }
 
     #[tokio::test]
     async fn build_rejects_a_host_with_a_leftover_path_before_any_network_call() {
-        let mut builder = RociaDbBuilder::new();
-        builder.host("http://127.0.0.1:1/v1");
-        let error = match builder.build().await {
-            Ok(_) => panic!("a host carrying a path must fail build()"),
-            Err(error) => error,
-        };
+        let error = RociaDbBuilder::new()
+            .host("http://127.0.0.1:1/v1")
+            .build()
+            .await
+            .expect_err("a host carrying a path must fail build()");
         assert!(matches!(error, RociaDbError::Connection { .. }));
     }
 
@@ -2525,8 +914,7 @@ mod tests {
     // — a derived `Debug` would print it in clear text.
     #[test]
     fn builder_debug_output_redacts_the_client_secret() {
-        let mut builder = RociaDbBuilder::new();
-        builder.auth_client_credentials(
+        let builder = RociaDbBuilder::new().auth_client_credentials(
             "https://idp.example.com/token",
             "client-123",
             "super-secret-value",
@@ -2547,62 +935,31 @@ mod tests {
         assert!(debug_output.contains("client-123"));
     }
 
-    #[test]
-    fn default_document_request_id_uses_the_put_document_prefix_with_a_fresh_uuid_each_time() {
-        let first = default_document_request_id("catalog");
-        let second = default_document_request_id("catalog");
-        let uuid_part = first
-            .strip_prefix("put_document:catalog:")
-            .expect("default request_id must use the put_document:{collection}: prefix");
-        uuid::Uuid::parse_str(uuid_part).expect("suffix after the prefix must be a uuid");
-        assert_ne!(
-            first, second,
-            "each call without an explicit request_id must get its own generated id"
+    #[tokio::test]
+    async fn client_debug_names_the_host_and_whether_auth_is_enabled() {
+        // `lazy_test_client()` needs a tokio runtime just to build its
+        // (never-dialed) channel, hence `#[tokio::test]`.
+        let client = lazy_test_client();
+        let debug_output = format!("{client:?}");
+        assert!(
+            debug_output.contains("http://127.0.0.1:1"),
+            "Debug must name the host the client was built for, got: {debug_output}"
         );
-    }
-
-    // `upload_file_chunked`'s pre-flight validation (file size, checksum
-    // length) must run — and fail — before the method ever touches the
-    // network, so these tests run against a client wired to an unreachable
-    // host and must still return promptly.
-
-    #[tokio::test]
-    async fn upload_file_chunked_rejects_an_oversized_file_before_any_network_call() {
-        let client = lazy_test_client();
-        let oversized = 5u64 * 1024 * 1024 * 1024 + 1; // 5 GiB + 1 byte
-        let result = client
-            .upload_file_chunked(
-                "tenant",
-                "bucket",
-                "file",
-                oversized,
-                vec![0u8; 32],
-                stream::empty::<Vec<u8>>(),
-                FileStreamUploadOptions::default(),
-            )
-            .await;
-        let error = result.expect_err("a file over the 5 GiB limit must be rejected");
-        assert!(matches!(error, RociaDbError::Validation(_)));
-        assert!(error.to_string().contains("5 GiB"));
-    }
-
-    #[tokio::test]
-    async fn upload_file_chunked_rejects_a_wrong_length_checksum_before_any_network_call() {
-        let client = lazy_test_client();
-        let result = client
-            .upload_file_chunked(
-                "tenant",
-                "bucket",
-                "file",
-                0,
-                vec![0u8; 10], // must be exactly 32 bytes (sha256)
-                stream::empty::<Vec<u8>>(),
-                FileStreamUploadOptions::default(),
-            )
-            .await;
-        let error = result.expect_err("a checksum that is not 32 bytes must be rejected");
-        assert!(matches!(error, RociaDbError::Validation(_)));
-        assert!(error.to_string().contains("32 bytes"));
+        assert!(
+            debug_output.contains("auth_enabled: false"),
+            "Debug must report whether auth is enabled, got: {debug_output}"
+        );
+        // Nothing credential-shaped may leak: the interceptor holds a live
+        // bearer token and the token manager its client secret, so neither
+        // the service clients nor the token manager may be printed.
+        assert!(
+            !debug_output.contains("BearerInterceptor"),
+            "Debug must not print the interceptor holding the bearer token, got: {debug_output}"
+        );
+        assert!(
+            !debug_output.contains("TokenManager"),
+            "Debug must not print the token manager, got: {debug_output}"
+        );
     }
 
     #[tokio::test]
