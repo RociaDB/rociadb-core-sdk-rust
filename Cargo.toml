@@ -22,8 +22,11 @@ rust-version = "1.88"
 # Repository-only files that a consumer of the published crate has no use for.
 # Everything the build needs — `build.rs` and `proto/` — must stay in the
 # package; the Google well-known types are not vendored, `protox` supplies them
-# (see `build.rs`). `CHANGELOG.md` deliberately stays in the package: it is the
-# one repository document a consumer reads when upgrading.
+# (see `build.rs`). Two more directories deliberately stay in the package and
+# must never be added here: `CHANGELOG.md`, the one repository document a
+# consumer reads when upgrading, and `docs/`, the guides `README.md` links to —
+# which `src/lib.rs` also `include_str!`s as doctests, so dropping them would
+# make `cargo test` fail on an unpacked `.crate`.
 exclude = [".github", "AGENTS.md", "deny.toml", "mise.toml"]
 
 [dependencies]

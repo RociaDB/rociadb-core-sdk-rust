@@ -228,8 +228,8 @@ async fn writes_through_an_arc(client: Arc<RociaDbClient>) -> Result<()> {
 }
 
 // Every write takes its options struct, built with `new()` plus chainable
-// `with_*` setters — the replacement for the 1.0 `_with_request_id` and
-// `_with_node_binding` siblings.
+// `with_*` setters — the replacement for what were formerly, in 1.0, the
+// `_with_request_id` and `_with_node_binding` sibling methods.
 #[allow(dead_code)]
 async fn option_structs_carry_what_the_extra_methods_used_to(
     client: Arc<RociaDbClient>,

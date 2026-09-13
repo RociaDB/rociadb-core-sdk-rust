@@ -391,14 +391,22 @@ impl RociaDbError {
     /// [`get_node`](crate::RociaDbClient::get_node),
     /// [`get_edge`](crate::RociaDbClient::get_edge),
     /// [`stat_file`](crate::RociaDbClient::stat_file),
-    /// [`download_file`](crate::RociaDbClient::download_file) — and so can a
-    /// delete of something already gone. It is an expected outcome to branch
-    /// on rather than an error to propagate blindly: "absent" is usually a
-    /// value in the caller's domain (`Option::None`), not a failure. Unlike
-    /// [`Self::is_aborted`], retrying the same call changes nothing.
+    /// [`download_file`](crate::RociaDbClient::download_file) — and so can
+    /// [`add_edge`](crate::RociaDbClient::add_edge) (and
+    /// [`add_edges`](crate::RociaDbClient::add_edges)) when the edge's `from`
+    /// or `to` node does not already exist. It is an expected outcome to
+    /// branch on rather than an error to propagate blindly: "absent" is
+    /// usually a value in the caller's domain (`Option::None`), not a
+    /// failure. Unlike [`Self::is_aborted`], retrying the same call changes
+    /// nothing.
     ///
-    /// A paginated listing never reports this for an empty collection,
-    /// graph or bucket: it returns an empty page instead.
+    /// Two kinds of call never report it. A paginated listing returns an
+    /// empty page for an empty (or unknown) collection, graph or bucket
+    /// rather than this status; and the deletes are idempotent, so
+    /// [`delete_document`](crate::RociaDbClient::delete_document),
+    /// [`delete_edge`](crate::RociaDbClient::delete_edge) and
+    /// [`delete_file`](crate::RociaDbClient::delete_file) succeed on
+    /// something already gone instead of reporting it missing.
     pub fn is_not_found(&self) -> bool {
         self.code() == Some(tonic::Code::NotFound)
     }

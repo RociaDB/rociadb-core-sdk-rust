@@ -7,22 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.0.0] - Unreleased
 
+A breaking release. The public API is restructured around one method per
+operation; authentication, transport and resilience gain the controls a
+production deployment needs; the build no longer requires `protoc`; and the
+documentation is rewritten and compiled as doctests. Nothing is deprecated —
+the 1.0 names are gone, and the table below maps every one of them.
+
 ### Breaking
 
-- **Minimum supported Rust version is 1.88**, stated in `Cargo.toml` as
-  `rust-version` and checked in CI against the committed `Cargo.lock`. The
-  floor comes from the dependency graph (tonic, tonic-prost and
-  tonic-prost-build 0.14.6 all declare 1.88), not from `edition = "2024"`.
-- `tokio` is now depended on with only the features the library itself needs
-  (`rt`, `sync`, `time`, `macros`). `rt-multi-thread` moved to
-  `[dev-dependencies]`. A consumer that relied on this crate enabling
-  `rt-multi-thread` for them — through Cargo's feature unification — must now
-  enable it on their own `tokio` dependency.
-- **The public API is restructured around one method per operation.** Optional
-  per-call parameters now travel in an options or input struct passed last,
-  replacing the `_with_request_id` / `_with_node_binding` / `_as` sibling
-  methods. Nothing is deprecated: the 1.0 names are gone. Pagination keeps its
-  positional `limit: Option<u32>, cursor: Option<&str>` convention, and
+- **The public API is restructured around one method per operation.**
+  Optional per-call parameters now travel in an options or input struct
+  passed last, replacing the `_with_request_id` / `_with_node_binding` /
+  `_as` sibling methods. Pagination keeps its positional
+  `limit: Option<u32>, cursor: Option<&str>` convention, and
   `tenant_id: &str` stays the first argument of every tenant-scoped call.
 
   | 1.0 | 2.0 |
@@ -54,34 +51,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `upload_file_chunked(t, b, f, size_bytes, checksum, chunks, opts)` | `upload_file_chunked(t, b, f, chunks, FileStreamUploadOptions::new(size_bytes, checksum))` |
   | `delete_file(t, b, f)` | `delete_file(t, b, f, WriteOptions::new())` |
   | `delete_file_with_request_id(t, b, f, rid)` | `delete_file(t, b, f, WriteOptions::new().with_request_id(rid))` |
-  | `FileUploadOptions { checksum: Option<Vec<u8>> }` | `FileUploadOptions { checksum: Option<[u8; 32]> }`, or `.with_checksum([u8; 32])` |
+  | `FileUploadOptions { checksum: Option<Vec<u8>>, .. }` | `FileUploadOptions::new().with_checksum([u8; 32])` |
   | `FileStreamUploadOptions::default()` | `FileStreamUploadOptions::new(size_bytes, checksum)` — no `Default`, since neither of those two fields has a sensible one |
   | `NeighborPage` | `Page<Neighbor>` |
   | `rociadb_sdk::file::*`, `rociadb_sdk::graph::*` | `rociadb_sdk::*` (`file` and `graph` are private; `auth` is the only public module) |
   | `builder.host(..)` and the other setters: `&mut self -> &mut Self` | `self -> Self`: `RociaDbBuilder::new().host(..).disable_auth().build().await?`, and `let b = RociaDbBuilder::new().host(..);` now compiles |
 
-- **A checksum is `[u8; 32]`, not `Vec<u8>`.** `FileUploadOptions::checksum` is
-  `Option<[u8; 32]>` and `FileStreamUploadOptions::checksum` is `[u8; 32]`, so
-  the length is checked by the compiler and the runtime
-  "checksum must be exactly 32 bytes" `Validation` error is gone. The SHA-256
-  digest is still computed for you when `FileUploadOptions::checksum` is
-  `None`. Callers holding a `Vec<u8>` convert with
+- **`FileUploadOptions` and `FileStreamUploadOptions` are now
+  `#[non_exhaustive]`.** In 1.0 both were plain structs assembled with a
+  literal and `..Default::default()`; that no longer compiles from outside
+  the crate. Build them with `new()` plus the chainable `with_*` setters
+  instead. Their fields stay `pub` for reading, and both now derive
+  `PartialEq + Eq`. Every other option, input and page type was already
+  `#[non_exhaustive]` in 1.0.
+- **A checksum is `[u8; 32]`, not `Vec<u8>`.** `FileUploadOptions::checksum`
+  is `Option<[u8; 32]>` and `FileStreamUploadOptions::checksum` is
+  `[u8; 32]`, so the length is checked by the compiler and the runtime
+  "checksum must be exactly 32 bytes" `Validation` error is gone. The
+  SHA-256 digest is still computed for you when `FileUploadOptions::checksum`
+  is `None`. Callers holding a `Vec<u8>` convert with
   `<[u8; 32]>::try_from(v.as_slice())`.
-- **`add_edge` now defaults its `request_id` to `add_edge:<uuid>`** instead of
-  a bare UUID with no prefix — on the single-item and batch paths alike. It was
-  the only write whose generated key carried no operation prefix. A caller that
-  parsed those keys, or replayed one recorded from 1.0, sees a different shape;
-  the server's dedup scope already includes the operation, so nothing about
-  deduplication changes.
+- **`add_edge` now defaults its `request_id` to `add_edge:<uuid>`** instead
+  of a bare UUID with no prefix — on the single-item and batch paths alike.
+  It was the only write whose generated key carried no operation prefix. A
+  caller that parsed those keys, or replayed one recorded from 1.0, sees a
+  different shape; the server's dedup scope already includes the operation,
+  so nothing about deduplication changes.
 - **Logging levels changed.** The SDK no longer emits `info!` on routine
   success or `error!` on routine failure: a library hands the error back and
   lets the caller decide how to log it. Every RPC now emits exactly one
   `debug!` line with its identifying fields (tenant, collection/graph/bucket,
-  ids, counts) and no payloads. The `warn!` lines are `disable_auth()`, a
-  non-`https` token URL, a failed background token refresh, a token response
-  with no `expires_in`, and a token refresh that failed after an
-  `UNAUTHENTICATED` response. A deployment that relied on the `info!`/`error!`
-  lines must lower its filter for this crate's target to `debug`.
+  ids, counts) and no payloads. The five remaining `warn!` lines are
+  `disable_auth()`, a non-`https` token URL, a failed background token
+  refresh, a token response with no `expires_in`, and a token refresh that
+  failed after an `UNAUTHENTICATED` response. A deployment that relied on the
+  `info!`/`error!` lines must lower its filter for this crate's target to
+  `debug`.
 - **Secrets are `secrecy::SecretString`, not `String`.** The OAuth2 client
   secret and the bearer token are redacted by every formatter and zeroized
   when dropped, which changes three signatures in `auth`:
@@ -122,39 +127,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on `Connection { .. }` for a configuration mistake must match
   `Config { .. }` instead — the enum is `#[non_exhaustive]`, so a wildcard
   arm keeps compiling either way.
+- `tokio` is now depended on with only the features the library itself needs
+  (`rt`, `sync`, `time`, `macros`); 1.0 asked for `rt-multi-thread`, which
+  moved to `[dev-dependencies]`. A consumer that relied on this crate
+  enabling `rt-multi-thread` for them — through Cargo's feature unification —
+  must now enable it on their own `tokio` dependency.
 
 ### Added
 
-- English documentation on the generated types re-exported at the crate root
-  (`CollectionInfo`, `StatResponse`, `Neighbor`, `UploadRequest`,
-  `DownloadResponse`) and on each of their fields, describing the wire
-  semantics. It is attached by the build script, so it is regenerated with the
-  code rather than drifting from it.
-- `#![forbid(unsafe_code)]` and `#![warn(missing_docs)]` on the crate, and doc
-  comments on every public item the latter reported — the fields of `Page`,
-  `DocumentPage`, `NodeBinding`, `DocumentQueryFilter`, `DocumentQuerySort`,
-  `NodeInput`, `EdgeInput`, `Edge`, `NeighborNode`,
-  `FileUploadOptions`, `FileStreamUploadOptions`, `TokenResponse` and the
-  `RociaDbError` variants, plus the variants of `DocumentQueryOperator` and
-  `DocumentQuerySortDirection`.
 - `WriteOptions` (`request_id`) and `DocumentWriteOptions` (`request_id`,
   `node_binding`): the per-call options every write now takes. Both are
-  `#[non_exhaustive]`, `Debug + Clone + Default + PartialEq + Eq`, with `new()`
-  and chainable `with_*` setters. `WriteOptions`' documentation is the single
-  place where the generated idempotency key of *every* write is stated, and
-  every write links to it.
+  `#[non_exhaustive]`, `Debug + Clone + Default + PartialEq + Eq`, with
+  `new()` and chainable `with_*` setters. `WriteOptions`' documentation is
+  the single place where the generated idempotency key of *every* write is
+  stated, and every write links to it.
 - `FileUploadOptions::new`, `with_content_type`, `with_checksum`,
   `with_request_id`, and `FileStreamUploadOptions::new(size_bytes, checksum)`,
-  `with_content_type`, `with_request_id`. Both structs are now
-  `#[non_exhaustive]` and derive `PartialEq + Eq`.
-- `impl Debug for RociaDbClient`, reporting the host the client was built for
-  and whether auth is enabled — never a token, a client id, or a secret.
-- `.github/workflows/ci.yml`: formatting, Clippy, tests, a documentation build
-  with `RUSTDOCFLAGS="-D warnings"`, an MSRV job on Rust 1.88, and a
-  `cargo deny` job.
-- `deny.toml`: RustSec advisories, a permissive-only licence allow-list,
-  duplicate and wildcard bans as warnings, and crates.io as the only allowed
-  source.
+  `with_content_type`, `with_request_id`.
 - `RociaDbBuilder::request_timeout(Duration)`: a deadline for every unary
   RPC. Opt-in, with no default. Each attempt both carries a `grpc-timeout`
   header (so the server can abandon the work) and is wrapped in a
@@ -210,30 +199,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RociaDbClient::neighbor_nodes_in<T>`:
   `(tenant_id, graph, node_id, label, limit, cursor) -> Result<Page<NeighborNode<T>>>`.
   One `neighbors_*` page, then the node payload of each neighbor *on that
-  page* fetched concurrently (at most `CONCURRENT_REQUESTS` = 10 in flight,
-  order preserved) and decoded into `T`. The work is bounded by `limit`
-  rather than by the node's degree, and the cursor is the one
-  `neighbors_out` / `neighbors_in` issued, with the same scoping rules.
-  `get_outgoing_neighbor_nodes` / `get_incoming_neighbor_nodes` keep their
-  all-pages behaviour, now documented as unbounded with a pointer here, and
-  both shapes share one fan-out helper.
-- An integration test suite (`tests/documents.rs`, `tests/graph.rs`,
-  `tests/files.rs`, `tests/auth.rs`, `tests/resilience.rs`, on a shared
-  `tests/support/`) that runs the real client path — builder, channel, bearer
-  interceptor, generated client, the unary helper, JSON decoding — against an
-  in-process tonic server implementing all four services and a mock OAuth2
-  identity provider served by hyper. Both bind `127.0.0.1:0`, so the suite is
-  loopback-only, parallel-safe and needs nothing installed; the server
-  reproduces the parts of the contract the SDK depends on (cursor pagination,
-  `total_count`, the `(from, label, to)` edge uniqueness rule, idempotent
-  deletes, the 1 MiB upload chunk cap, a checksum length check that never
-  looks at the bytes, and the `reason` trailing metadata on every error) and
-  offers scripted per-RPC failures, per-RPC delays and a recorder of every
-  request and its `authorization` header.
+  page* fetched concurrently (at most 10 in flight, order preserved) and
+  decoded into `T`. The work is bounded by `limit` rather than by the node's
+  degree, and the cursor is the one `neighbors_out` / `neighbors_in` issued,
+  with the same scoping rules. `get_outgoing_neighbor_nodes` /
+  `get_incoming_neighbor_nodes` keep their all-pages behaviour, now
+  documented as unbounded with a pointer here, and both shapes share one
+  fan-out helper.
+- `impl Debug for RociaDbClient`, reporting the host the client was built for
+  and whether auth is enabled — never a token, a client id, or a secret.
 - Crate-root re-exports so configuring the SDK needs no extra direct
   dependency: `Channel` and `ClientTlsConfig` (from `tonic`), `SecretString`
   and `ExposeSecret` (from `secrecy`). The same stability caveat as
   `Streaming` applies.
+- `#![forbid(unsafe_code)]` and `#![warn(missing_docs)]` on the crate, and doc
+  comments on every public item the latter reported — the fields of `Page`,
+  `DocumentPage`, `NodeBinding`, `DocumentQueryFilter`, `DocumentQuerySort`,
+  `NodeInput`, `EdgeInput`, `Edge`, `NeighborNode`, `FileUploadOptions`,
+  `FileStreamUploadOptions`, `TokenResponse` and the `RociaDbError` variants,
+  plus the variants of `DocumentQueryOperator` and
+  `DocumentQuerySortDirection`.
+- English documentation on the generated types re-exported at the crate root
+  (`CollectionInfo`, `StatResponse`, `Neighbor`, `UploadRequest`,
+  `DownloadResponse`) and on each of their fields, describing the wire
+  semantics. It is attached by the build script, so it is regenerated with
+  the code rather than drifting from it.
+- A `docs/` directory of guides — authentication, errors and retries,
+  documents, graph, files, pagination, tenancy and authorization, transport
+  and TLS, and parity with the TypeScript SDK — carrying the reference
+  material the 1.0 README held in one 1 159-line file. `docs/` ships in the
+  published package, and the crate documentation lists the guides by path.
+- Every code example in `README.md` and in `docs/` is compiled by
+  `cargo test`, through `#[cfg(doctest)] #[doc = include_str!(..)]` items in
+  `src/lib.rs`. An example that stops matching the API now fails the build
+  instead of misleading a reader.
+- An integration test suite (`tests/documents.rs`, `tests/graph.rs`,
+  `tests/files.rs`, `tests/auth.rs`, `tests/resilience.rs`,
+  `tests/shared_client.rs`, on a shared `tests/support/`) that runs the real
+  client path — builder, channel, bearer interceptor, generated client, the
+  unary helper, JSON decoding — against an in-process tonic server
+  implementing all four services and a mock OAuth2 identity provider served
+  by hyper. Both bind `127.0.0.1:0`, so the suite is loopback-only,
+  parallel-safe and needs nothing installed; the server reproduces the parts
+  of the contract the SDK depends on (cursor pagination, `total_count`, the
+  `(from, label, to)` edge uniqueness rule, idempotent deletes, the 1 MiB
+  upload chunk cap, a checksum length check that never looks at the bytes,
+  and the `reason` trailing metadata on every error) and offers scripted
+  per-RPC failures, per-RPC delays and a recorder of every request and its
+  `authorization` header.
+- `.github/workflows/ci.yml`: formatting, Clippy, tests, a documentation
+  build with `RUSTDOCFLAGS="-D warnings"`, an MSRV job on Rust 1.88, and a
+  `cargo deny` job.
+- `deny.toml`: RustSec advisories, a permissive-only licence allow-list,
+  duplicate and wildcard bans as warnings, and crates.io as the only allowed
+  source.
 - `secrecy` 0.10 as a dependency (MSRV 1.60, dual Apache-2.0/MIT, one
   transitive crate — `zeroize`, already in the graph via rustls).
 - This changelog.
@@ -250,16 +269,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The vendored well-known-type `.proto` files under `proto/google/` were
   deleted; `protox` supplies them. `proto/upstream/v1/upstream.proto` is
   unchanged and still mirrors the server repository byte for byte.
-- `Cargo.toml`'s `exclude` list now also drops `.github`, `deny.toml` and
-  `mise.toml` from the published package. `CHANGELOG.md` is deliberately
-  included.
 - **Module layout.** Each service's RPCs and types live with each other:
   documents in `document.rs`, graph in `graph.rs`, files in `file.rs`, tenants
-  in `tenant.rs`. `lib.rs` keeps only the crate documentation, the builder, the
-  client (with its auth methods), `Page`, `WriteOptions` and the private
-  helpers the modules share. Everything public is re-exported at the crate
-  root, so the namespace is flat and `auth` is the only public module — the
-  paths `rociadb_sdk::file::..` and `rociadb_sdk::graph::..` no longer exist.
+  in `tenant.rs`, retries in `retry.rs`. `lib.rs` keeps only the crate
+  documentation, the builder, the client (with its auth methods), `Page`,
+  `WriteOptions` and the private helpers the modules share. Everything public
+  is re-exported at the crate root, so the namespace is flat and `auth` is the
+  only public module — the paths `rociadb_sdk::file::..` and
+  `rociadb_sdk::graph::..` no longer exist.
 - Every unary RPC now goes through one private helper on the client, which
   wraps the request, applies the per-call deadline, refreshes and retries once
   on `UNAUTHENTICATED`, and maps a failed `tonic::Status` — so none of that is
@@ -278,12 +295,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FileDescriptorSet` is cloned between the two passes. A consumer pays a few
   tens of milliseconds inside a build script that measures around 150 ms in
   total, and compiles none of the second pass's output.
+- `README.md` is rewritten for the 2.0 API and cut from 1 159 lines to a
+  quick start plus the conventions that apply everywhere; the reference
+  material moved to `docs/`.
+- The minimum supported Rust version is **unchanged at 1.88** — 1.0.0 already
+  declared it. The `rust-version` field now carries a comment recording which
+  dependencies pin the floor (tonic, tonic-prost and tonic-prost-build all
+  declare 1.88; the `icu_*` crates reached through reqwest declare 1.86), and
+  CI checks it against the committed `Cargo.lock`.
+- `Cargo.toml`'s `exclude` list now also drops `.github`, `deny.toml` and
+  `mise.toml` from the published package. `CHANGELOG.md` and `docs/` are
+  deliberately included.
 - New development dependencies, all of them crates the graph already carried
   (only features and five small crates — `axum`, `axum-core`, `matchit`,
   `mime`, `httpdate` — are added to `Cargo.lock`, and nothing changes for a
   consumer building the library): `tonic` with `server` + `router`, `hyper`
   with `http1` + `server`, `hyper-util` with `tokio`, `http-body-util`, and
-  `net` on `tokio`.
+  `net` + `test-util` + `rt-multi-thread` on `tokio`.
 
 ### Removed
 
@@ -298,11 +326,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `delete_file_with_request_id`.
 - The `NeighborPage` type, replaced by `Page<Neighbor>`.
 - The `pbjson-types` dependency, which existed only to name
-  `google.protobuf.Empty`. It pulled `pbjson`, `chrono`, `num-traits` and
-  `autocfg` into every consumer's build; `cargo tree -e normal` goes from 166
-  entries to 162.
+  `google.protobuf.Empty`, and the `pbjson`, `chrono` and `num-traits` crates
+  it pulled into every consumer's build with it. Across the whole of 2.0,
+  `cargo tree -e normal` goes from 166 crates to 163: those four out,
+  `secrecy` in.
 - The `mise.toml` `protoc` tool entry, and every `PROTOC=` instruction in the
   crate documentation, `AGENTS.md` and `README.md`.
+- The crate-wide `#![allow(clippy::doc_lazy_continuation)]`; the
+  documentation it silenced was reflowed instead.
 
 ### Fixed
 

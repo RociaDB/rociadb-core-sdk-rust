@@ -115,7 +115,9 @@
 //!   load-balanced list — and still does all of the auth work above.
 //! - [`RetryPolicy`] and [`RociaDbClient::retry`] replay a call while it
 //!   fails with `ABORTED`, the one status the server expects callers to
-//!   retry (see [`RociaDbError::is_aborted`]).
+//!   retry (see [`RociaDbError::is_aborted`]) — and with `UNAVAILABLE` too
+//!   when [`with_retry_unavailable`](RetryPolicy::with_retry_unavailable)
+//!   asks for it.
 //!
 //! # Building
 //!
@@ -125,6 +127,34 @@
 //! so there is no `protoc` binary to install and no `PROTOC` environment
 //! variable to set — on a developer machine, in CI, or on docs.rs. The
 //! Google well-known types the API imports come from `protox` itself.
+//!
+//! # Guides
+//!
+//! The deep dives live in the repository, next to the code, and every
+//! example in them is compiled as a doctest. rustdoc cannot render them as
+//! pages of this documentation, so they are listed here by path — read them
+//! on
+//! [GitHub](https://github.com/RociaDB/rociadb-core-sdk-rust/tree/main/docs)
+//! or in a checkout:
+//!
+//! - `docs/authentication.md` — token lifetime, the background refresh and
+//!   its backoff, refresh-and-retry on `UNAUTHENTICATED`, the `auth` module.
+//! - `docs/errors-and-retries.md` — every [`RociaDbError`] variant, the
+//!   predicates, `ABORTED`, and [`RetryPolicy`].
+//! - `docs/documents.md` — writes, reads, listings, queries, and what
+//!   `total_count` costs.
+//! - `docs/graph.md` — nodes, edges, the `(from, label, to)` uniqueness
+//!   rule, batches, and neighbor traversal.
+//! - `docs/files.md` — the upload wire contract, the three upload tiers, and
+//!   verified downloads.
+//! - `docs/pagination.md` — limits, cursors, and the one correct stop
+//!   condition.
+//! - `docs/tenancy.md` — what `tenant_id` is and is not, the token scopes,
+//!   and the tenant registry.
+//! - `docs/transport.md` — where TLS terminates, the timeouts, and bringing
+//!   your own [`Channel`].
+//! - `docs/typescript-parity.md` — the names and shapes that do not
+//!   translate mechanically to the TypeScript SDK.
 //!
 //! # Example project
 //!
@@ -143,10 +173,11 @@
 //!
 //! # Stability
 //!
-//! The public API follows semantic versioning, with one documented
-//! exception: the internal `pb` module holds code generated from the
-//! `.proto` files by prost and tonic, and is not covered by that promise. A
-//! routine prost or tonic upgrade can reshape those generated types without
+//! The public API follows semantic versioning from 2.0.0 onward, with one
+//! documented exception: the internal `pb` module holds code generated from
+//! the `.proto` files by prost and tonic, and is not covered by that
+//! promise. A routine prost or tonic upgrade can reshape those generated
+//! types without
 //! this SDK's own API changing. Five of them — [`CollectionInfo`],
 //! [`StatResponse`], [`Neighbor`], [`UploadRequest`] and
 //! [`DownloadResponse`] — appear in public signatures and are re-exported at
@@ -160,6 +191,46 @@
 //! of either crate can reshape them without this SDK's own API changing.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+/// Compiles every Rust example in `README.md` as a doctest, so a code block
+/// that stops matching the API fails `cargo test` instead of misleading a
+/// reader.
+///
+/// The file is attached as documentation on a private, `cfg(doctest)`-only
+/// item: rustdoc collects the code blocks when running doctests and the item
+/// does not exist in any other build, so nothing about the public API
+/// changes. Consequence to keep in mind when editing the file: rustdoc treats
+/// an **untagged** fence as Rust, so every non-Rust block must carry its
+/// language (` ```toml `, ` ```bash `, ` ```text `), and every Rust block that
+/// would talk to a server is ` ```rust,no_run `.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
+/// The guides under `docs/`, compiled as doctests on the same terms as
+/// [`ReadmeDoctests`]. One item per file so a failure names the guide it came
+/// from.
+#[cfg(doctest)]
+mod guide_doctests {
+    #[doc = include_str!("../docs/authentication.md")]
+    struct Authentication;
+    #[doc = include_str!("../docs/errors-and-retries.md")]
+    struct ErrorsAndRetries;
+    #[doc = include_str!("../docs/documents.md")]
+    struct Documents;
+    #[doc = include_str!("../docs/graph.md")]
+    struct Graph;
+    #[doc = include_str!("../docs/files.md")]
+    struct Files;
+    #[doc = include_str!("../docs/pagination.md")]
+    struct Pagination;
+    #[doc = include_str!("../docs/tenancy.md")]
+    struct Tenancy;
+    #[doc = include_str!("../docs/transport.md")]
+    struct Transport;
+    #[doc = include_str!("../docs/typescript-parity.md")]
+    struct TypeScriptParity;
+}
 
 pub mod auth;
 mod document;
