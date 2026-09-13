@@ -10,20 +10,21 @@ The Node.js/TypeScript SDK has moved to its own sibling repository
 
 ## Build, Test, and Development Commands
 
-- `mise install` installs the pinned Rust toolchain and protobuf compiler.
+- `mise install` installs the pinned Rust toolchain.
 - `cargo build` compiles the SDK and regenerates gRPC bindings when proto inputs change.
 - `cargo test` runs unit, integration, and documentation tests.
 - `cargo fmt --all -- --check` verifies standard Rust formatting; run `cargo fmt --all` to apply it.
 - `cargo clippy --all-targets --all-features -- -D warnings` treats lint warnings as failures.
-- `cargo doc --no-deps` checks and builds API documentation locally.
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` checks and builds API documentation locally.
+- `cargo deny check` runs the advisory, licence, ban, and source policy in `deny.toml`.
 
-If `PROTOC` is not already set to a real `protoc` binary (as it is after `mise install`), prefix the above with `PROTOC=/path/to/protoc`.
+No system dependency is needed to build: `build.rs` compiles `proto/upstream/v1/upstream.proto` with `protox`, a pure-Rust protobuf compiler, so there is no `protoc` binary to install and no `PROTOC` environment variable to set. `protox` also supplies the Google well-known types, which is why none are vendored under `proto/`.
 
-Run formatting, Clippy, and tests before submitting changes.
+Run formatting, Clippy, tests, and the documentation build before submitting changes; `.github/workflows/ci.yml` runs the same set plus an MSRV check and `cargo deny`.
 
 ## Coding Style & Naming Conventions
 
-Use rustfmt defaults and idiomatic Rust naming. Public methods return `rociadb_sdk::Result<T>` (an alias for `std::result::Result<T, RociaDbError>`, defined in `src/error.rs`) rather than `anyhow::Result` — extend the existing `RociaDbError` variants (or add a new one) for a new fallible case instead of reaching for `anyhow`, and avoid panics or unchecked casts in public paths. Write Rust documentation and comments in English only — do not introduce French text or `EN:`/`FR:` prefixes. Do not edit generated output. Protobuf changes must originate in canonical `proto/` here and be mirrored byte-for-byte into the sibling [`rociadb-core-sdk-ts`](https://github.com/RociaDB/rociadb-core-sdk-ts) repository's own copy — that repository uses TypeScript strict mode, two-space indentation, `camelCase` values, and `PascalCase` types, but none of its files live in this checkout.
+The crate sets `#![forbid(unsafe_code)]` and `#![warn(missing_docs)]`, so every new public item — struct fields and enum variants included — needs a short English doc comment. Use rustfmt defaults and idiomatic Rust naming. Public methods return `rociadb_sdk::Result<T>` (an alias for `std::result::Result<T, RociaDbError>`, defined in `src/error.rs`) rather than `anyhow::Result` — extend the existing `RociaDbError` variants (or add a new one) for a new fallible case instead of reaching for `anyhow`, and avoid panics or unchecked casts in public paths. Write Rust documentation and comments in English only — do not introduce French text or `EN:`/`FR:` prefixes. Do not edit generated output. Protobuf changes must originate in canonical `proto/` here and be mirrored byte-for-byte into the sibling [`rociadb-core-sdk-ts`](https://github.com/RociaDB/rociadb-core-sdk-ts) repository's own copy — that repository uses TypeScript strict mode, two-space indentation, `camelCase` values, and `PascalCase` types, but none of its files live in this checkout.
 
 ## Testing Guidelines
 

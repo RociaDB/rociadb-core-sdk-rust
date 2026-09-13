@@ -44,14 +44,12 @@ messages.
 rociadb-sdk = "1.0"
 ```
 
-Building the crate runs a build script that compiles the bundled
-`.proto` files, so **`protoc` must be available** on any machine that
-compiles it — including CI. Install it from your package manager
-(`apt install protobuf-compiler`, `brew install protobuf`) or from the
-[protobuf releases](https://github.com/protocolbuffers/protobuf/releases),
-and make sure it is on `PATH` or pointed at by the `PROTOC` environment
-variable. No other system dependency is required: the Google well-known
-types the API uses are vendored under `proto/google/protobuf/`.
+Building the crate runs a build script that compiles the bundled `.proto`
+with [`protox`](https://docs.rs/protox), a pure-Rust protobuf compiler, so
+**no system dependency is required** — there is no `protoc` binary to
+install and no `PROTOC` environment variable to set, on a developer machine,
+in CI, or on docs.rs. The Google well-known types the API imports come from
+`protox` itself.
 
 This is a standalone crate, not a workspace member: there is no
 `crates/rociadb-sdk` path inside it. To work against an unreleased change,
@@ -1139,16 +1137,15 @@ capability).
 ## Development
 
 ```bash
-PROTOC=/usr/bin/protoc cargo build
-PROTOC=/usr/bin/protoc cargo fmt --all -- --check
-PROTOC=/usr/bin/protoc cargo clippy --all-targets --all-features -- -D warnings
-PROTOC=/usr/bin/protoc cargo test
+cargo build
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
-`PROTOC` only needs to point at a real `protoc` binary; `mise install`
-(see `mise.toml`) installs a pinned one for you at
-`~/.local/share/mise/installs/protoc/35.0/bin/protoc`, in which case the
-`PROTOC=` prefix above is not needed.
+Nothing beyond a Rust toolchain is needed; `mise install` (see `mise.toml`)
+installs the pinned one.
 
 Add focused unit tests in `#[cfg(test)] mod tests` next to the code they
 cover, and public API scenarios under `tests/`; keep tests deterministic

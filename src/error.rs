@@ -38,6 +38,8 @@ pub enum RociaDbError {
         /// Short description of the failed operation (for example
         /// `"failed to upsert document"`).
         operation: &'static str,
+        /// The status the server returned, complete with its code, message
+        /// and trailing metadata.
         #[source]
         status: tonic::Status,
     },
@@ -57,7 +59,10 @@ pub enum RociaDbError {
     /// to match on the cause's concrete type rather than read it.
     #[error("{message}{}", source_suffix(.source))]
     Connection {
+        /// Description of what could not be connected to or configured.
         message: String,
+        /// The underlying cause, when the failure came from I/O or TLS
+        /// rather than from a pure configuration check.
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
@@ -70,7 +75,9 @@ pub enum RociaDbError {
     /// [`RociaDbError`] into the same fixed string.
     #[error("{message}{}", source_suffix(.source))]
     Auth {
+        /// Description of which step of token acquisition or refresh failed.
         message: String,
+        /// The underlying cause, when there is one.
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
@@ -78,7 +85,10 @@ pub enum RociaDbError {
     /// Failed to encode a value as JSON before sending it upstream.
     #[error("failed to encode {context}: {source}")]
     Encode {
+        /// Name of the value that could not be encoded (for example
+        /// `"node json"`).
         context: &'static str,
+        /// The serialization error `serde_json` reported.
         #[source]
         source: serde_json::Error,
     },
@@ -86,7 +96,12 @@ pub enum RociaDbError {
     /// Failed to decode a JSON payload received from upstream.
     #[error("failed to decode {context}: {source}")]
     Decode {
+        /// Name of the payload that could not be decoded (for example
+        /// `"document json"`).
         context: &'static str,
+        /// The deserialization error `serde_json` reported. For a page of
+        /// documents its message leads with `"item <index>: "`, naming the
+        /// zero-based position of the offending item within the page.
         #[source]
         source: serde_json::Error,
     },

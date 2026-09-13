@@ -14,6 +14,12 @@
 //! [`crate::Neighbor`], [`crate::UploadRequest`], and
 //! [`crate::DownloadResponse`]. Depend on those re-exports, not on paths
 //! reaching into `pb` directly.
+//!
+//! The crate-wide `missing_docs` lint is switched off for everything below:
+//! the generated code documents only what the build script attaches to it (the
+//! five re-exported types and their fields), and the rest is internal.
+#![allow(missing_docs)]
+
 pub mod upstream {
     /// Generated code for the rocia.v1 API.
     pub mod v1 {

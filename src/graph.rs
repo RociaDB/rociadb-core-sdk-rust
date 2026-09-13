@@ -17,7 +17,10 @@ use uuid::Uuid;
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NeighborPage {
+    /// The neighbors on this page, in the order the server returned them.
     pub neighbors: Vec<Neighbor>,
+    /// Cursor to pass back to fetch the page after this one, or `None` when
+    /// this is the last page.
     pub next_cursor: Option<String>,
 }
 
@@ -25,8 +28,11 @@ pub struct NeighborPage {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct NeighborNode<T> {
+    /// Id of the edge that reaches the node.
     pub edge_id: String,
+    /// Id of the neighboring node.
     pub node_id: String,
+    /// The node's own properties, decoded into `T`.
     pub value: T,
 }
 
@@ -46,10 +52,17 @@ pub struct NeighborNode<T> {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Edge<T> {
+    /// Id of the edge, echoed from the argument the read was made with.
     pub edge_id: String,
+    /// Id of the node the edge starts from.
     pub from: String,
+    /// Id of the node the edge points to.
     pub to: String,
+    /// Type of relation the edge carries.
     pub label: String,
+    /// The edge's own properties, decoded into `T`. Their JSON form is
+    /// normalized on write (object keys sorted, whitespace removed), so what
+    /// comes back is the JSON that was stored, not the original bytes.
     pub value: T,
 }
 

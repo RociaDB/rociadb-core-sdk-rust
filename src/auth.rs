@@ -1,5 +1,4 @@
 //! Auth helpers for bearer tokens and API keys.
-#![allow(clippy::doc_lazy_continuation)]
 
 use crate::Result;
 use crate::error::AuthResultExt;
@@ -22,8 +21,16 @@ const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 #[non_exhaustive]
 #[derive(Deserialize)]
 pub struct TokenResponse {
+    /// The bearer token itself, attached verbatim to the `authorization`
+    /// header of every outgoing RPC. A live credential: never log it (this
+    /// type's `Debug` impl redacts it for that reason).
     pub access_token: String,
+    /// Lifetime the IdP advertises for `access_token`, in seconds from the
+    /// moment it was issued. The background refresh task derives its cadence
+    /// from this value.
     pub expires_in: u64,
+    /// Token type the IdP reports, `"Bearer"` for the client-credentials
+    /// grant this crate uses.
     pub token_type: String,
 }
 
@@ -541,7 +548,7 @@ mod tests {
             // stands unclamped.
             (6, 5),
             // A lifetime shorter than the floor itself: without the
-            // finding #27 ceiling clamp, the floor would schedule the next
+            // ceiling clamp, the floor alone would schedule the next
             // refresh at 5s, a full 2s after this 3s token has already
             // expired. The clamp must cap the result at expires_in - 1.
             (3, 2),

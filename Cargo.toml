@@ -1,6 +1,6 @@
 [package]
 name = "rociadb-sdk"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
 description = "Rust client SDK for RociaDB document, graph, file, and tenant gRPC services"
 license = "Apache-2.0"
@@ -13,14 +13,18 @@ categories = ["api-bindings", "database", "network-programming", "asynchronous"]
 # `edition = "2024"` needs 1.85, but the real floor comes from the dependency
 # graph rather than the edition: tonic and tonic-prost 0.14.6 — which the
 # "0.14.2" requirement below already resolves to — declare `rust-version =
-# "1.88"`, and the icu_* crates reached through reqwest -> url -> idna declare
-# 1.86. Re-check this field after any `cargo update` that moves tonic,
-# tonic-prost, or reqwest.
+# "1.88"`, as does the `tonic-prost-build` used at build time, and the icu_*
+# crates reached through reqwest -> url -> idna declare 1.86. `protox` itself
+# asks for only 1.74, so it does not move this floor. Re-check this field after
+# any `cargo update` that moves tonic, tonic-prost, tonic-prost-build, or
+# reqwest.
 rust-version = "1.88"
 # Repository-only files that a consumer of the published crate has no use for.
-# Everything the build needs — `build.rs`, `proto/` and the vendored
-# `proto/google/protobuf/*.proto` — must stay in the package.
-exclude = ["AGENTS.md", "mise.toml"]
+# Everything the build needs — `build.rs` and `proto/` — must stay in the
+# package; the Google well-known types are not vendored, `protox` supplies them
+# (see `build.rs`). `CHANGELOG.md` deliberately stays in the package: it is the
+# one repository document a consumer reads when upgrading.
+exclude = [".github", "AGENTS.md", "deny.toml", "mise.toml"]
 
 [dependencies]
 futures = "0.3.31"
@@ -34,13 +38,23 @@ http = "1"
 # then surfaces a confusing auth error even though the CA was provisioned
 # correctly at the OS level. Keep both crates reading from the OS trust store.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
-pbjson-types = "0.8.0"
+# Nothing in `src/` names `prost` directly; the generated code does, for
+# `::prost::Message` and `::prost::alloc::*`, which is why it is a regular
+# dependency and not a build dependency. There is deliberately no
+# `prost-types`: `google.protobuf.Empty` is the only well-known type the
+# `.proto` imports and prost maps it to `()`, so no generated item names a
+# `prost_types` type.
 prost = "0.14.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+# The library needs `rt` (the token-refresh task spawned in `src/auth.rs`),
+# `sync` (its `Mutex`/`Notify`/`oneshot`), `time` and `macros` (its
+# `tokio::select!`). `rt-multi-thread` is a test-only need — `#[tokio::main]`
+# in the doctests defaults to the multi-thread runtime — and lives in
+# `[dev-dependencies]` so a consumer does not pay for it.
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 # `default-features = false` drops tonic's default `router` and `server`
 # feature stack (axum, matchit, hyper's server support, hyper-util's
 # server-auto) — this SDK is a gRPC client only, build.rs disables server
@@ -52,9 +66,21 @@ tonic-prost = "0.14.2"
 tracing = "0.1"
 uuid = { version = "1.19.0", features = ["v4"] }
 
-# `build.rs` only reaches for `tonic_prost_build` — including the
-# `prost_build::Config` it re-exports, which is why `prost-build` itself does
-# not need to be listed here. The prost and tonic runtime crates the generated
-# code links against are regular dependencies above, not build dependencies.
+[dev-dependencies]
+# `#[tokio::main]` in the crate documentation's examples defaults to the
+# multi-thread runtime, and `tests/` spawns tasks, so the test and doctest
+# builds need `rt-multi-thread` on top of the library's own feature set.
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# `build.rs` reaches for exactly two crates: `protox`, a pure-Rust protobuf
+# compiler that replaces the `protoc` binary (and bundles the Google well-known
+# types, so none are vendored in `proto/`), and `tonic_prost_build` — including
+# the `prost_build::Config` it re-exports, which is why `prost-build` itself
+# does not need to be listed here. Both must agree on the `prost-types` major
+# version, since the `FileDescriptorSet` protox produces is handed straight to
+# `tonic_prost_build`: protox 0.9 and tonic-prost-build 0.14 both use
+# `prost-types` 0.14. The prost and tonic runtime crates the generated code
+# links against are regular dependencies above, not build dependencies.
 [build-dependencies]
+protox = "0.9.1"
 tonic-prost-build = { version = "0.14.2" }

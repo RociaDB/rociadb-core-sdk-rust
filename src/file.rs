@@ -46,6 +46,9 @@ const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// 1 MiB is the only size worth using.
 #[derive(Debug, Clone)]
 pub struct FileUploadOptions {
+    /// MIME type recorded for the file. Defaults to
+    /// `"application/octet-stream"`; the server records it as given and never
+    /// inspects the bytes to confirm it.
     pub content_type: String,
     /// SHA-256 digest of the uploaded bytes, as exactly 32 raw bytes. When
     /// `None`, [`RociaDbClient::upload_file`] computes it from the buffer
@@ -53,6 +56,10 @@ pub struct FileUploadOptions {
     /// upload fails before any network call — the server rejects any other
     /// length with `INVALID_ARGUMENT`.
     pub checksum: Option<Vec<u8>>,
+    /// Idempotency key for the upload. When `None`, one is generated
+    /// automatically (`upload_file:<uuid>`). Provide it explicitly — and
+    /// reuse the same value on a retry — so an upload replayed after a
+    /// timeout is absorbed rather than performed twice.
     pub request_id: Option<String>,
 }
 
@@ -77,7 +84,14 @@ impl Default for FileUploadOptions {
 /// [`FileUploadOptions::checksum`].
 #[derive(Debug, Clone)]
 pub struct FileStreamUploadOptions {
+    /// MIME type recorded for the file. Defaults to
+    /// `"application/octet-stream"`; the server records it as given and never
+    /// inspects the bytes to confirm it.
     pub content_type: String,
+    /// Idempotency key for the upload. When `None`, one is generated
+    /// automatically (`upload_file:<uuid>`). Provide it explicitly — and
+    /// reuse the same value on a retry — so an upload replayed after a
+    /// timeout is absorbed rather than performed twice.
     pub request_id: Option<String>,
 }
 
@@ -1247,9 +1261,9 @@ mod tests {
 
     #[test]
     fn ingest_never_grows_the_buffer_past_one_chunk_for_a_single_oversized_item() {
-        // Regression test for finding #3: before the fix, a caller who
+        // Regression test for the unbounded-buffer bug: a caller who
         // already held the whole file as one in-memory `Vec<u8>` and
-        // yielded it as a single stream item would have that whole item
+        // yielded it as a single stream item used to have that whole item
         // copied into `buffer` by one `Vec::extend` call, defeating the
         // "never buffers more than one outgoing chunk" bound this module's
         // docs promise. `RechunkState::ingest`/`RechunkState::drain_pending`

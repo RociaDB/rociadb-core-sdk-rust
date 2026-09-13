@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# No protobuf compiler is installed anywhere in this file on purpose: the build
+# script compiles the `.proto` with `protox`, a pure-Rust compiler, so a bare
+# Rust toolchain is all any job needs.
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: MSRV 1.88
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Must match `rust-version` in Cargo.toml. `--locked` is what makes this
+      # job meaningful: it checks the committed Cargo.lock, not whatever newer
+      # resolution a fresh update would pick.
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --lib --all-features --locked
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

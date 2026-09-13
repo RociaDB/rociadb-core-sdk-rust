@@ -39,11 +39,12 @@
 //!
 //! # Building
 //!
-//! The build script compiles the `.proto` files bundled with this crate, so
-//! **`protoc` must be available** on any machine that compiles it, including
-//! CI: either on `PATH`, or at the location given by the `PROTOC` environment
-//! variable. Nothing else is needed from the system — the Google well-known
-//! types the API uses ship inside the crate.
+//! No system dependency is required: `cargo build` on a bare Rust toolchain
+//! is enough. The build script compiles the `.proto` bundled with this crate
+//! using [`protox`](https://docs.rs/protox), a pure-Rust protobuf compiler,
+//! so there is no `protoc` binary to install and no `PROTOC` environment
+//! variable to set — on a developer machine, in CI, or on docs.rs. The
+//! Google well-known types the API imports come from `protox` itself.
 //!
 //! # Example project
 //!
@@ -75,7 +76,8 @@
 //! [`Neighbor`], [`UploadRequest`] and [`DownloadResponse`] — appear in public
 //! signatures and are re-exported at the crate root for that reason; depend on
 //! the re-exports: the `pb` module itself is private.
-#![allow(clippy::doc_lazy_continuation)]
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 pub mod auth;
 mod document;
@@ -218,7 +220,10 @@ pub struct RociaDbClient {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page<T> {
+    /// The items on this page, in the order the server returned them.
     pub items: Vec<T>,
+    /// Cursor to pass back to fetch the page after this one, or `None` when
+    /// this is the last page.
     pub next_cursor: Option<String>,
 }
 
@@ -242,8 +247,16 @@ pub struct Page<T> {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentPage<T> {
+    /// The decoded documents on this page, in the order the server returned
+    /// them.
     pub items: Vec<T>,
+    /// Cursor to pass back to fetch the page after this one, or `None` when
+    /// this is the last page.
     pub next_cursor: Option<String>,
+    /// Total number of documents matching the request, before pagination.
+    /// It describes the same instant as `items` — both are taken from a
+    /// single state of the store — but nothing is promised from one call to
+    /// the next. See the type-level documentation for what it costs.
     pub total_count: u64,
 }
 
@@ -360,7 +373,10 @@ fn validate_node_binding(node_label: &Option<String>, node_graph: &Option<String
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeBinding {
+    /// Label prefixed to the document id to form the graph node id, as
+    /// `"{label}:{document_id}"`.
     pub label: String,
+    /// Name of the graph the node is written to.
     pub graph: String,
 }
 
@@ -395,8 +411,16 @@ fn node_binding_to_pair(node_binding: Option<NodeBinding>) -> (Option<String>, O
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentQueryOperator {
+    /// The field equals the single value given.
     Eq,
+    /// The field equals any one of the values given.
     In,
+    /// The field contains the single value given as a case-insensitive
+    /// substring. A term shorter than three characters is not indexable, and
+    /// the server refuses a query in which no filter is indexable with
+    /// `INVALID_ARGUMENT` rather than serving it from a full scan — pair a
+    /// short term with an [`Eq`](Self::Eq) or [`In`](Self::In) filter on
+    /// another field.
     Contains,
 }
 
@@ -414,7 +438,9 @@ impl DocumentQueryOperator {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentQuerySortDirection {
+    /// Ascending order.
     Asc,
+    /// Descending order.
     Desc,
 }
 
@@ -427,12 +453,20 @@ impl DocumentQuerySortDirection {
     }
 }
 
-/// Filter definition for `QueryDoc`.
+/// Filter definition for `QueryDoc`. Every filter of a query is combined
+/// with logical AND.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocumentQueryFilter {
+    /// Name of the document field to compare.
     pub field: String,
+    /// How `field` is compared against `values`.
     pub operator: DocumentQueryOperator,
+    /// Values to compare against, each serialized to JSON before being sent.
+    /// How many the server expects depends on `operator`:
+    /// [`Eq`](DocumentQueryOperator::Eq) and
+    /// [`Contains`](DocumentQueryOperator::Contains) take one,
+    /// [`In`](DocumentQueryOperator::In) takes the set to match.
     pub values: Vec<Value>,
 }
 
@@ -453,11 +487,15 @@ impl DocumentQueryFilter {
     }
 }
 
-/// Sort definition for `QueryDoc`.
+/// Sort definition for `QueryDoc`. A query's sort list is applied in the
+/// order given, and results are always tie-broken by document id, so the
+/// ordering is total and stable across pages.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocumentQuerySort {
+    /// Name of the document field to sort on.
     pub field: String,
+    /// Direction to sort `field` in.
     pub direction: DocumentQuerySortDirection,
 }
 
@@ -480,7 +518,10 @@ impl DocumentQuerySort {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeInput {
+    /// Complete id of the node to upsert, for example `"product:sku-1"`.
     pub node_id: String,
+    /// Properties to store on the node. The server requires a JSON object
+    /// here, never a scalar or an array.
     pub value: Value,
     /// Idempotency key for this item's `PutNode` call. When `None`, one is
     /// generated automatically (`put_node:<uuid>` — the same prefix
@@ -520,10 +561,20 @@ impl NodeInput {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct EdgeInput {
+    /// Id of the edge to upsert. Raw: do not prefix it with `label`.
     pub edge_id: String,
+    /// Id of the node the edge starts from. It must already exist, or the
+    /// write fails with `NOT_FOUND`.
     pub from: String,
+    /// Id of the node the edge points to. It must already exist, or the
+    /// write fails with `NOT_FOUND`.
     pub to: String,
+    /// Type of relation the edge carries. A `(from, label, to)` triplet names
+    /// at most one edge: a second edge over a triplet another edge already
+    /// holds fails with `ALREADY_EXISTS`, while reusing the same `edge_id`
+    /// over its own triplet replaces the edge's properties.
     pub label: String,
+    /// Properties to store on the edge.
     pub value: Value,
     /// Idempotency key for this item's `AddEdge` call. When `None`, one is
     /// generated automatically (a bare UUID, with no prefix). See
