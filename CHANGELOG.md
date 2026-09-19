@@ -49,6 +49,7 @@ the 1.0 names are gone, and the table below maps every one of them.
   | `upload_file(t, b, f, bytes: impl AsRef<[u8]>, opts)` | `upload_file(t, b, f, bytes: impl Into<Vec<u8>>, opts)` |
   | `upload_file_owned(t, b, f, bytes: Vec<u8>, opts)` | `upload_file(t, b, f, bytes, opts)` (a `Vec<u8>` still moves without a copy) |
   | `upload_file_chunked(t, b, f, size_bytes, checksum, chunks, opts)` | `upload_file_chunked(t, b, f, chunks, FileStreamUploadOptions::new(size_bytes, checksum))` |
+  | `upload_file_chunked` with `chunks: Stream<Item = Vec<u8>>` | `chunks: Stream<Item = std::io::Result<bytes::Bytes>>` — pass a `tokio_util::io::ReaderStream` straight in, or wrap each piece as `Ok(Bytes::from(piece))` |
   | `delete_file(t, b, f)` | `delete_file(t, b, f, WriteOptions::new())` |
   | `delete_file_with_request_id(t, b, f, rid)` | `delete_file(t, b, f, WriteOptions::new().with_request_id(rid))` |
   | `FileUploadOptions { checksum: Option<Vec<u8>>, .. }` | `FileUploadOptions::new().with_checksum([u8; 32])` |
@@ -57,6 +58,31 @@ the 1.0 names are gone, and the table below maps every one of them.
   | `rociadb_sdk::file::*`, `rociadb_sdk::graph::*` | `rociadb_sdk::*` (`file` and `graph` are private; `auth` is the only public module) |
   | `builder.host(..)` and the other setters: `&mut self -> &mut Self` | `self -> Self`: `RociaDbBuilder::new().host(..).disable_auth().build().await?`, and `let b = RociaDbBuilder::new().host(..);` now compiles |
 
+- **`upload_file_chunked` takes a fallible chunk stream of `Bytes`.** Its
+  `chunks` parameter is now
+  `S: Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static` instead of
+  `Stream<Item = Vec<u8>>`, and `bytes = "1"` is a new **regular dependency**
+  because that item type is part of the public signature (`Bytes` is
+  re-exported at the crate root, with the same stability caveat as `Streaming`
+  and `Channel`, so no caller needs `bytes` as a direct dependency). Two things
+  this buys, both of which the old signature made impossible:
+
+  - a `tokio_util::io::ReaderStream` over a `tokio::fs::File`, a socket or a
+    decompressor yields exactly this item, so it is passed in with **no**
+    adaptation — no `map`, no `to_vec`, no collecting;
+  - a read that fails partway through has somewhere to say so. It now fails the
+    upload with the new `RociaDbError::Io`; previously a failing source could
+    only end the stream early, and the upload was reported as a `Validation`
+    size mismatch that blamed the caller's `size_bytes` for a disk that could
+    not be read.
+
+  Existing callers holding `Vec<u8>` pieces wrap each one:
+  `stream::iter(pieces.into_iter().map(|p| Ok(Bytes::from(p))))`. The memory
+  bound is unchanged — never more than one outgoing chunk buffered — and a
+  `Bytes` item is still copied into that buffer, as any other bytes would be;
+  the type is for what it makes easy at the call site, not to make the upload
+  zero-copy. `bytes` is not a new crate in the dependency graph: `tonic`,
+  `prost`, `h2` and `reqwest` all already pull it in.
 - **`FileUploadOptions` and `FileStreamUploadOptions` are now
   `#[non_exhaustive]`.** In 1.0 both were plain structs assembled with a
   literal and `..Default::default()`; that no longer compiles from outside
@@ -81,10 +107,11 @@ the 1.0 names are gone, and the table below maps every one of them.
   success or `error!` on routine failure: a library hands the error back and
   lets the caller decide how to log it. Every RPC now emits exactly one
   `debug!` line with its identifying fields (tenant, collection/graph/bucket,
-  ids, counts) and no payloads. The five remaining `warn!` lines are
+  ids, counts) and no payloads. The six remaining `warn!` lines are
   `disable_auth()`, a non-`https` token URL, a failed background token
-  refresh, a token response with no `expires_in`, and a token refresh that
-  failed after an `UNAUTHENTICATED` response. A deployment that relied on the
+  refresh, a token response with no `expires_in`, a token refresh that
+  failed after an `UNAUTHENTICATED` response, and a failed pre-flight token
+  refresh before a streaming RPC. A deployment that relied on the
   `info!`/`error!` lines must lower its filter for this crate's target to
   `debug`.
 - **Secrets are `secrecy::SecretString`, not `String`.** The OAuth2 client
@@ -187,6 +214,15 @@ the 1.0 names are gone, and the table below maps every one of them.
   corruption, truncation and partial overwrites, and not an uploader whose
   declared digest never matched its own bytes. `download_file` and
   `download_file_stream` link to it where they describe that asymmetry.
+- `RociaDbError::Io { context: &'static str, source: std::io::Error }`, raised
+  only by `upload_file_chunked` when its `chunks` stream yields an `Err` — a
+  read that failed on the caller's own file or socket. Nothing further is pulled
+  from the stream, the upload is abandoned (so the server, which publishes a
+  file only once it has the whole stream, stores nothing), and this error is
+  reported **ahead of** whatever status the server returned for the stream that
+  then ended early — the same error-slot precedence the size-mismatch check
+  already had. `Display` folds in the `io::Error`, which stays reachable as the
+  `source` for a caller that needs its `kind()`.
 - `RociaDbError::ChecksumMismatch { expected: Vec<u8>, actual: Vec<u8> }` and
   `RociaDbError::SizeMismatch { expected: u64, actual: u64 }`, raised only by
   `download_file_verified`. Two flat variants rather than one nested
@@ -195,6 +231,40 @@ the 1.0 names are gone, and the table below maps every one of them.
   transfer fails both, and the byte count is the more actionable report);
   `Display` renders the two digests as lowercase hex, and both carry raw
   bytes so nothing has to be decoded to compare them.
+- **Token handling for the two streaming RPCs**, which previously got none at
+  all.
+
+  - `TokenManager::ensure_fresh(margin: Duration) -> Result<()>`: refresh the
+    cached token only when less than `margin` of its advertised lifetime is
+    left, and return immediately otherwise. The manager now records *when* each
+    token was fetched alongside the `expires_in` the IdP reported, so what is
+    left of a lifetime is a value it can compute; a refresh that is due goes
+    through `refresh_now`, so concurrent callers are still coalesced into one
+    fetch.
+  - **Every** streaming call — all three uploads and every download — runs that
+    check before opening, with a five-second margin. Five seconds is enough
+    because a gRPC server validates the bearer token once, when it accepts the
+    call: a transfer that outlives its token keeps running, so the margin only
+    has to cover the gap between reading the cached token and the server
+    checking it. A pre-flight refresh that fails is a `warn!` and the call
+    proceeds with the cached token, which may well still be valid.
+  - `upload_file` now **retries once** on `UNAUTHENTICATED`, exactly as a unary
+    RPC does: it holds its buffer in an `Arc`, so the request stream is rebuilt
+    without copying the file, and the replay carries the **same** `request_id`,
+    which is what makes it safe — the server deduplicates on it, so a replay
+    that lands on an upload it had already committed is absorbed rather than
+    written twice.
+  - The call that **opens** a download does too, so `download_file_stream`,
+    `download_file` and `download_file_verified` all recover from one
+    `UNAUTHENTICATED`. A server that rejects a server-streaming call answers
+    before any message exists, so that rejection resolves the opening call
+    itself and there is nothing consumed to replay around. No `grpc-timeout`
+    header is sent (`request_timeout` still does not apply to a transfer).
+  - `upload_file_chunked` and `upload_file_stream` get the pre-flight refresh
+    only, and their documentation now says why: the request stream belongs to
+    the caller, and h2 begins writing body frames as soon as the call opens, so
+    "nothing has been consumed yet" is not a state the SDK can establish.
+    Recover with `refresh_auth_token()` and a freshly built stream.
 - `RociaDbClient::neighbor_nodes_out<T>` and
   `RociaDbClient::neighbor_nodes_in<T>`:
   `(tenant_id, graph, node_id, label, limit, cursor) -> Result<Page<NeighborNode<T>>>`.
@@ -280,8 +350,12 @@ the 1.0 names are gone, and the table below maps every one of them.
 - Every unary RPC now goes through one private helper on the client, which
   wraps the request, applies the per-call deadline, refreshes and retries once
   on `UNAUTHENTICATED`, and maps a failed `tonic::Status` — so none of that is
-  repeated at twenty call sites. The two streaming RPCs (`Upload`, `Download`)
-  still call the generated client directly and get none of it.
+  repeated at twenty call sites. The refresh-and-retry half of it is shared, and
+  the deadline is a parameter: the same core serves the call that opens a
+  download (with no deadline) and, through the one helper that decides whether
+  to replay, `upload_file`'s re-send of its own request stream. The `Upload` RPC
+  is the only place left that calls a generated client directly, because its
+  request is a stream rather than a cloneable message.
 - The neighbor page size used while walking every page in
   `get_outgoing_neighbor_nodes` / `get_incoming_neighbor_nodes` is a documented
   named constant instead of a literal `50` repeated at two call sites. The
@@ -310,8 +384,10 @@ the 1.0 names are gone, and the table below maps every one of them.
   (only features and five small crates — `axum`, `axum-core`, `matchit`,
   `mime`, `httpdate` — are added to `Cargo.lock`, and nothing changes for a
   consumer building the library): `tonic` with `server` + `router`, `hyper`
-  with `http1` + `server`, `hyper-util` with `tokio`, `http-body-util`, and
-  `net` + `test-util` + `rt-multi-thread` on `tokio`.
+  with `http1` + `server`, `hyper-util` with `tokio`, `http-body-util`,
+  `tokio-util` with `io` (for the `ReaderStream` the upload tests hand to
+  `upload_file_chunked`), and `net` + `test-util` + `rt-multi-thread` + `fs` on
+  `tokio`.
 
 ### Removed
 
@@ -339,6 +415,10 @@ the 1.0 names are gone, and the table below maps every one of them.
 
 - Updated `h2` to 0.4.19 in `Cargo.lock` for RUSTSEC-2026-0258 (unbounded empty
   DATA frames, reachable through both `tonic` and `reqwest`).
+- Updated `rustls` to 0.23.45 (and `rustls-webpki` to 0.103.15) in `Cargo.lock`
+  for GHSA-2mjx-qc3c-rqvc, reachable through both `tonic` and `reqwest`. A patch
+  bump within the same major version, so nothing in this crate's API or its MSRV
+  changes.
 - **A failed background token refresh no longer waits out the whole regular
   interval.** It used to wait for the next tick — 400 seconds for the IdP's
   600-second tokens — so a single failed refresh guaranteed a window in which
@@ -357,8 +437,24 @@ the 1.0 names are gone, and the table below maps every one of them.
   retries once, automatically**, when auth is enabled. The refresh is
   coalesced with any already in flight; a refresh that itself fails is
   reported as a `warn!` and the original `UNAUTHENTICATED` is returned; the
-  call is never retried more than once. Streaming uploads and downloads are
-  not covered — call `refresh_auth_token()` yourself there.
+  call is never retried more than once.
+- **A streaming upload or download no longer starts on a token that is about to
+  be rejected**, and two of them recover from a rejection on their own. Both
+  streaming RPCs used to get nothing: no pre-flight refresh, no retry, so a
+  transfer begun seconds before a token expired — or begun while the background
+  refresh task was failing — failed with `UNAUTHENTICATED` and left the caller
+  to notice. Every streaming call now refreshes first when little of the
+  token's lifetime is left, `upload_file` replays its own buffer once under the
+  same `request_id`, and the call that opens a download replays once too. See
+  the Added section for which call gets what, and why
+  `upload_file_chunked`/`upload_file_stream` cannot be replayed for you.
+- **A failed read from an `upload_file_chunked` source is no longer reported as
+  a size mismatch.** With the old `Stream<Item = Vec<u8>>` item type a source
+  that hit an I/O error could only end early, and the upload failed with a
+  `Validation` error naming byte counts — pointing at the caller's `size_bytes`
+  rather than at the disk that could not be read. The item type is now
+  `std::io::Result<Bytes>` and the error surfaces as `RociaDbError::Io` carrying
+  the original `std::io::Error`.
 
 ## [1.0.0] - 2026-09-01
 

@@ -7,7 +7,7 @@
 mod support;
 
 use rociadb_sdk::{
-    FileStreamUploadOptions, FileUploadOptions, RociaDbError, UploadRequest, WriteOptions,
+    Bytes, FileStreamUploadOptions, FileUploadOptions, RociaDbError, UploadRequest, WriteOptions,
 };
 use support::{FakeServer, payload, sha256};
 
@@ -15,6 +15,12 @@ const TENANT: &str = "tenant-1";
 const BUCKET: &str = "assets";
 /// The chunk size the SDK uploads with, and the one thing the server caps.
 const ONE_MIB: usize = 1024 * 1024;
+
+/// One item of an `upload_file_chunked` source stream, for the tests that build
+/// their chunks in memory rather than reading them off a file.
+fn chunk(bytes: Vec<u8>) -> std::io::Result<Bytes> {
+    Ok(Bytes::from(bytes))
+}
 
 #[tokio::test]
 async fn a_multi_chunk_upload_stats_and_downloads_byte_for_byte() {
@@ -135,7 +141,7 @@ async fn upload_file_chunked_rechunks_odd_sized_source_pieces() {
     let mut offset = 0;
     let mut pieces = Vec::new();
     for size in sizes {
-        pieces.push(bytes[offset..offset + size].to_vec());
+        pieces.push(chunk(bytes[offset..offset + size].to_vec()));
         offset += size;
     }
 
@@ -278,7 +284,7 @@ async fn a_chunk_stream_shorter_than_its_declared_size_is_a_validation_error() {
             TENANT,
             BUCKET,
             "short.bin",
-            futures::stream::iter(vec![bytes.clone()]),
+            futures::stream::iter(vec![chunk(bytes.clone())]),
             // Declares one byte more than the stream will ever produce.
             FileStreamUploadOptions::new(bytes.len() as u64 + 1, sha256(&bytes)),
         )
@@ -296,12 +302,114 @@ async fn a_chunk_stream_shorter_than_its_declared_size_is_a_validation_error() {
             TENANT,
             BUCKET,
             "long.bin",
-            futures::stream::iter(vec![bytes.clone()]),
+            futures::stream::iter(vec![chunk(bytes.clone())]),
             FileStreamUploadOptions::new(16, sha256(&bytes)),
         )
         .await
         .expect_err("an overlong stream must be rejected");
     assert!(matches!(error, RociaDbError::Validation(_)), "got: {error}");
+}
+
+#[tokio::test]
+async fn upload_file_chunked_takes_a_reader_stream_over_a_real_file_unadapted() {
+    // The reason the item type is `std::io::Result<Bytes>`: a
+    // `tokio_util::io::ReaderStream` over a `tokio::fs::File` is passed in with
+    // no adapter, no `map`, no collecting. Nothing here converts anything.
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    // Over one outgoing chunk and not a multiple of it, so the re-chunker has
+    // to reassemble the reader's own 4 KiB-ish slices into 1 MiB messages and
+    // end with a short one.
+    let bytes = payload(ONE_MIB + 7919);
+    let path = std::env::temp_dir().join(format!(
+        "rociadb-sdk-reader-stream-{}.bin",
+        std::process::id()
+    ));
+    std::fs::write(&path, &bytes).expect("writing the temporary source file must succeed");
+
+    let file = tokio::fs::File::open(&path)
+        .await
+        .expect("opening the temporary source file must succeed");
+    let result = client
+        .upload_file_chunked(
+            TENANT,
+            BUCKET,
+            "from-a-file.bin",
+            tokio_util::io::ReaderStream::new(file),
+            FileStreamUploadOptions::new(bytes.len() as u64, sha256(&bytes)),
+        )
+        .await;
+    // Remove the temporary file before asserting, so a failure does not leave
+    // it behind.
+    let _ = std::fs::remove_file(&path);
+    result.expect("a ReaderStream over a real file must upload as-is");
+
+    let chunk_sizes: Vec<usize> =
+        serde_json::from_value(server.only_call("Upload").field("chunk_sizes").clone())
+            .expect("recorded chunk sizes");
+    assert_eq!(
+        chunk_sizes,
+        vec![ONE_MIB, 7919],
+        "the reader's own slicing must be re-chunked to the wire contract, got {chunk_sizes:?}"
+    );
+    assert_eq!(
+        client
+            .download_file(TENANT, BUCKET, "from-a-file.bin")
+            .await
+            .expect("the download must succeed"),
+        bytes,
+        "the file must come back byte for byte"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_chunk_source_surfaces_as_an_io_error_not_a_size_mismatch() {
+    // The other half of the fallible item type: a read that dies partway
+    // through must reach the caller as its own `io::Error`, and must win over
+    // whatever the server made of the stream that then ended early — here an
+    // `INVALID_ARGUMENT` for a 4096-byte upload that delivered 64 bytes.
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+
+    let error = client
+        .upload_file_chunked(
+            TENANT,
+            BUCKET,
+            "unreadable.bin",
+            futures::stream::iter(vec![
+                chunk(payload(64)),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the source disk gave up",
+                )),
+                chunk(payload(4032)),
+            ]),
+            FileStreamUploadOptions::new(4096, sha256(&payload(4096))),
+        )
+        .await
+        .expect_err("a failing source must fail the upload");
+
+    match &error {
+        RociaDbError::Io { context, source } => {
+            assert_eq!(*context, "the upload chunk stream");
+            assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof);
+        }
+        other => panic!("expected an Io error, got: {other}"),
+    }
+    assert!(
+        error.to_string().contains("the source disk gave up"),
+        "the source's own message must be readable, got: {error}"
+    );
+    assert!(
+        error.code().is_none(),
+        "the server's status for the truncated stream must not be what surfaces, got: {error}"
+    );
+    assert!(
+        server
+            .stored_file(TENANT, BUCKET, "unreadable.bin")
+            .is_none(),
+        "an upload abandoned mid-stream must store nothing"
+    );
 }
 
 #[tokio::test]

@@ -18,13 +18,16 @@ to stay forward-compatible. Every variant implements `std::error::Error`, so
 | `Auth { message, source }` | obtaining or refreshing the upstream token failed |
 | `Encode { context, source }` | a value could not be serialized to JSON before being sent |
 | `Decode { context, source }` | a JSON payload received from upstream could not be decoded; for a page of documents the message leads with `"item <index>: "`, naming the offending position |
+| `Io { context, source }` | a source the SDK was reading on your behalf failed: an `Err` item from `upload_file_chunked`'s chunk stream, carrying the `std::io::Error` |
 | `Validation(String)` | a client-side rule about the *data* of one call was violated before any network call |
 | `ChecksumMismatch { expected, actual }` | a verified download's SHA-256 digest disagrees with the stored checksum |
 | `SizeMismatch { expected, actual }` | a verified download's byte count disagrees with the stored `size_bytes` |
 
 `Config`, `Connection` and `Auth` fold their optional underlying cause into
 `Display`, so a bare `.to_string()` already distinguishes a DNS failure from
-a TLS mismatch from a refused connection.
+a TLS mismatch from a refused connection. `Io` does the same with its
+`std::io::Error`, which stays reachable as the `source` when you need to match on
+its `kind()`.
 
 ### `Config` vs `Connection` vs `Validation`
 
@@ -42,6 +45,17 @@ one call.
 | a zero `connect_timeout` or `request_timeout` | `Config` |
 | a failed dial, a DNS failure, a refused connection | `Connection` |
 | a zero page limit, an oversized file, a chunk stream whose length disagrees with the declared size | `Validation` |
+
+### `Io`
+
+A fourth variant carries no status, for a third reason: the failure is in a
+source **you** handed over. `upload_file_chunked` takes a
+`Stream<Item = std::io::Result<Bytes>>`, and an `Err` item — a read that died on
+your file or socket — ends the upload and is reported here, ahead of whatever
+status the server returned for the stream that then stopped early. Nothing is
+pulled from the stream after the error, and nothing is stored: the server only
+publishes a file once it has received and validated the whole stream. See
+[files](files.md).
 
 ### `ChecksumMismatch` and `SizeMismatch`
 
@@ -104,7 +118,7 @@ let document = match outcome {
 
 | Predicate | Code | What it means here |
 | --------- | ---- | ------------------ |
-| `is_unauthenticated()` | `UNAUTHENTICATED` | on a unary call, a *refreshed* credential was rejected too — see [authentication](authentication.md) |
+| `is_unauthenticated()` | `UNAUTHENTICATED` | on every call but `upload_file_chunked` / `upload_file_stream`, a *refreshed* credential was rejected too — see [authentication](authentication.md) |
 | `is_permission_denied()` | `PERMISSION_DENIED` | valid token, missing scope: final, a refresh will not help |
 | `is_not_found()` | `NOT_FOUND` | every single-item read can return it, and so can `add_edge` when an endpoint node is missing. Listings return an empty page instead, and the deletes are idempotent, so neither ever reports it |
 | `is_invalid_argument()` | `INVALID_ARGUMENT` | a rule only the server knows; retrying changes nothing |

@@ -4,9 +4,12 @@
 //! first one, hands out a [`BearerInterceptor`] that stamps the cached
 //! `authorization` header onto every outgoing RPC, and — once
 //! [`TokenManager::spawn_refresh`] is running — replaces that header before
-//! the token expires. [`RociaDbBuilder::build`](crate::RociaDbBuilder::build)
-//! wires all of it up; reach for this module directly only when you drive
-//! authentication yourself.
+//! the token expires. [`TokenManager::refresh_now`] forces a refresh,
+//! [`TokenManager::ensure_fresh`] forces one only when the cached token is
+//! close to expiring, and [`TokenManager::request_refresh`] asks the
+//! background task for one without waiting.
+//! [`RociaDbBuilder::build`](crate::RociaDbBuilder::build) wires all of it up;
+//! reach for this module directly only when you drive authentication yourself.
 //!
 //! Both the OAuth2 client secret and the access token are held as
 //! [`SecretString`], so neither can reach a log line through a `Debug`
@@ -20,7 +23,7 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -257,6 +260,44 @@ pub async fn fetch_token(
         .auth_context("failed to parse token response")
 }
 
+/// When the token currently cached in `header_value` was obtained, and how
+/// long the IdP said it would live.
+///
+/// The two are held together, under one lock, precisely so they cannot be read
+/// apart: a `fetched_at` from one token paired with the `expires_in` of another
+/// would make [`TokenManager::ensure_fresh`] compute a remaining lifetime that
+/// belongs to no token at all.
+#[derive(Debug, Clone, Copy)]
+struct TokenLifetime {
+    /// Instant the token was fetched — as close to the moment the IdP issued
+    /// it as this process can observe, since `expires_in` is counted from
+    /// issuance and the only other reference point (the network round trip)
+    /// is not observable here. Rounding this *later* than issuance is the safe
+    /// direction: it can only overstate the remaining lifetime by the fetch
+    /// latency, which a refresh margin of whole seconds absorbs.
+    fetched_at: Instant,
+    /// `expires_in` (seconds) as reported by the IdP for that token, or the
+    /// assumed [`ASSUMED_EXPIRES_IN_SECS`] when it reported none.
+    expires_in: u64,
+}
+
+impl TokenLifetime {
+    /// A lifetime starting now.
+    fn issued_now(expires_in: u64) -> Self {
+        Self {
+            fetched_at: Instant::now(),
+            expires_in,
+        }
+    }
+
+    /// How much of the lifetime is left, saturating at zero for a token that
+    /// has already expired (and for the monotonic-clock edge case where
+    /// `elapsed()` exceeds the whole lifetime).
+    fn remaining(&self) -> Duration {
+        Duration::from_secs(self.expires_in).saturating_sub(self.fetched_at.elapsed())
+    }
+}
+
 /// Token manager with cached authorization header.
 #[derive(Clone)]
 pub struct TokenManager {
@@ -275,9 +316,13 @@ struct TokenManagerInner {
     /// is exposed only in [`fetch_token`], where the form body is built.
     client_secret: SecretString,
     header_value: Arc<RwLock<MetadataValue<Ascii>>>,
-    /// `expires_in` (seconds) from the most recently fetched token, as
-    /// reported by the IdP. Drives [`TokenManager::refresh_interval`].
-    expires_in: AtomicU64,
+    /// When the most recently fetched token was obtained and how long the IdP
+    /// said it lives. Drives [`TokenManager::refresh_interval`] (which reads
+    /// the lifetime) and [`TokenManager::ensure_fresh`] (which reads what is
+    /// left of it). Written only while `refresh_lock` is held, alongside
+    /// `header_value`, so the recorded lifetime always describes the cached
+    /// token.
+    lifetime: RwLock<TokenLifetime>,
     /// Number of times [`TokenManager::refresh_now`] has actually reached
     /// the IdP, incremented before the request whether it then succeeds or
     /// fails (a call coalesced into another caller's in-flight fetch does
@@ -329,7 +374,7 @@ impl TokenManager {
         client_secret: SecretString,
     ) -> Result<Self> {
         let token = fetch_token(&http, &token_url, &client_id, &client_secret).await?;
-        let expires_in = AtomicU64::new(token.expires_in);
+        let lifetime = RwLock::new(TokenLifetime::issued_now(token.expires_in));
         let header_value = Arc::new(RwLock::new(build_header(&token)?));
 
         Ok(Self {
@@ -339,7 +384,7 @@ impl TokenManager {
                 client_id,
                 client_secret,
                 header_value,
-                expires_in,
+                lifetime,
                 fetch_attempts: AtomicU64::new(0),
                 refresh_lock: Mutex::new(()),
                 refresh_generation: AtomicU64::new(0),
@@ -375,7 +420,7 @@ impl TokenManager {
     /// the much tighter schedule described by
     /// [`TokenManager::spawn_refresh`] until one succeeds.
     pub fn refresh_interval(&self) -> Duration {
-        let expires_in = self.inner.expires_in.load(Ordering::Relaxed);
+        let expires_in = self.lifetime().expires_in;
         let with_margin = expires_in.saturating_mul(2) / 3;
         let floored = Duration::from_secs(with_margin).max(MIN_REFRESH_INTERVAL);
         let ceiling = Duration::from_secs(expires_in.saturating_sub(1).max(1));
@@ -385,6 +430,46 @@ impl TokenManager {
     /// Create an interceptor that injects the bearer token.
     pub fn interceptor(&self) -> BearerInterceptor {
         BearerInterceptor::new(Arc::clone(&self.inner.header_value))
+    }
+
+    /// The lifetime recorded for the currently cached token.
+    fn lifetime(&self) -> TokenLifetime {
+        *self
+            .inner
+            .lifetime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Refresh the token only if less than `margin` of its advertised lifetime
+    /// is left, and do nothing at all otherwise.
+    ///
+    /// This is the pre-flight check the two streaming RPCs use, where
+    /// [`TokenManager::refresh_now`]'s unconditional round trip would be paid
+    /// on every call and the refresh-and-retry that covers a unary RPC cannot
+    /// apply (a request stream the caller has handed over cannot be replayed).
+    /// It is cheap in the common case: reading the recorded lifetime is one
+    /// `RwLock` read and one clock read, with no lock held across an `.await`.
+    ///
+    /// When a refresh *is* due, it goes through [`TokenManager::refresh_now`],
+    /// so concurrent callers are coalesced into a single fetch and a caller
+    /// that arrives just after another one refreshed makes no request of its
+    /// own. A failure is returned as [`crate::RociaDbError::Auth`]; the cached
+    /// token is left in place, exactly as for a failed
+    /// [`TokenManager::refresh_now`], so a caller that can still try with it
+    /// (as [`crate::RociaDbClient`]'s streaming calls do) may ignore the
+    /// error.
+    ///
+    /// `margin` only has to cover the moment the call *starts*: a gRPC server
+    /// validates the bearer token once, when it accepts the call, so a stream
+    /// that outlives its token keeps running. A few seconds is therefore
+    /// enough, and a margin as long as the token's whole lifetime would just
+    /// refresh on every call.
+    pub async fn ensure_fresh(&self, margin: Duration) -> Result<()> {
+        if self.lifetime().remaining() >= margin {
+            return Ok(());
+        }
+        self.refresh_now().await
     }
 
     /// Force a token refresh immediately.
@@ -429,9 +514,14 @@ impl TokenManager {
         )
         .await?;
         let header = build_header(&token)?;
-        self.inner
-            .expires_in
-            .store(token.expires_in, Ordering::Relaxed);
+        {
+            let mut guard = self
+                .inner
+                .lifetime
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = TokenLifetime::issued_now(token.expires_in);
+        }
         {
             let mut guard = self
                 .inner
@@ -656,14 +746,14 @@ impl Interceptor for BearerInterceptor {
 mod tests {
     use super::{
         ASSUMED_EXPIRES_IN_SECS, BearerInterceptor, REFRESH_RETRY_BASE_DELAY,
-        REFRESH_RETRY_MAX_DELAY, TokenManager, TokenManagerInner, TokenResponse, build_header,
-        jittered_retry_backoff, retry_backoff,
+        REFRESH_RETRY_MAX_DELAY, TokenLifetime, TokenManager, TokenManagerInner, TokenResponse,
+        build_header, jittered_retry_backoff, retry_backoff,
     };
     use secrecy::{ExposeSecret, SecretString};
     use std::sync::Arc;
     use std::sync::RwLock;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::sync::{Mutex, Notify};
     use tonic::Request;
     use tonic::metadata::{Ascii, MetadataValue};
@@ -677,6 +767,24 @@ mod tests {
     /// so a test that calls `refresh_now` here stays deterministic and
     /// network-free too.
     fn offline_token_manager(header_value: MetadataValue<Ascii>, expires_in: u64) -> TokenManager {
+        offline_token_manager_issued(header_value, expires_in, Duration::ZERO)
+    }
+
+    /// [`offline_token_manager`] for a token fetched `issued_ago` in the past,
+    /// so the tests of [`TokenManager::ensure_fresh`] can present a token that
+    /// is fresh, nearly expired or long expired without sleeping for real.
+    /// `Instant::checked_sub` is used rather than plain subtraction because a
+    /// process that has been up for less than `issued_ago` has no such instant
+    /// to name — the saturating fallback just means "as long ago as this clock
+    /// can express", which is older still and therefore fine here.
+    fn offline_token_manager_issued(
+        header_value: MetadataValue<Ascii>,
+        expires_in: u64,
+        issued_ago: Duration,
+    ) -> TokenManager {
+        let fetched_at = Instant::now()
+            .checked_sub(issued_ago)
+            .unwrap_or_else(Instant::now);
         TokenManager {
             inner: Arc::new(TokenManagerInner {
                 http: reqwest::Client::new(),
@@ -684,7 +792,10 @@ mod tests {
                 client_id: "unused-client-id".to_string(),
                 client_secret: SecretString::from("unused-client-secret"),
                 header_value: Arc::new(RwLock::new(header_value)),
-                expires_in: AtomicU64::new(expires_in),
+                lifetime: RwLock::new(TokenLifetime {
+                    fetched_at,
+                    expires_in,
+                }),
                 fetch_attempts: AtomicU64::new(0),
                 refresh_lock: Mutex::new(()),
                 refresh_generation: AtomicU64::new(0),
@@ -789,6 +900,112 @@ mod tests {
             "a caller that observes the generation advance while waiting for the lock must \
              return Ok(()) without attempting its own fetch — one was attempted here, since \
              the offline harness's malformed token_url always fails: {result:?}"
+        );
+        assert_eq!(
+            manager.inner.fetch_attempts.load(Ordering::Relaxed),
+            0,
+            "a coalesced caller must not reach the IdP at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_makes_no_request_while_the_cached_token_is_still_fresh() {
+        // 600 seconds of lifetime, one second of it used: a 5-second margin is
+        // nowhere near, so this must not touch the IdP at all — which the
+        // offline harness proves twice over, since any fetch it did attempt
+        // would fail on the malformed token_url and be visible as an `Err`.
+        let manager =
+            offline_token_manager_issued(sample_header("token"), 600, Duration::from_secs(1));
+
+        manager
+            .ensure_fresh(Duration::from_secs(5))
+            .await
+            .expect("a token well inside its lifetime must need no refresh");
+
+        assert_eq!(
+            manager.inner.fetch_attempts.load(Ordering::Relaxed),
+            0,
+            "ensure_fresh must not reach the IdP for a token that is still fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_refreshes_a_token_whose_remaining_lifetime_is_under_the_margin() {
+        // 3 of the 10 seconds left, against a 5-second margin: due.
+        let manager = offline_token_manager_issued(
+            sample_header("nearly-expired"),
+            10,
+            Duration::from_secs(7),
+        );
+
+        let error = manager
+            .ensure_fresh(Duration::from_secs(5))
+            .await
+            .expect_err("the offline harness cannot actually fetch, so the refresh must fail");
+        assert!(matches!(error, crate::RociaDbError::Auth { .. }), "{error}");
+        assert_eq!(
+            manager.inner.fetch_attempts.load(Ordering::Relaxed),
+            1,
+            "a token inside the margin must be refreshed exactly once"
+        );
+        // The failure left the still-usable cached token alone, which is what
+        // lets `RociaDbClient`'s streaming calls carry on with it.
+        assert_eq!(
+            *manager
+                .inner
+                .header_value
+                .read()
+                .expect("header lock must not be poisoned"),
+            sample_header("nearly-expired")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_refreshes_a_token_that_has_already_expired() {
+        // Twice the lifetime elapsed: `remaining()` saturates at zero rather
+        // than underflowing, and the refresh is due.
+        let manager =
+            offline_token_manager_issued(sample_header("expired"), 600, Duration::from_secs(1200));
+        assert_eq!(manager.lifetime().remaining(), Duration::ZERO);
+
+        manager
+            .ensure_fresh(Duration::from_secs(5))
+            .await
+            .expect_err("an expired token must be refreshed");
+        assert_eq!(manager.inner.fetch_attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_coalesces_concurrent_callers_into_one_fetch() {
+        // Same shape as `refresh_now_coalesces_with_a_refresh_already_in_flight`:
+        // holding the refresh lock stands in for another refresh already in
+        // flight, and bumping the generation before releasing it stands in for
+        // that refresh succeeding. A second caller must then skip its own
+        // fetch — the property that keeps a fleet of streaming calls whose
+        // token expired together from firing one POST each at the IdP.
+        let manager =
+            offline_token_manager_issued(sample_header("expired"), 1, Duration::from_secs(60));
+        let held = manager.inner.refresh_lock.lock().await;
+        let waiting = manager.clone();
+        let handle =
+            tokio::spawn(async move { waiting.ensure_fresh(Duration::from_secs(5)).await });
+
+        // A current-thread runtime: one yield is enough for the spawned task
+        // to read the generation and block on the lock.
+        tokio::task::yield_now().await;
+        manager
+            .inner
+            .refresh_generation
+            .fetch_add(1, Ordering::Relaxed);
+        drop(held);
+
+        let result = handle
+            .await
+            .expect("the spawned ensure_fresh call must not panic");
+        assert!(
+            result.is_ok(),
+            "a coalesced caller must return Ok(()) without fetching — a fetch would have failed \
+             on the offline harness's malformed token_url: {result:?}"
         );
         assert_eq!(
             manager.inner.fetch_attempts.load(Ordering::Relaxed),

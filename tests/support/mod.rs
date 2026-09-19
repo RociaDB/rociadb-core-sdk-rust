@@ -31,6 +31,10 @@
 //!   refresh-and-retry and error-mapping paths are driven.
 //! - [`FakeServer::delay`] makes one RPC sleep before answering, for the
 //!   deadline tests.
+//! - [`FakeServer::accept_only_tokens`] makes every RPC reject a bearer token
+//!   outside a named set with `UNAUTHENTICATED`, which is how a test proves
+//!   *which* token a call carried — including one that no refresh-and-retry
+//!   could rescue, as for the streaming uploads.
 //! - Every call is recorded with the `authorization` metadata it carried and
 //!   its full request as JSON ([`FakeServer::calls_for`]), so "the node
 //!   binding wrote this node id with that payload and reused the document's
@@ -183,6 +187,10 @@ struct State {
     tenants: BTreeSet<String>,
     /// Scripted failures, oldest first, per RPC.
     failures: HashMap<String, VecDeque<Code>>,
+    /// Bearer tokens the server accepts, or `None` for "any, including none at
+    /// all" — the default, which is what every test that is not about
+    /// authentication wants. See [`FakeServer::accept_only_tokens`].
+    accepted_tokens: Option<BTreeSet<String>>,
     /// Per-RPC artificial latency.
     delays: HashMap<String, Duration>,
     /// Every call the server saw, in order.
@@ -355,6 +363,33 @@ impl FakeServer {
         self.lock().delays.insert(rpc.to_string(), delay);
     }
 
+    /// From now on, answer any call whose bearer token is not one of `tokens`
+    /// with `UNAUTHENTICATED` (and the `reason: "unauthenticated"` the real
+    /// server attaches), on every RPC including the two streaming ones.
+    ///
+    /// `tokens` are the raw token values the mock identity provider issues
+    /// (`"token-2"`), not whole header values: the `"Bearer "` prefix the SDK
+    /// builds is added here.
+    ///
+    /// This is how a test pins down *which* token a call carried without
+    /// reading the recorded header afterwards — and, more to the point, the
+    /// only way to prove that a call which gets **no** automatic retry (a
+    /// streaming upload) nonetheless went out with a token the server would
+    /// accept. A call carrying no `authorization` at all is rejected too, so a
+    /// `disable_auth()` client must not be pointed at a server configured this
+    /// way.
+    pub fn accept_only_tokens<I, T>(&self, tokens: I)
+    where
+        I: IntoIterator<Item = T>,
+        T: AsRef<str>,
+    {
+        let accepted = tokens
+            .into_iter()
+            .map(|token| format!("Bearer {}", token.as_ref()))
+            .collect();
+        self.lock().accepted_tokens = Some(accepted);
+    }
+
     /// Read one stored file back, as the server holds it.
     pub fn stored_file(&self, tenant: &str, bucket: &str, file_id: &str) -> Option<StoredFile> {
         self.lock()
@@ -518,12 +553,27 @@ impl FakeService {
                 .get("request_id")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let rejected_token = state.accepted_tokens.as_ref().is_some_and(|accepted| {
+                !authorization
+                    .as_deref()
+                    .is_some_and(|header| accepted.contains(header))
+            });
             state.calls.push(RecordedCall {
                 rpc,
                 authorization,
                 request_id,
                 request,
             });
+            if rejected_token {
+                // Recorded (so the test can see which token was offered) but
+                // rejected before anything else applies: an unacceptable
+                // credential must not consume a scripted failure meant for the
+                // call that gets through, nor wait out its delay.
+                return Err(status(
+                    Code::Unauthenticated,
+                    format!("{rpc} rejected: the bearer token is not accepted"),
+                ));
+            }
             let failure = state
                 .failures
                 .get_mut(rpc)

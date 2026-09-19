@@ -73,9 +73,23 @@ prefixes. Do not edit generated output.
   helper wraps the request, applies the per-RPC deadline, refreshes the token
   and retries once on `UNAUTHENTICATED`, and maps a failed `tonic::Status`
   into `RociaDbError::Status`. Do not call a generated client directly from a
-  new method; the only exceptions are the two streaming RPCs (`Upload`,
-  `Download`), where neither a per-call deadline nor a transparent replay
-  applies.
+  new method.
+
+  `unary` is a thin wrapper over `attempt_with_replay(operation, message,
+  timeout, call)`, which owns the refresh-and-retry and takes the deadline as
+  a parameter, over `attempt`, which applies it. `unary` passes
+  `self.request_timeout`; its sibling `server_streaming` passes `None` and is
+  how `download_file_stream` opens the `Download` stream — a rejected
+  server-streaming call resolves that opening future with the status, so it is
+  replayable on identical terms, while a `grpc-timeout` header on it would put
+  a deadline on the whole transfer. The `Upload` RPC is the one place that
+  still calls a generated client directly, from `upload_raw`'s single
+  choke point, because its request is a stream rather than a cloneable
+  message; `upload_file` replays it by rebuilding that stream and consulting
+  the same `refresh_for_replay` helper, so the rules live in exactly one
+  place. Both streaming RPCs additionally run
+  `refresh_token_before_stream` — a pre-flight `TokenManager::ensure_fresh`
+  whose failure is a `warn!`, never an error.
 - Public methods return `rociadb_sdk::Result<T>` (an alias for
   `std::result::Result<T, RociaDbError>`, defined in `src/error.rs`) rather
   than `anyhow::Result`. Extend `RociaDbError` — or add a variant, the enum is
@@ -90,10 +104,13 @@ prefixes. Do not edit generated output.
 This is a library. `tracing` at `debug!` for "what is about to happen" — one
 line per RPC with its identifying fields — and **never** `info!` or `error!`
 for routine success or failure: the caller receives the error and decides how
-to log it. `warn!` is reserved for the five conditions that already use it:
+to log it. `warn!` is reserved for the six conditions that already use it:
 `disable_auth()`, a non-`https` token URL, a failed background token refresh, a
-token response with no `expires_in`, and a token refresh that failed after an
-`UNAUTHENTICATED` response.
+token response with no `expires_in`, a token refresh that failed after an
+`UNAUTHENTICATED` response, and a failed pre-flight token refresh before a
+streaming RPC. The last two share a rule worth keeping: a refresh the SDK
+attempted on its own behalf, and then decided to carry on without, is a `warn!`
+— because the error the caller ends up seeing says nothing about it.
 
 **Never log a secret.** No tokens, no `client_secret`, no `client_id`, no
 `token_url`, no document, node, edge or file payloads. Secrets are held as

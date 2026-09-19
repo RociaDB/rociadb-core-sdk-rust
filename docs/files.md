@@ -61,12 +61,41 @@ transfer takes is a property of the file's size and the link, not of a
 single round trip. Wrap an upload or download in a `tokio::time::timeout` of
 your own when it needs a deadline.
 
+## Tokens on a streaming call
+
+A gRPC server validates the bearer token **once, when it accepts the call**, so
+a transfer that runs for an hour on a ten-minute token is not a problem. What is
+a problem is a stream that *starts* on a token about to be rejected, and the SDK
+handles that in two ways:
+
+- **Every** streaming call — all three uploads, and every download — refreshes
+  the token before opening if less than five seconds of its advertised lifetime
+  is left. A refresh that fails here is logged as a `warn!` and the call goes
+  ahead with the cached token, which may well still be valid; if it is not, the
+  server says `UNAUTHENTICATED` and that reaches you.
+- `upload_file` and the call that *opens* a download (so `download_file_stream`,
+  `download_file` and `download_file_verified`) additionally get the same
+  refresh-and-retry a unary RPC gets: an `UNAUTHENTICATED` answer triggers one
+  coalesced refresh and one re-issue. `upload_file` can do this because it owns
+  its buffer and re-sends under the same `request_id`, so a replay that lands on
+  an upload the server had already committed is deduplicated rather than written
+  twice. A download can do it because a rejected server-streaming call fails
+  before any message exists.
+
+`upload_file_chunked` and `upload_file_stream` get the pre-flight refresh and
+nothing more: their source is a stream **you** handed over, and h2 starts writing
+body frames as soon as the call opens, so "nothing has been consumed yet" is not
+a state the SDK can establish — a replay would have to re-drain a stream that is
+already partly drained. Recover by hand where it matters: `refresh_auth_token()`,
+then re-issue with a freshly built stream and the same `request_id`. See
+[authentication](authentication.md).
+
 ## The three upload tiers
 
 | Method | Input | Does for you | Use when |
 | ------ | ----- | ------------ | -------- |
-| `upload_file` | `impl Into<Vec<u8>>` | chunking **and** the SHA-256 digest | the file fits in memory |
-| `upload_file_chunked` | `Stream<Item = Vec<u8>>` | re-chunking, and validates the total against `size_bytes` | the file does not fit in memory but can be hashed ahead of time |
+| `upload_file` | `impl Into<Vec<u8>>` | chunking, the SHA-256 digest, **and** one automatic retry after `UNAUTHENTICATED` | the file fits in memory |
+| `upload_file_chunked` | `Stream<Item = std::io::Result<Bytes>>` | re-chunking, validates the total against `size_bytes`, and surfaces a failed read as `RociaDbError::Io` | the file does not fit in memory but can be hashed ahead of time |
 | `upload_file_stream` | `Stream<Item = UploadRequest>` | nothing at all | you need to build every protobuf message yourself |
 
 ### `upload_file` — an in-memory buffer
@@ -117,30 +146,73 @@ it as given and never inspects the bytes to confirm it.
 
 ### `upload_file_chunked` — a stream you cannot buffer
 
+The item type is `std::io::Result<Bytes>`, which is exactly what
+`tokio_util::io::ReaderStream` yields for any `tokio::io::AsyncRead` — a file, a
+socket, a decompressor. So the common case needs no adaptation at all: hash the
+file in one pass, then hand the reader straight over.
+
 ```rust,no_run
-use futures::stream;
+use futures::StreamExt;
 use rociadb_sdk::{FileStreamUploadOptions, RociaDbBuilder};
 use sha2::{Digest, Sha256};
+use tokio_util::io::ReaderStream;
 
 # #[tokio::main]
-# async fn main() -> rociadb_sdk::Result<()> {
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
 # let client = RociaDbBuilder::new().disable_auth().build().await?;
-let payload = std::fs::read("large-report.csv").expect("read the source file");
-let checksum: [u8; 32] = Sha256::digest(&payload).into();
-let size_bytes = payload.len() as u64;
+// First pass: measure and hash, without buffering the file either. Neither
+// value can be computed while sending, since both travel on the first gRPC
+// message.
+let mut hasher = Sha256::new();
+let mut size_bytes = 0u64;
+let mut hashing = ReaderStream::new(tokio::fs::File::open("large-report.csv").await?);
+while let Some(chunk) = hashing.next().await {
+    let chunk = chunk?;
+    size_bytes += chunk.len() as u64;
+    hasher.update(&chunk);
+}
+let checksum: [u8; 32] = hasher.finalize().into();
 
-// Whatever chunking the source naturally produces — 64 KiB here purely as
-// an example. `upload_file_chunked` re-slices to the server's 1 MiB
-// messages internally regardless of what it is handed.
-let chunks: Vec<Vec<u8>> = payload.chunks(64 * 1024).map(<[u8]>::to_vec).collect();
+// Second pass: stream it. `ReaderStream` reads in its own ~4 KiB slices and
+// `upload_file_chunked` re-slices them to the server's 1 MiB messages.
+let file = tokio::fs::File::open("large-report.csv").await?;
 
 client
     .upload_file_chunked(
         "tenant-1",
         "reports",
         "large-report.csv",
-        stream::iter(chunks),
+        ReaderStream::new(file),
         FileStreamUploadOptions::new(size_bytes, checksum).with_content_type("text/csv"),
+    )
+    .await?;
+# Ok(())
+# }
+```
+
+Any other stream of the same item type works too, so a source that is not an
+`AsyncRead` — chunks arriving from elsewhere, a generator — wraps each piece in
+`Ok(Bytes::from(..))`:
+
+```rust,no_run
+use futures::stream;
+use rociadb_sdk::{Bytes, FileStreamUploadOptions, RociaDbBuilder};
+
+# #[tokio::main]
+# async fn main() -> rociadb_sdk::Result<()> {
+# let client = RociaDbBuilder::new().disable_auth().build().await?;
+# let (size_bytes, checksum) = (6u64, [0u8; 32]);
+let chunks = stream::iter(vec![
+    Ok(Bytes::from_static(b"abc")),
+    Ok(Bytes::from_static(b"def")),
+]);
+client
+    .upload_file_chunked(
+        "tenant-1",
+        "reports",
+        "assembled.csv",
+        chunks,
+        FileStreamUploadOptions::new(size_bytes, checksum),
     )
     .await?;
 # Ok(())
@@ -154,11 +226,23 @@ has been read from the caller's stream. Neither can be derived on the fly
 the way `upload_file` derives them from a complete buffer: hash the source
 ahead of time.
 
+The `Result` in the item type is the load-bearing half. A read that fails partway
+through yields an `Err`, and that **fails the upload** with `RociaDbError::Io`
+carrying the `std::io::Error` — nothing further is pulled from the stream. With a
+plain-bytes item type a failing source could only end early, and the upload would
+be reported as a size mismatch, blaming your `size_bytes` for a disk that could
+not be read. The `Bytes` items are copied into the outgoing chunk buffer like any
+other bytes: the type is there for what it makes easy at the call site, not to
+make the upload zero-copy.
+
 If the stream ends up producing more or fewer total bytes than `size_bytes`
 declared, the call fails with `RociaDbError::Validation` naming the actual
 byte counts, rather than sending a stream the server would reject anyway at
-the end. It never holds more than one outgoing chunk's worth of bytes at a
-time, however the input happens to be sliced.
+the end. Both client-side failures — the `Io` and the `Validation` — are
+reported ahead of whatever status the server returned for the stream that then
+ended early, because they say what actually went wrong. It never holds more than
+one outgoing chunk's worth of bytes at a time, however the input happens to be
+sliced.
 
 **Naming trap when porting code between SDKs:** despite doing the
 re-chunking and the validation, this method is not called

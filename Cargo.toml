@@ -30,6 +30,15 @@ rust-version = "1.88"
 exclude = [".github", "AGENTS.md", "deny.toml", "mise.toml"]
 
 [dependencies]
+# `Bytes` is the item type of the chunk stream `upload_file_chunked` takes
+# (`Stream<Item = std::io::Result<Bytes>>`), so it appears in a public
+# signature and is re-exported at the crate root — a caller wrapping a file in
+# `tokio_util::io::ReaderStream` gets a stream of exactly that shape with no
+# adaptation. Not a new crate in the graph: `bytes` is already pulled in by
+# `tonic`, `prost`, `h2` and `reqwest`, so this only makes a direct dependency
+# out of something every build already compiled. MIT, on the `deny.toml`
+# allow-list.
+bytes = "1"
 futures = "0.3.31"
 http = "1"
 # `rustls-tls-native-roots` (not the default `rustls-tls`, which bundles the
@@ -97,7 +106,18 @@ hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 # token-refresh backoff tests advance a paused clock instead of sleeping for
 # real, so a schedule measured in seconds is still tested in microseconds. `net`
 # is for the integration tests' own listeners — the mock IdP binds one directly.
-tokio = { version = "1", features = ["rt-multi-thread", "test-util", "net"] }
+# `fs` is for `tokio::fs::File`, which `tests/files.rs` hands to a
+# `tokio_util::io::ReaderStream` to upload a real file off disk.
+tokio = { version = "1", features = ["rt-multi-thread", "test-util", "net", "fs"] }
+# The `io` feature is `ReaderStream`, the whole reason `upload_file_chunked`
+# takes `Stream<Item = std::io::Result<Bytes>>`: `tests/files.rs` wraps a real
+# `tokio::fs::File` in one and passes it straight in, so the no-adaptation claim
+# is tested against the actual type rather than a hand-rolled look-alike. The
+# feature pulls in no crate that is not already in the graph (`io = []` in
+# `tokio-util`, whose own dependencies — `bytes`, `futures-core`,
+# `futures-sink`, `pin-project-lite`, `tokio` — are all present), and
+# `tokio-util` itself already arrives through `h2`.
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 # The integration tests run all four services in-process over a loopback
 # socket: `server` is tonic's server stack and `router` the `add_service`
 # router the four generated services are assembled into. Both are test-only —

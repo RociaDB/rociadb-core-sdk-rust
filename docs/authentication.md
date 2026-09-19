@@ -6,9 +6,9 @@ token, installs an interceptor that stamps an `authorization` header on
 every outgoing RPC, and starts a background task that keeps the token fresh
 for as long as the client — or any of its clones — is alive.
 
-Three things then happen on their own, and none of them needs calling code:
-scheduled refresh, fast recovery from a failed refresh, and
-refresh-and-retry on `UNAUTHENTICATED`.
+Four things then happen on their own, and none of them needs calling code:
+scheduled refresh, fast recovery from a failed refresh, refresh-and-retry on
+`UNAUTHENTICATED`, and a pre-flight refresh before a streaming call.
 
 ## Configuring credentials
 
@@ -128,14 +128,54 @@ coalesced token refresh and re-issues the call exactly once.
   failure is reported as a `warn!`.
 - The deadline from `request_timeout` is per attempt, so a call that is
   retried this way can take up to twice that long.
-- The two streaming RPCs are **not** covered: an upload or download stream
-  is the caller's and can only be consumed once. Call `refresh_auth_token()`
-  yourself and retry there.
 
-So a caller who sees `RociaDbError::is_unauthenticated()` on a unary call is
-seeing a refreshed credential being rejected too — the client id or secret
-is wrong, revoked, or not entitled to this deployment. The fix is in the
-configuration, not in another retry.
+So a caller who sees `RociaDbError::is_unauthenticated()` on a call that is
+covered here is seeing a refreshed credential being rejected too — the client id
+or secret is wrong, revoked, or not entitled to this deployment. The fix is in
+the configuration, not in another retry.
+
+## What the streaming RPCs get
+
+The two streaming RPCs — `Upload` and `Download` — cannot all be treated the
+same way, because what can be replayed differs. Both halves below are automatic;
+neither needs calling code.
+
+| Call | Pre-flight refresh | Replay after `UNAUTHENTICATED` |
+| ---- | ------------------ | ------------------------------ |
+| `upload_file` | yes | **yes** — same buffer, same `request_id` |
+| `upload_file_chunked` | yes | no |
+| `upload_file_stream` | yes | no |
+| `download_file_stream` / `download_file` / `download_file_verified` | yes | **yes** — on the call that opens the stream |
+
+**The pre-flight refresh.** Before opening any of these calls, the SDK refreshes
+the token if less than **five seconds** of its advertised lifetime is left, and
+otherwise does nothing at all (one clock read). Five seconds is enough because a
+gRPC server validates the bearer token **once, when it accepts the call** — a
+transfer that outlives its token keeps running, so the margin only has to cover
+the gap between reading the cached token and the server checking it. A pre-flight
+refresh that fails is a `warn!` rather than an error: the cached token may well
+still be valid, so the call goes ahead with it, and if it really is finished the
+server's `UNAUTHENTICATED` reaches you as usual. Concurrent callers are coalesced
+into one fetch, like every other refresh. `TokenManager::ensure_fresh(margin)` is
+the same check, public, for code driving authentication itself.
+
+**The replay.** `upload_file` owns its buffer, so it can rebuild the request
+stream and re-send it once — with the **same** `request_id`, which is what makes
+that safe: the server deduplicates on it, so a replay that lands on an upload it
+had already committed is absorbed rather than written twice. A download is
+replayable for a different reason: a server that rejects a server-streaming call
+does so before any message exists, so tonic resolves the opening call with the
+status and there is nothing consumed to replay around. Neither carries a
+`grpc-timeout` header (`request_timeout` does not apply to a transfer), and
+neither covers a status that arrives later, in the stream's trailers.
+
+**Why not the other two.** `upload_file_chunked` and `upload_file_stream` are
+handed a stream that belongs to the caller, and h2 begins writing body frames as
+soon as the call opens — so "nothing has been consumed yet" is not a state the
+SDK can establish, let alone rely on, and a replay would mean re-draining a
+stream that is already partly drained. Recover by hand: call
+`refresh_auth_token()` and re-issue with a freshly built stream, reusing the same
+`request_id` so the server recognizes the replay.
 
 ## `refresh_auth_token` vs `invalidate_auth_token`
 
@@ -148,7 +188,9 @@ propagates the fetch error. Concurrent callers are coalesced into a single
 in-flight fetch, so a fleet of tasks all recovering at once produces one
 POST rather than one per task. Reach for it right before retrying a call
 that just failed, for a token you know has been revoked, for a credential
-rotation to pick up immediately, or after an `UNAUTHENTICATED` on a stream.
+rotation to pick up immediately, or after an `UNAUTHENTICATED` on an
+`upload_file_chunked` / `upload_file_stream` — the two calls nothing retries for
+you.
 
 `invalidate_auth_token()` is its **lazy** counterpart: synchronous, returns
 immediately, and only wakes the background refresh task so it fetches at its
@@ -156,19 +198,45 @@ next opportunity — nobody pays for the network round trip inline. It is
 honoured even while the task is waiting out a retry backoff.
 
 ```rust,no_run
-# use rociadb_sdk::RociaDbBuilder;
+# use rociadb_sdk::{FileStreamUploadOptions, RociaDbBuilder};
+# use tokio_util::io::ReaderStream;
 # #[tokio::main]
-# async fn main() -> rociadb_sdk::Result<()> {
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
 # let client = RociaDbBuilder::new().build().await?;
-// A streaming download is not retried for you: refresh and retry yourself.
-match client.download_file("tenant-1", "assets", "manual.txt").await {
-    Ok(bytes) => println!("{} bytes", bytes.len()),
+# let (size_bytes, checksum) = (0u64, [0u8; 32]);
+// A chunked upload is not retried for you — the SDK cannot re-drain a stream
+// you handed over — so refresh and re-issue it yourself, with a *fresh* stream
+// and the same `request_id` so the server recognizes the replay.
+let options = FileStreamUploadOptions::new(size_bytes, checksum)
+    .with_request_id("import-42:large-report.csv");
+let source = || async {
+    Ok::<_, std::io::Error>(ReaderStream::new(
+        tokio::fs::File::open("large-report.csv").await?,
+    ))
+};
+let upload = client.upload_file_chunked(
+    "tenant-1",
+    "reports",
+    "large-report.csv",
+    source().await?,
+    options.clone(),
+);
+match upload.await {
+    Ok(()) => println!("uploaded"),
     Err(error) if error.is_unauthenticated() => {
         client.refresh_auth_token().await?;
-        let bytes = client.download_file("tenant-1", "assets", "manual.txt").await?;
-        println!("{} bytes", bytes.len());
+        client
+            .upload_file_chunked(
+                "tenant-1",
+                "reports",
+                "large-report.csv",
+                source().await?,
+                options,
+            )
+            .await?;
+        println!("uploaded on the second attempt");
     }
-    Err(error) => return Err(error),
+    Err(error) => return Err(error.into()),
 }
 
 // Elsewhere — a background health check, say — that observed staleness but
@@ -184,8 +252,8 @@ client.invalidate_auth_token();
 The two need different handling, and confusing them wastes retries:
 
 - **`UNAUTHENTICATED`** — the token is missing, expired, malformed, or
-  issued by a different issuer. This is the renewal signal, and unary calls
-  already act on it.
+  issued by a different issuer. This is the renewal signal, and every call but
+  `upload_file_chunked` and `upload_file_stream` already acts on it.
 - **`PERMISSION_DENIED`** — the token is valid but lacks the required scope.
   Retrying after a refresh will not help, because a fresh token carries the
   same scope. It happens in exactly two cases: a read-only client calling
@@ -233,6 +301,10 @@ let _interceptor = manager.interceptor();
 // Mark the cached token stale without blocking; the background task picks
 // it up. `TokenManager::refresh_now` is the awaiting counterpart.
 manager.request_refresh();
+
+// Refresh only if little of the cached token's lifetime is left — the check the
+// SDK itself runs before a streaming call. A no-op (one clock read) otherwise.
+manager.ensure_fresh(Duration::from_secs(5)).await?;
 # Ok(())
 # }
 ```

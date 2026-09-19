@@ -317,7 +317,11 @@ environment unless `auth_client_credentials` supplies them. `build()`
 fetches the first token; from then on a background task refreshes it before
 it expires, and **every unary RPC answered `UNAUTHENTICATED` refreshes the
 token and retries itself exactly once**. Seeing that status therefore means
-the refreshed credential was rejected too. Credentials and tokens are held
+the refreshed credential was rejected too. A streaming call refreshes up front
+if its token is nearly expired, and `upload_file` and the call that opens a
+download retry once as well; only `upload_file_chunked` and
+`upload_file_stream` are left to retry by hand, since the SDK cannot re-drain a
+stream you handed over. Credentials and tokens are held
 as `SecretString`, so they are redacted by every formatter and zeroized on
 drop. `disable_auth()` turns the whole mechanism off for a controlled local
 deployment. See [authentication](docs/authentication.md).

@@ -49,6 +49,13 @@ pub type Result<T> = std::result::Result<T, RociaDbError>;
 /// fixing the network or the server, a `Validation` error by changing the
 /// arguments of one call.
 ///
+/// [`RociaDbError::Io`] carries no status either, and for a third reason: the
+/// failure is in a source the *caller* handed over. It is raised only by
+/// [`upload_file_chunked`](crate::RociaDbClient::upload_file_chunked), when the
+/// chunk stream it is draining yields an `Err` — a read that failed on the
+/// caller's file or socket, which ends the upload and is reported ahead of
+/// whatever the server made of the truncated stream.
+///
 /// Two more variants carry no status for a different reason: the call
 /// succeeded and the *data* it returned is wrong.
 /// [`RociaDbError::ChecksumMismatch`] and [`RociaDbError::SizeMismatch`] are
@@ -165,6 +172,36 @@ pub enum RociaDbError {
         /// zero-based position of the offending item within the page.
         #[source]
         source: serde_json::Error,
+    },
+
+    /// A source the SDK was reading on the caller's behalf failed with an I/O
+    /// error.
+    ///
+    /// Raised only by
+    /// [`upload_file_chunked`](crate::RociaDbClient::upload_file_chunked),
+    /// whose `chunks` stream yields `std::io::Result<Bytes>`: an `Err` item —
+    /// a read error from the file, socket or pipe behind a
+    /// `tokio_util::io::ReaderStream`, say — ends the upload and surfaces
+    /// here. The failure is the caller's own source, not the server and not
+    /// the transport, which is why it carries neither a
+    /// [`tonic::Status`] nor a byte count: the upload was abandoned partway
+    /// through, so nothing was stored (the server only publishes a file once
+    /// it has received and validated the whole stream) and this error takes
+    /// precedence over whatever status the server made of the truncated
+    /// stream.
+    ///
+    /// [`Display`](std::fmt::Display) folds in the underlying
+    /// [`std::io::Error`], which is also available as the
+    /// [`source`](std::error::Error::source) for a caller that needs its
+    /// [`kind`](std::io::Error::kind).
+    #[error("failed to read {context}: {source}")]
+    Io {
+        /// Name of what was being read (for example
+        /// `"the upload chunk stream"`).
+        context: &'static str,
+        /// The I/O error the source reported.
+        #[source]
+        source: std::io::Error,
     },
 
     /// A client-side rule about the *data* of one call was violated before
@@ -800,6 +837,35 @@ mod tests {
         );
         assert_eq!(error.code(), None);
         assert!(error.status().is_none());
+    }
+
+    #[test]
+    fn io_names_what_was_being_read_folds_in_the_cause_and_keeps_its_kind() {
+        let error = RociaDbError::Io {
+            context: "the upload chunk stream",
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("the upload chunk stream"),
+            "the message must name what was being read, got: {message}"
+        );
+        assert!(
+            message.contains("permission denied"),
+            "Display must fold in the underlying io::Error, got: {message}"
+        );
+        // The caller's source failed, not the server: no gRPC status, and the
+        // `io::Error` is reachable as the source so `kind()` can be matched on.
+        assert_eq!(error.code(), None);
+        assert_eq!(error.reason(), None);
+        assert!(error.status().is_none());
+        let source = std::error::Error::source(&error).expect("the io::Error must be the source");
+        assert_eq!(
+            source
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::PermissionDenied)
+        );
     }
 
     #[test]

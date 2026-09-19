@@ -46,13 +46,13 @@ name nor a gap in major version is a signal of a capability difference.
 
 | Capability | Rust ([`rociadb-core-sdk-rust`](https://github.com/RociaDB/rociadb-core-sdk-rust)) | TypeScript ([`rociadb-core-sdk-ts`](https://github.com/RociaDB/rociadb-core-sdk-ts)) | Note |
 |---|---|---|---|
-| Assisted streaming upload — re-chunks to the 1 MiB wire contract, validates the total, caller supplies the checksum | `upload_file_chunked` | `uploadFileStream` | Names do **not** correspond — see below. |
+| Assisted streaming upload — re-chunks to the 1 MiB wire contract, validates the total, caller supplies the checksum | `upload_file_chunked` | `uploadFileStream` | Names do **not** correspond — see below. The Rust source stream is fallible (`Stream<Item = std::io::Result<Bytes>>`, so a `tokio_util::io::ReaderStream` needs no adaptation and a failed read surfaces as `RociaDbError::Io`); the TypeScript one takes an `AsyncIterable<Uint8Array>`, where a throwing iterator plays the same role. |
 | Raw streaming upload — zero validation, caller builds every protobuf message | `upload_file_stream` | `uploadFileRaw` | Names do **not** correspond — the mirror image of the row above. |
 | Idempotency key on a document write that can also bind a graph node | `put_document(t, c, id, &value, DocumentWriteOptions::new().with_request_id(rid).with_node_binding(..))` | `createDocument(..., { requestId })` | Same capability, different shape: an options struct passed as the last argument vs. an options object — the established pattern on each side. In Rust 2.0 the one key covers **both** writes (the server's dedup scope includes the operation, so the `PutDoc` and `PutNode` markers cannot collide), which makes replaying the whole call idempotent. |
 | Releasing the connection and the background token-refresh task | Drop the last live `RociaDbClient` clone | `client.close()` | No Rust method by design — see below. |
 | Lazy token invalidation at the level of the background refresh task itself (not the `RociaDbClient`-level wrapper, which *does* translate mechanically: `invalidate_auth_token` ↔ `invalidateToken`) | `TokenManager::request_refresh` | `TokenManager.invalidate()` | Different verb chosen independently on each side for the same "mark it stale, wake the background task, do not block" idea. |
 | Standalone OAuth2 token fetch, usable outside of `TokenManager` | `auth::fetch_token` | `fetchOAuthToken` (exported from `auth.ts`, re-exported at the package root) | TypeScript needed a name that does not collide with the `fetch` Web API it wraps; Rust has no such collision. |
-| Discriminating why an `Err` happened | `RociaDbError` — a `match`-able `#[non_exhaustive]` enum: `Status { .. }` / `Config { .. }` / `Connection { .. }` / `Auth { .. }` / `Encode { .. }` / `Decode { .. }` / `Validation(String)` / `ChecksumMismatch { .. }` / `SizeMismatch { .. }` | `RociaDbError.kind: RociaDbErrorKind`, one class with a `"status" \| "connection" \| "auth" \| "encode" \| "decode" \| "validation"` field | Different shape, not just a different name — see below. The Rust enum also carries three causes the TypeScript union above does not name, all added in 2.0. |
+| Discriminating why an `Err` happened | `RociaDbError` — a `match`-able `#[non_exhaustive]` enum: `Status { .. }` / `Config { .. }` / `Connection { .. }` / `Auth { .. }` / `Encode { .. }` / `Decode { .. }` / `Io { .. }` / `Validation(String)` / `ChecksumMismatch { .. }` / `SizeMismatch { .. }` | `RociaDbError.kind: RociaDbErrorKind`, one class with a `"status" \| "connection" \| "auth" \| "encode" \| "decode" \| "validation"` field | Different shape, not just a different name — see below. The Rust enum also carries four causes the TypeScript union above does not name, all added in 2.0. |
 | Escape hatch to the raw generated protobuf/gRPC types, to build a custom client against the same `.proto` | **none** — the generated module is private (`pub(crate) mod pb`). The generated types that reach a public signature are re-exported at the crate root instead: `CollectionInfo`, `StatResponse`, `Neighbor`, `UploadRequest`, `DownloadResponse`, and `Streaming` | the `rocia-db-sdk/proto` subpath export | **A real capability gap, not a naming difference.** TypeScript lets a caller reach every generated type; Rust deliberately does not, because the crate's public surface is under semantic versioning from 2.0.0 onward and generated code is reshaped by any prost or tonic upgrade. Reopen this if a Rust consumer needs it — it would be an addition, not a removal. |
 
 ## The error-kind trap, spelled out
@@ -70,9 +70,10 @@ a discriminated union instead of a variant match. Neither representation is
 set of causes in its own language.
 
 The sets themselves no longer line up exactly. Rust 2.0 split configuration
-mistakes out of `Connection` into their own `Config` variant, and added
-`ChecksumMismatch` / `SizeMismatch` for `download_file_verified`. A
-TypeScript caller porting a `match` will find three arms with no `kind` to
+mistakes out of `Connection` into their own `Config` variant, added
+`ChecksumMismatch` / `SizeMismatch` for `download_file_verified`, and added `Io`
+for a chunk stream whose source failed to read. A
+TypeScript caller porting a `match` will find four arms with no `kind` to
 narrow on — see the unverified-parity note above, and
 [errors and retries](errors-and-retries.md) for what each one means.
 

@@ -12,7 +12,7 @@
 
 use futures::stream;
 use rociadb_sdk::{
-    Channel, ClientTlsConfig, DocumentPage, DocumentQueryFilter, DocumentQueryOperator,
+    Bytes, Channel, ClientTlsConfig, DocumentPage, DocumentQueryFilter, DocumentQueryOperator,
     DocumentQuerySort, DocumentQuerySortDirection, DocumentWriteOptions, Edge, EdgeInput,
     ExposeSecret, FileStreamUploadOptions, FileUploadOptions, Neighbor, NeighborNode, NodeBinding,
     NodeInput, Page, Result, RetryPolicy, RociaDbBuilder, RociaDbClient, RociaDbError,
@@ -306,7 +306,10 @@ async fn uploads_accept_owned_and_borrowed_buffers(client: Arc<RociaDbClient>) -
             "tenant",
             "assets",
             "streamed.bin",
-            stream::iter(vec![vec![1u8; 8], vec![2u8; 2]]),
+            stream::iter(vec![
+                Ok(Bytes::from_static(&[1u8; 8])),
+                Ok(Bytes::from_static(&[2u8; 2])),
+            ]),
             FileStreamUploadOptions::new(10, [0u8; 32])
                 .with_content_type("application/octet-stream")
                 .with_request_id("stable-chunked-key"),
@@ -316,6 +319,27 @@ async fn uploads_accept_owned_and_borrowed_buffers(client: Arc<RociaDbClient>) -
         .upload_file_stream(stream::iter(vec![UploadRequest::default()]))
         .await?;
     Ok(())
+}
+
+// `upload_file_chunked`'s item type is `std::io::Result<Bytes>` precisely so a
+// `tokio_util::io::ReaderStream` — the obvious way to turn a file, a socket or
+// a decompressor into a chunk stream — is accepted with no adapter at all. If
+// that ever stopped being true, this function would stop compiling, which is
+// the whole point of the file.
+#[allow(dead_code)]
+async fn a_reader_stream_is_a_chunk_stream(
+    client: Arc<RociaDbClient>,
+    file: tokio::fs::File,
+) -> Result<()> {
+    client
+        .upload_file_chunked(
+            "tenant",
+            "assets",
+            "from-a-file.bin",
+            tokio_util::io::ReaderStream::new(file),
+            FileStreamUploadOptions::new(10, [0u8; 32]),
+        )
+        .await
 }
 
 // The shared client must survive being sent across tasks, which is what a

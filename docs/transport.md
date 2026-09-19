@@ -95,6 +95,16 @@ not of the SDK, and a deadline meant for a single round trip would abort a
 perfectly healthy multi-gigabyte transfer. Bound those with a
 `tokio::time::timeout` of your own.
 
+That holds even for the *opening* call of a download, which otherwise goes
+through the same path as a unary RPC: the exclusion is about the `grpc-timeout`
+header, which announces a deadline for the whole RPC. tonic's own server enforces
+that header only up to the response headers, so against a tonic server it would
+not truncate a slow body — but it *would* fail a download whose first header
+takes longer than the deadline, reporting `CANCELLED` for a transfer that was
+merely slow to start. And the gRPC specification makes the header a deadline for
+the entire call, which most implementations honour by cutting the stream once it
+expires.
+
 ## Custom TLS
 
 `tls_config` replaces the default `ClientTlsConfig::new().with_native_roots()`

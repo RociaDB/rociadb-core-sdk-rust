@@ -92,7 +92,22 @@
 //! - **Refresh-and-retry on `UNAUTHENTICATED`.** A unary RPC that comes back
 //!   `UNAUTHENTICATED` triggers one coalesced token refresh and is then
 //!   re-issued exactly once. A caller only sees that status when the second
-//!   attempt fails too, or when the refresh itself did.
+//!   attempt fails too, or when the refresh itself did. The same applies to
+//!   the two calls that open a stream but have not yet handed anything over:
+//!   [`upload_file`](RociaDbClient::upload_file), whose buffer it owns and can
+//!   re-send under the same idempotency key, and the opening call of
+//!   [`download_file_stream`](RociaDbClient::download_file_stream) (so also
+//!   [`download_file`](RociaDbClient::download_file) and
+//!   [`download_file_verified`](RociaDbClient::download_file_verified)).
+//! - **A pre-flight refresh before every streaming RPC.** An upload or
+//!   download whose cached token has less than a few seconds of life left
+//!   refreshes it before opening the call, so a stream never starts on a token
+//!   the server is about to reject. This is all
+//!   [`upload_file_chunked`](RociaDbClient::upload_file_chunked) and
+//!   [`upload_file_stream`](RociaDbClient::upload_file_stream) get: a request
+//!   stream the caller has handed over cannot be replayed. A pre-flight
+//!   refresh that fails is a `warn!`, not an error — the cached token may
+//!   still work, and the call proceeds with it.
 //!
 //! [`RociaDbClient::refresh_auth_token`] and
 //! [`RociaDbClient::invalidate_auth_token`] remain for driving a refresh out
@@ -184,11 +199,12 @@
 //! the crate root for that reason; depend on the re-exports: the `pb` module
 //! itself is private.
 //!
-//! The same caveat covers the four types re-exported straight from another
+//! The same caveat covers the five types re-exported straight from another
 //! crate so that configuring this one needs no extra direct dependency:
-//! [`Streaming`], [`Channel`] and [`ClientTlsConfig`] from `tonic`, and
-//! [`SecretString`] (with [`ExposeSecret`]) from `secrecy`. A major upgrade
-//! of either crate can reshape them without this SDK's own API changing.
+//! [`Streaming`], [`Channel`] and [`ClientTlsConfig`] from `tonic`,
+//! [`SecretString`] (with [`ExposeSecret`]) from `secrecy`, and [`Bytes`]
+//! from `bytes`. A major upgrade of any of those crates can reshape them
+//! without this SDK's own API changing.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -241,6 +257,15 @@ pub(crate) mod pb;
 mod retry;
 mod tenant;
 
+/// Re-exported so callers do not need `bytes` as a direct dependency just to
+/// name the item type of the chunk stream
+/// [`RociaDbClient::upload_file_chunked`] takes
+/// (`Stream<Item = std::io::Result<Bytes>>`). A `tokio_util::io::ReaderStream`
+/// already yields exactly that, so a caller wrapping a file or socket never has
+/// to build a [`Bytes`] value by hand. The crate documentation's stability
+/// caveat applies: a major `bytes` upgrade can reshape this type without the
+/// SDK's own API changing.
+pub use bytes::Bytes;
 pub use document::{
     DocumentPage, DocumentQueryFilter, DocumentQueryOperator, DocumentQuerySort,
     DocumentQuerySortDirection, DocumentWriteOptions, NodeBinding,
@@ -316,6 +341,23 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// client's authentication outright: it exists to break a hang, not to
 /// enforce a service level.
 const OAUTH_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How much of the cached token's lifetime must be left for a streaming RPC to
+/// start without refreshing it first. Below this,
+/// [`RociaDbClient::refresh_token_before_stream`] refreshes (coalesced with any
+/// refresh already in flight) before the call opens.
+///
+/// A few seconds is genuinely enough, and deliberately much shorter than the
+/// token's whole lifetime: **a gRPC server validates the bearer token once,
+/// when it accepts the call**, so a transfer that runs for an hour on a
+/// 600-second token is not a problem — only a transfer that *starts* with a
+/// token already past its expiry is. The margin therefore has to cover just the
+/// gap between reading the cached token and the server checking it: the refresh
+/// round trip that this triggers, the connection setup, and any scheduling
+/// delay in between. Five seconds covers all of it with room to spare, while
+/// staying short enough that the check is a no-op on essentially every call —
+/// the background refresh task already replaces the token after two thirds of
+/// its lifetime, so this only ever fires when that task has been failing.
+const STREAMING_TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 enum BuilderAuthConfig {
@@ -839,7 +881,8 @@ impl RociaDbBuilder {
     /// returned `RociaDbClient` or any of its clones is kept alive; a
     /// refresh that fails is retried on a short backoff until one succeeds.
     /// Every unary RPC also refreshes and retries once on its own when the
-    /// server answers `UNAUTHENTICATED`, so
+    /// server answers `UNAUTHENTICATED`, and every streaming RPC refreshes
+    /// before it opens when its token is nearly expired, so
     /// [`RociaDbClient::refresh_auth_token`] is only needed to drive a
     /// refresh out of band.
     ///
@@ -1042,15 +1085,20 @@ impl RociaDbClient {
     /// server answers `UNAUTHENTICATED`: the token is refreshed (coalesced
     /// with any concurrent refresh) and the call is re-issued a single time,
     /// so a caller normally sees that status only when the retry failed too.
+    /// [`RociaDbClient::upload_file`] and the opening call of
+    /// [`RociaDbClient::download_file_stream`] do the same, and every
+    /// streaming call refreshes up front when its token is nearly expired.
     /// A background task also refreshes the token before it expires, and
     /// retries on a short backoff when a refresh fails.
     ///
     /// What is left for this method is the out-of-band cases: a token you
     /// know has been revoked, a credential rotation you want to pick up
-    /// immediately, a streaming upload or download (neither of which is
-    /// retried automatically — the automatic path covers unary RPCs only)
-    /// that failed with `UNAUTHENTICATED`, or code that wants to pay the
-    /// refresh cost up front rather than on the next call.
+    /// immediately, an [`upload_file_chunked`](RociaDbClient::upload_file_chunked)
+    /// or [`upload_file_stream`](RociaDbClient::upload_file_stream) that failed
+    /// with `UNAUTHENTICATED` (a request stream the caller has handed over
+    /// cannot be replayed for them, so those two are the only calls left
+    /// without an automatic retry), or code that wants to pay the refresh cost
+    /// up front rather than on the next call.
     ///
     /// `UNAUTHENTICATED` is the renewal signal, as opposed to
     /// `PERMISSION_DENIED`, which means the token is valid but lacks the
@@ -1091,14 +1139,16 @@ impl RociaDbClient {
     /// Every unary call in the crate goes through here — including the ones
     /// the batch helpers ([`RociaDbClient::put_nodes`],
     /// [`RociaDbClient::add_edges`]) and the neighbor-node fan-out issue
-    /// one per item. Only the two streaming RPCs (`Upload`, `Download`) call
-    /// the generated client directly, because neither a per-call deadline
-    /// nor a transparent replay applies to a stream the caller is feeding
-    /// or draining.
+    /// one per item.
     ///
     /// That single choke point is the point: both behaviours below are
     /// properties of "any unary RPC", and belong here rather than repeated
-    /// at twenty call sites.
+    /// at twenty call sites. The deadline is the half that is genuinely
+    /// unary-only; the refresh-and-retry half is shared with the opening call
+    /// of the `Download` stream through
+    /// [`RociaDbClient::attempt_with_replay`], and with
+    /// [`RociaDbClient::upload_file`]'s replay of its own request stream
+    /// through [`RociaDbClient::refresh_for_replay`].
     ///
     /// # Deadline
     ///
@@ -1121,16 +1171,6 @@ impl RociaDbClient {
     /// itself fails, the *original* `UNAUTHENTICATED` is returned (it
     /// describes what the caller actually asked for) and the refresh failure
     /// is reported as a `warn!`.
-    ///
-    /// This is why `Req: Clone`: the first attempt consumes `message`, so a
-    /// replay needs a copy made beforehand. The clone happens only when auth
-    /// is enabled — with `disable_auth()` no refresh exists, nothing can be
-    /// replayed, and every RPC in the crate would otherwise pay for a copy
-    /// that is never read.
-    ///
-    /// `call` takes the whole `tonic::Request` (not just the message) so
-    /// this function stays the only place that touches per-call metadata
-    /// and extensions. It is `Fn`, not `FnOnce`, for the same replay reason.
     pub(crate) async fn unary<Req, Resp, F, Fut>(
         &self,
         operation: &'static str,
@@ -1142,20 +1182,136 @@ impl RociaDbClient {
         F: Fn(tonic::Request<Req>) -> Fut,
         Fut: Future<Output = std::result::Result<tonic::Response<Resp>, tonic::Status>>,
     {
+        self.attempt_with_replay(operation, message, self.request_timeout, call)
+            .await
+    }
+
+    /// Open one server-streaming RPC — in this crate, `Download` — with the
+    /// same refresh-and-retry as [`RociaDbClient::unary`] and **no** per-RPC
+    /// deadline.
+    ///
+    /// Only the *opening* call is covered, which is exactly the call this
+    /// returns: tonic resolves a server-streaming request once the response
+    /// headers arrive, and a server that rejects the call outright answers
+    /// with a trailers-only response (the `grpc-status` in the headers), which
+    /// tonic turns into an `Err` from this very future — before a single
+    /// message exists. An `UNAUTHENTICATED` rejection is therefore replayable
+    /// on identical terms to a unary call: nothing has been handed to the
+    /// caller and nothing has been consumed. A status that arrives *later*,
+    /// in the stream's trailers, reaches the caller through
+    /// [`Streaming::message`](tonic::codec::Streaming::message) and is none of
+    /// this function's business.
+    ///
+    /// # Why no deadline
+    ///
+    /// [`RociaDbBuilder::request_timeout`] is deliberately not applied, and
+    /// that is a decision about the `grpc-timeout` header rather than about
+    /// the local `tokio::time::timeout`. The header would announce a deadline
+    /// for the whole RPC, and how long a download takes is a property of the
+    /// file's size and the link, not of a round trip.
+    ///
+    /// Two concrete consequences, the first verified against tonic 0.14:
+    /// tonic's own server enforces the header through the same
+    /// `GrpcTimeout` layer as its client, and that layer only races the future
+    /// that produces the response *headers* — so against a tonic server the
+    /// header would not truncate a slow body, but it *would* kill a download
+    /// whose first response header takes longer than the deadline (a cold
+    /// file, a slow storage seek), reporting `CANCELLED` on a transfer that
+    /// was merely slow to start. And the gRPC specification makes
+    /// `grpc-timeout` a deadline for the entire call, so a server that
+    /// implements it that way — most do — would cut the stream mid-body once
+    /// it expired, turning a healthy multi-gigabyte transfer into a truncated
+    /// one. Callers who want a bound on a transfer wrap the whole thing in a
+    /// `tokio::time::timeout` of their own, which is what the public docs say.
+    pub(crate) async fn server_streaming<Req, Resp, F, Fut>(
+        &self,
+        operation: &'static str,
+        message: Req,
+        call: F,
+    ) -> Result<Resp>
+    where
+        Req: Clone,
+        F: Fn(tonic::Request<Req>) -> Fut,
+        Fut: Future<Output = std::result::Result<tonic::Response<Resp>, tonic::Status>>,
+    {
+        self.attempt_with_replay(operation, message, None, call)
+            .await
+    }
+
+    /// The replay core shared by [`RociaDbClient::unary`] and
+    /// [`RociaDbClient::server_streaming`]: one attempt under `timeout`, and
+    /// on `UNAUTHENTICATED` one token refresh followed by exactly one more
+    /// attempt. `timeout` is a parameter rather than a read of
+    /// [`RociaDbClient::request_timeout`] precisely so the two callers can
+    /// differ on the deadline while sharing every rule about the replay.
+    ///
+    /// This is why `Req: Clone`: the first attempt consumes `message`, so a
+    /// replay needs a copy made beforehand. The clone happens only when auth
+    /// is enabled — with `disable_auth()` no refresh exists, nothing can be
+    /// replayed, and every RPC in the crate would otherwise pay for a copy
+    /// that is never read.
+    ///
+    /// `call` takes the whole `tonic::Request` (not just the message) so this
+    /// function and [`RociaDbClient::attempt`] stay the only places that touch
+    /// per-call metadata and extensions. It is `Fn`, not `FnOnce`, for the
+    /// same replay reason.
+    async fn attempt_with_replay<Req, Resp, F, Fut>(
+        &self,
+        operation: &'static str,
+        message: Req,
+        timeout: Option<Duration>,
+        call: F,
+    ) -> Result<Resp>
+    where
+        Req: Clone,
+        F: Fn(tonic::Request<Req>) -> Fut,
+        Fut: Future<Output = std::result::Result<tonic::Response<Resp>, tonic::Status>>,
+    {
         let replay = self.token_manager.as_ref().map(|_| Clone::clone(&message));
-        let error = match self.attempt(operation, message, &call).await {
+        let error = match self.attempt(operation, message, timeout, &call).await {
             Ok(response) => return Ok(response),
             Err(error) => error,
         };
-        if !error.is_unauthenticated() {
+        // A token manager is present exactly when auth is enabled, which is
+        // exactly when `replay` was cloned above — so this never falls through
+        // in practice, and returning the original error is the right answer if
+        // it ever did.
+        let Some(replay) = replay else {
+            return Err(error);
+        };
+        if !self.refresh_for_replay(operation, &error).await {
             return Err(error);
         }
-        // A token manager is present exactly when auth is enabled, which is
-        // exactly when `replay` was cloned above — so this destructuring
-        // never falls through in practice, and returning the original error
-        // is the right answer if it ever did.
-        let (Some(manager), Some(replay)) = (&self.token_manager, replay) else {
-            return Err(error);
+        self.attempt(operation, replay, timeout, &call).await
+    }
+
+    /// Whether `error` is an `UNAUTHENTICATED` the caller should replay once,
+    /// refreshing the token here if so.
+    ///
+    /// The one place the crate's "refresh once, then replay once" rule lives.
+    /// [`RociaDbClient::attempt_with_replay`] uses it for every unary RPC and
+    /// for the `Download` stream's opening call, and
+    /// [`RociaDbClient::upload_file`] uses it directly, because its request is
+    /// a *stream* and so has to be rebuilt rather than cloned — but must
+    /// follow exactly the same rules.
+    ///
+    /// `false` for anything other than `UNAUTHENTICATED`, `false` when auth is
+    /// disabled (there is no token to refresh and nothing a replay could
+    /// change), and `false` when the refresh itself failed — which is also the
+    /// one case that emits a `warn!`, since the original `UNAUTHENTICATED`
+    /// that the caller then returns says nothing about why no new token could
+    /// be had. Never loops: one call, one refresh, and the decision is the
+    /// caller's to act on once.
+    pub(crate) async fn refresh_for_replay(
+        &self,
+        operation: &'static str,
+        error: &RociaDbError,
+    ) -> bool {
+        if !error.is_unauthenticated() {
+            return false;
+        }
+        let Some(manager) = &self.token_manager else {
+            return false;
         };
         debug!(
             operation,
@@ -1168,21 +1324,54 @@ impl RociaDbClient {
                 "refreshing the auth token after an UNAUTHENTICATED response failed; returning \
                  the original error"
             );
-            return Err(error);
+            return false;
         }
-        self.attempt(operation, replay, &call).await
+        true
     }
 
-    /// One attempt at a unary RPC, with the per-RPC deadline applied.
+    /// Refresh the auth token before a streaming RPC when little of its
+    /// lifetime is left, and carry on regardless of whether that worked.
     ///
-    /// Split out of [`RociaDbClient::unary`] because the refresh-and-retry
-    /// path needs to run it twice, and each attempt must get its own
-    /// deadline: a retry that inherited the first attempt's remaining budget
-    /// would routinely be born already expired.
+    /// The pre-flight half of what the streaming RPCs get in place of the
+    /// refresh-and-retry a unary RPC enjoys. A no-op when auth is disabled,
+    /// and — thanks to
+    /// [`TokenManager::ensure_fresh`](auth::TokenManager::ensure_fresh) — a
+    /// clock read and nothing more whenever more than
+    /// [`STREAMING_TOKEN_REFRESH_MARGIN`] of the cached token's lifetime
+    /// remains, which is the normal case.
+    ///
+    /// A failed refresh is a `warn!` and not an error: the cached token is
+    /// still there and may well still be valid (the background refresh task
+    /// may simply have hit a blip, or the margin may be nowhere near the real
+    /// expiry), so failing the caller's upload or download over it would turn
+    /// a working call into a broken one. If the token really is finished, the
+    /// server says `UNAUTHENTICATED` and that reaches the caller.
+    pub(crate) async fn refresh_token_before_stream(&self, operation: &'static str) {
+        let Some(manager) = &self.token_manager else {
+            return;
+        };
+        if let Err(error) = manager.ensure_fresh(STREAMING_TOKEN_REFRESH_MARGIN).await {
+            warn!(
+                operation,
+                error = %error,
+                "refreshing the auth token before a streaming RPC failed; continuing with the \
+                 cached token"
+            );
+        }
+    }
+
+    /// One attempt at an RPC, with `timeout` applied as the per-attempt
+    /// deadline (`None` for no client-side deadline at all).
+    ///
+    /// Split out of [`RociaDbClient::attempt_with_replay`] because the
+    /// refresh-and-retry path needs to run it twice, and each attempt must get
+    /// its own deadline: a retry that inherited the first attempt's remaining
+    /// budget would routinely be born already expired.
     async fn attempt<Req, Resp, F, Fut>(
         &self,
         operation: &'static str,
         message: Req,
+        timeout: Option<Duration>,
         call: &F,
     ) -> Result<Resp>
     where
@@ -1190,7 +1379,7 @@ impl RociaDbClient {
         Fut: Future<Output = std::result::Result<tonic::Response<Resp>, tonic::Status>>,
     {
         let mut request = tonic::Request::new(message);
-        let Some(timeout) = self.request_timeout else {
+        let Some(timeout) = timeout else {
             return Ok(call(request).await.status_context(operation)?.into_inner());
         };
         // Tells the server the deadline (it can then stop work nobody is
