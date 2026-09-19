@@ -145,7 +145,7 @@ neither needs calling code.
 | `upload_file` | yes | **yes** — same buffer, same `request_id` |
 | `upload_file_chunked` | yes | no |
 | `upload_file_stream` | yes | no |
-| `download_file_stream` / `download_file` / `download_file_verified` | yes | **yes** — on the call that opens the stream |
+| `download_file_stream` / `download_file` / `download_file_verified` / `download_file_verified_to` | yes | **yes** — on the call that opens the stream |
 
 **The pre-flight refresh.** Before opening any of these calls, the SDK refreshes
 the token if less than **five seconds** of its advertised lifetime is left, and

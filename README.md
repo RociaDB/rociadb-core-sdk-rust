@@ -248,7 +248,8 @@ cost of `total_count`.
 Every public method returns `rociadb_sdk::Result<T>`, an alias for
 `std::result::Result<T, RociaDbError>`. `RociaDbError` is a `match`-able
 `#[non_exhaustive]` enum — `Status`, `Config`, `Connection`, `Auth`,
-`Encode`, `Decode`, `Validation`, `ChecksumMismatch`, `SizeMismatch` — with
+`Encode`, `Decode`, `Io`, `Validation`, `ChecksumMismatch`, `SizeMismatch` —
+with
 `code()`, `reason()` and `status()` accessors plus predicates for the codes
 worth branching on:
 

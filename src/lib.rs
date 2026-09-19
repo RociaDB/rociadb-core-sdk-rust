@@ -97,8 +97,9 @@
 //!   [`upload_file`](RociaDbClient::upload_file), whose buffer it owns and can
 //!   re-send under the same idempotency key, and the opening call of
 //!   [`download_file_stream`](RociaDbClient::download_file_stream) (so also
-//!   [`download_file`](RociaDbClient::download_file) and
-//!   [`download_file_verified`](RociaDbClient::download_file_verified)).
+//!   [`download_file`](RociaDbClient::download_file),
+//!   [`download_file_verified`](RociaDbClient::download_file_verified) and
+//!   [`download_file_verified_to`](RociaDbClient::download_file_verified_to)).
 //! - **A pre-flight refresh before every streaming RPC.** An upload or
 //!   download whose cached token has less than a few seconds of life left
 //!   refreshes it before opening the call, so a stream never starts on a token
@@ -120,6 +121,10 @@
 //!   seconds by default), and
 //!   [`request_timeout`](RociaDbBuilder::request_timeout) puts a deadline on
 //!   every unary RPC (opt-in, no default).
+//! - [`max_file_bytes`](RociaDbBuilder::max_file_bytes) caps the size of a file
+//!   the two ergonomic uploads will send (5 GiB by default), mirroring the
+//!   server's configurable `limits.max_file_bytes` so an oversized upload fails
+//!   locally and immediately — the server still has the final say.
 //! - [`tls_config`](RociaDbBuilder::tls_config) replaces the default
 //!   native-roots TLS setup, for a private CA or mTLS, and
 //!   [`http2_keep_alive`](RociaDbBuilder::http2_keep_alive) turns on HTTP/2
@@ -204,7 +209,12 @@
 //! [`Streaming`], [`Channel`] and [`ClientTlsConfig`] from `tonic`,
 //! [`SecretString`] (with [`ExposeSecret`]) from `secrecy`, and [`Bytes`]
 //! from `bytes`. A major upgrade of any of those crates can reshape them
-//! without this SDK's own API changing.
+//! without this SDK's own API changing. Two foreign *traits* appear in public
+//! bounds without being re-exported, on the same terms: `futures::Stream` (the
+//! source of the two streaming uploads) and `tokio::io::AsyncWrite` (the
+//! destination of
+//! [`download_file_verified_to`](RociaDbClient::download_file_verified_to)).
+//! Neither has to be named to call the method it appears on.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -305,6 +315,9 @@ pub use tonic::transport::{Channel, ClientTlsConfig};
 
 use crate::auth::{BearerInterceptor, TokenManager, TokenRefreshGuard};
 use crate::error::{AuthResultExt, ConfigResultExt, ConnectionResultExt, StatusResultExt};
+// The 5 GiB default for `RociaDbBuilder::max_file_bytes`, defined next to the
+// uploads that consult it.
+use crate::file::DEFAULT_MAX_FILE_BYTES;
 use crate::pb::upstream::v1::PageRequest;
 use crate::pb::upstream::v1::document_service_client::DocumentServiceClient;
 use crate::pb::upstream::v1::file_service_client::FileServiceClient;
@@ -394,6 +407,9 @@ pub struct RociaDbBuilder {
     /// `(interval, timeout)` from [`RociaDbBuilder::http2_keep_alive`], or
     /// `None` for tonic's default of no keep-alive pings at all.
     http2_keep_alive: Option<(Duration, Duration)>,
+    /// `None` means [`DEFAULT_MAX_FILE_BYTES`] (5 GiB); see
+    /// [`RociaDbBuilder::max_file_bytes`].
+    max_file_bytes: Option<u64>,
 }
 
 /// gRPC client for document, graph, file, and tenant services.
@@ -423,6 +439,11 @@ pub struct RociaDbClient {
     /// [`RociaDbBuilder::request_timeout`]. `None` (the default) means no
     /// client-side deadline at all.
     request_timeout: Option<Duration>,
+    /// Largest file [`RociaDbClient::upload_file`] and
+    /// [`RociaDbClient::upload_file_chunked`] will send, from
+    /// [`RociaDbBuilder::max_file_bytes`] or its 5 GiB default. Always
+    /// resolved, never `None`: the gate is unconditional.
+    max_file_bytes: u64,
     /// `None` when auth is disabled. Used to service
     /// [`RociaDbClient::refresh_auth_token`].
     token_manager: Option<TokenManager>,
@@ -635,6 +656,27 @@ fn resolve_request_timeout(explicit: Option<Duration>) -> Result<Option<Duration
     Ok(explicit)
 }
 
+/// Resolve the client-side file size ceiling [`RociaDbBuilder::build`] applies:
+/// whatever [`RociaDbBuilder::max_file_bytes`] was given, or
+/// [`DEFAULT_MAX_FILE_BYTES`] (5 GiB) otherwise.
+///
+/// Zero is rejected, exactly as for the two timeouts: the gate rejects
+/// `size_bytes > max_file_bytes`, so a zero ceiling would refuse every file
+/// with a single byte in it and admit only the empty one — never what a caller
+/// who reached for this setter wanted. There is deliberately no *upper* bound:
+/// the value mirrors a server setting this client cannot read, so one above the
+/// server's own limit is a choice with a known consequence (the failure simply
+/// happens server-side) rather than a mistake the SDK should refuse.
+fn resolve_max_file_bytes(explicit: Option<u64>) -> Result<u64> {
+    let max_file_bytes = explicit.unwrap_or(DEFAULT_MAX_FILE_BYTES);
+    if max_file_bytes == 0 {
+        return Err(RociaDbError::config(
+            "max file bytes must be greater than zero",
+        ));
+    }
+    Ok(max_file_bytes)
+}
+
 /// Build the [`RociaDbError::Status`] a per-RPC deadline produces, carrying a
 /// real [`tonic::Status`] so [`RociaDbError::code`] reports
 /// [`tonic::Code::DeadlineExceeded`] like any other status.
@@ -691,6 +733,7 @@ impl Default for RociaDbBuilder {
             request_timeout: None,
             tls_config: None,
             http2_keep_alive: None,
+            max_file_bytes: None,
         }
     }
 }
@@ -803,7 +846,10 @@ impl RociaDbBuilder {
     /// The file transfers are deliberately **not** covered — neither the two
     /// streaming RPCs themselves ([`upload_file_stream`],
     /// [`download_file_stream`]) nor the [`upload_file`],
-    /// [`upload_file_chunked`] and [`download_file`] helpers built on them.
+    /// [`upload_file_chunked`], [`download_file`], [`download_file_verified`]
+    /// and [`download_file_verified_to`] helpers built on them (the
+    /// `stat_file` call the last two make first is a unary RPC and is
+    /// covered).
     /// How long a stream the caller is feeding or draining may take is a
     /// property of that stream's own data rate, not of the SDK, and a
     /// deadline meant for a single unary round trip would abort a perfectly
@@ -815,6 +861,8 @@ impl RociaDbBuilder {
     /// [`upload_file_stream`]: RociaDbClient::upload_file_stream
     /// [`download_file`]: RociaDbClient::download_file
     /// [`download_file_stream`]: RociaDbClient::download_file_stream
+    /// [`download_file_verified`]: RociaDbClient::download_file_verified
+    /// [`download_file_verified_to`]: RociaDbClient::download_file_verified_to
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = Some(timeout);
         self
@@ -870,6 +918,44 @@ impl RociaDbBuilder {
         self
     }
 
+    /// Set the largest file [`RociaDbClient::upload_file`] and
+    /// [`RociaDbClient::upload_file_chunked`] will send, in bytes.
+    ///
+    /// Defaults to **5 GiB**, which is the default of the server setting this
+    /// mirrors (`limits.max_file_bytes`). A file over the limit fails with
+    /// [`RociaDbError::Validation`] before a byte goes on the wire, naming both
+    /// counts, instead of running an upload the server will refuse.
+    ///
+    /// # It only mirrors the server's limit
+    ///
+    /// **The server always has the final say**, and this client cannot read its
+    /// configuration. So:
+    ///
+    /// - set this **below** the server's limit — for example to the smallest
+    ///   size your own deployment should ever produce — and you get an
+    ///   immediate, local, free rejection instead of a transfer that fails
+    ///   after minutes of uploading;
+    /// - set it **above** the server's limit and nothing is unlocked: the
+    ///   failure simply moves server-side, arriving as an `INVALID_ARGUMENT`
+    ///   [`RociaDbError::Status`] once enough of the stream has been sent for
+    ///   the server to say so;
+    /// - leave it alone and you get the server's *default*, which is right up
+    ///   until someone changes it on the server.
+    ///
+    /// Two things it does not touch: [`RociaDbClient::upload_file_stream`],
+    /// which validates nothing at all by design, and the downloads, whose size
+    /// is the server's to report rather than the caller's to declare.
+    ///
+    /// The value is stored as-is here (no validation), exactly as
+    /// [`connect_timeout`](Self::connect_timeout) and
+    /// [`request_timeout`](Self::request_timeout) are: a zero ceiling is
+    /// rejected by [`build`](Self::build) with [`RociaDbError::Config`], and
+    /// there is no upper bound to check against.
+    pub fn max_file_bytes(mut self, max_file_bytes: u64) -> Self {
+        self.max_file_bytes = Some(max_file_bytes);
+        self
+    }
+
     /// Build a client connected to the upstream.
     ///
     /// Takes `&self`, so the same builder can be reused to produce several
@@ -890,9 +976,10 @@ impl RociaDbBuilder {
     ///
     /// [`RociaDbError::Config`] for anything wrong with the configuration —
     /// a missing or malformed host, a missing `AUTH_*` value, a zero
-    /// timeout, a TLS configuration the endpoint rejects — all detected
-    /// before any socket is opened. [`RociaDbError::Connection`] when the
-    /// dial itself fails, and [`RociaDbError::Auth`] when the IdP does.
+    /// timeout, a zero [`max_file_bytes`](Self::max_file_bytes), a TLS
+    /// configuration the endpoint rejects — all detected before any socket is
+    /// opened. [`RociaDbError::Connection`] when the dial itself fails, and
+    /// [`RociaDbError::Auth`] when the IdP does.
     pub async fn build(&self) -> Result<RociaDbClient> {
         let host = self
             .host
@@ -905,6 +992,10 @@ impl RociaDbBuilder {
         );
         validate_host_path(host)?;
         let connect_timeout = resolve_connect_timeout(self.connect_timeout)?;
+        // Resolved here rather than inside `build_on_channel` so that, like
+        // every other `Config` failure this method can report, a zero ceiling
+        // is caught before a socket is opened.
+        let max_file_bytes = resolve_max_file_bytes(self.max_file_bytes)?;
         let tls_config = self
             .tls_config
             .clone()
@@ -927,7 +1018,7 @@ impl RociaDbBuilder {
             .connect()
             .await
             .connection_context("failed to connect to upstream")?;
-        self.build_on_channel(channel, host.clone(), connect_timeout)
+        self.build_on_channel(channel, host.clone(), connect_timeout, max_file_bytes)
             .await
     }
 
@@ -954,7 +1045,9 @@ impl RociaDbBuilder {
     /// however the channel was built, and
     /// [`connect_timeout`](Self::connect_timeout) is what the OAuth2 HTTP
     /// client uses to reach the IdP — the one connection this method does
-    /// open itself.
+    /// open itself. So is
+    /// [`max_file_bytes`](Self::max_file_bytes), which is a client-side check
+    /// and has nothing to do with the transport.
     ///
     /// [`Debug`](std::fmt::Debug) on the returned client reports the host
     /// *configured on the builder*, which here is only a label — the channel
@@ -970,7 +1063,9 @@ impl RociaDbBuilder {
             "building rocia db client on a caller-supplied channel"
         );
         let connect_timeout = resolve_connect_timeout(self.connect_timeout)?;
-        self.build_on_channel(channel, host, connect_timeout).await
+        let max_file_bytes = resolve_max_file_bytes(self.max_file_bytes)?;
+        self.build_on_channel(channel, host, connect_timeout, max_file_bytes)
+            .await
     }
 
     /// The half of building a client that has nothing to do with the
@@ -983,13 +1078,16 @@ impl RociaDbBuilder {
     /// timeout-carrying HTTP client, the background refresh guard the client
     /// must keep alive) — exists exactly once.
     ///
-    /// `connect_timeout` is passed in rather than re-resolved: both callers
-    /// have already validated it, `build` because it also dials with it.
+    /// `connect_timeout` and `max_file_bytes` are passed in rather than
+    /// re-resolved: both callers have already validated them — `build` because
+    /// it dials with the first, and because a `Config` failure of either must
+    /// be reported before it opens a socket.
     async fn build_on_channel(
         &self,
         channel: Channel,
         host: String,
         connect_timeout: Duration,
+        max_file_bytes: u64,
     ) -> Result<RociaDbClient> {
         let request_timeout = resolve_request_timeout(self.request_timeout)?;
         let (interceptor, token_manager, token_refresh_guard) = match &self.auth {
@@ -1072,6 +1170,7 @@ impl RociaDbBuilder {
             upstream_tenant,
             host: Arc::from(host.as_str()),
             request_timeout,
+            max_file_bytes,
             token_manager,
             _token_refresh_guard: token_refresh_guard,
         })
@@ -1417,13 +1516,29 @@ pub(crate) mod test_support {
     /// gating ran too late, it would hang or fail against the unreachable
     /// `127.0.0.1:1` host instead of returning promptly.
     pub(crate) fn lazy_test_client() -> RociaDbClient {
-        lazy_test_client_with_request_timeout(None)
+        lazy_test_client_with(None, super::DEFAULT_MAX_FILE_BYTES)
     }
 
     /// [`lazy_test_client`] with an explicit per-RPC deadline, for the tests
     /// that exercise the deadline path in `RociaDbClient::attempt`.
     pub(crate) fn lazy_test_client_with_request_timeout(
         request_timeout: Option<std::time::Duration>,
+    ) -> RociaDbClient {
+        lazy_test_client_with(request_timeout, super::DEFAULT_MAX_FILE_BYTES)
+    }
+
+    /// [`lazy_test_client`] with an explicit client-side file size ceiling, for
+    /// the tests that prove the upload gate reads the client's own limit
+    /// without ever reaching the network.
+    pub(crate) fn lazy_test_client_with_max_file_bytes(max_file_bytes: u64) -> RociaDbClient {
+        lazy_test_client_with(None, max_file_bytes)
+    }
+
+    /// The one place the never-dialed client is assembled, so a new field on
+    /// [`RociaDbClient`] has exactly one test-side construction to update.
+    fn lazy_test_client_with(
+        request_timeout: Option<std::time::Duration>,
+        max_file_bytes: u64,
     ) -> RociaDbClient {
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         let interceptor = BearerInterceptor::disabled();
@@ -1443,6 +1558,7 @@ pub(crate) mod test_support {
             upstream_tenant: TenantServiceClient::with_interceptor(channel, interceptor),
             host: Arc::from("http://127.0.0.1:1"),
             request_timeout,
+            max_file_bytes,
             token_manager: None,
             _token_refresh_guard: None,
         }
@@ -1452,9 +1568,10 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CONNECT_TIMEOUT, Endpoint, OAUTH_HTTP_REQUEST_TIMEOUT, RociaDbBuilder,
-        RociaDbClient, WriteOptions, deadline_exceeded, is_local_deadline_expired, page_request,
-        resolve_connect_timeout, resolve_request_timeout, validate_host_path,
+        DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_FILE_BYTES, Endpoint, OAUTH_HTTP_REQUEST_TIMEOUT,
+        RociaDbBuilder, RociaDbClient, WriteOptions, deadline_exceeded, is_local_deadline_expired,
+        page_request, resolve_connect_timeout, resolve_max_file_bytes, resolve_request_timeout,
+        validate_host_path,
     };
     use crate::RociaDbError;
     use crate::test_support::{lazy_test_client, lazy_test_client_with_request_timeout};
@@ -1601,6 +1718,104 @@ mod tests {
     }
 
     #[test]
+    fn resolve_max_file_bytes_defaults_to_the_servers_five_gibibyte_default() {
+        assert_eq!(
+            resolve_max_file_bytes(None).expect("the default limit must always be accepted"),
+            DEFAULT_MAX_FILE_BYTES
+        );
+        assert_eq!(DEFAULT_MAX_FILE_BYTES, 5 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn resolve_max_file_bytes_passes_an_explicit_value_through_in_both_directions() {
+        // Deliberately no upper bound: the value mirrors a server setting this
+        // client cannot read, so one above the server's own limit is a choice
+        // whose consequence is a server-side failure, not a mistake to refuse.
+        assert_eq!(
+            resolve_max_file_bytes(Some(1)).expect("one byte is a usable, if strict, limit"),
+            1
+        );
+        assert_eq!(
+            resolve_max_file_bytes(Some(64 * 1024 * 1024))
+                .expect("a limit below the default must be accepted"),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            resolve_max_file_bytes(Some(DEFAULT_MAX_FILE_BYTES * 4))
+                .expect("a limit above the default must be accepted too"),
+            DEFAULT_MAX_FILE_BYTES * 4
+        );
+    }
+
+    #[test]
+    fn resolve_max_file_bytes_rejects_zero() {
+        let error =
+            resolve_max_file_bytes(Some(0)).expect_err("a zero file size ceiling must be rejected");
+        assert!(matches!(error, RociaDbError::Config { .. }));
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn builder_max_file_bytes_setter_stores_the_value_unvalidated() {
+        // Same contract as `connect_timeout` / `request_timeout`: the setter
+        // only records, `build()` validates. Unset means the documented 5 GiB
+        // default rather than "no limit".
+        assert_eq!(RociaDbBuilder::new().max_file_bytes, None);
+        assert_eq!(
+            RociaDbBuilder::new().max_file_bytes(0).max_file_bytes,
+            Some(0)
+        );
+        assert_eq!(
+            RociaDbBuilder::new().max_file_bytes(4096).max_file_bytes,
+            Some(4096)
+        );
+    }
+
+    #[tokio::test]
+    async fn build_with_channel_carries_the_max_file_bytes_onto_the_client() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = RociaDbBuilder::new()
+            .disable_auth()
+            .max_file_bytes(32 * 1024)
+            .build_with_channel(channel)
+            .await
+            .expect("a lazy channel with auth disabled must build");
+        assert_eq!(client.max_file_bytes, 32 * 1024);
+
+        // And a builder that never mentions it produces the default, not zero.
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let default_client = RociaDbBuilder::new()
+            .disable_auth()
+            .build_with_channel(channel)
+            .await
+            .expect("a lazy channel with auth disabled must build");
+        assert_eq!(default_client.max_file_bytes, DEFAULT_MAX_FILE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn build_rejects_a_zero_max_file_bytes_before_any_network_call() {
+        // Rejected on the same terms as a zero timeout, and just as early:
+        // `Config`, promptly, against a host that is never dialed.
+        let error = RociaDbBuilder::new()
+            .host("http://127.0.0.1:1")
+            .disable_auth()
+            .max_file_bytes(0)
+            .build()
+            .await
+            .expect_err("a zero file size ceiling must fail build()");
+        assert!(matches!(error, RociaDbError::Config { .. }));
+
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let error = RociaDbBuilder::new()
+            .disable_auth()
+            .max_file_bytes(0)
+            .build_with_channel(channel)
+            .await
+            .expect_err("a zero file size ceiling must fail build_with_channel() too");
+        assert!(matches!(error, RociaDbError::Config { .. }));
+    }
+
+    #[test]
     fn a_deadline_surfaces_as_a_status_error_reporting_deadline_exceeded() {
         let error = deadline_exceeded("failed to get document", Duration::from_millis(1500));
         assert_eq!(error.code(), Some(tonic::Code::DeadlineExceeded));
@@ -1724,6 +1939,7 @@ mod tests {
             .request_timeout(Duration::from_secs(9))
             .tls_config(crate::ClientTlsConfig::new().with_native_roots())
             .http2_keep_alive(Duration::from_secs(30), Duration::from_secs(5))
+            .max_file_bytes(256 * 1024 * 1024)
             .disable_auth();
         assert_eq!(chained.connect_timeout, Some(Duration::from_secs(7)));
         assert_eq!(chained.request_timeout, Some(Duration::from_secs(9)));
@@ -1732,6 +1948,7 @@ mod tests {
             chained.http2_keep_alive,
             Some((Duration::from_secs(30), Duration::from_secs(5)))
         );
+        assert_eq!(chained.max_file_bytes, Some(256 * 1024 * 1024));
 
         let partial = RociaDbBuilder::new().host("http://example.invalid:50051");
         let finished = partial.disable_auth();

@@ -18,7 +18,7 @@ to stay forward-compatible. Every variant implements `std::error::Error`, so
 | `Auth { message, source }` | obtaining or refreshing the upstream token failed |
 | `Encode { context, source }` | a value could not be serialized to JSON before being sent |
 | `Decode { context, source }` | a JSON payload received from upstream could not be decoded; for a page of documents the message leads with `"item <index>: "`, naming the offending position |
-| `Io { context, source }` | a source the SDK was reading on your behalf failed: an `Err` item from `upload_file_chunked`'s chunk stream, carrying the `std::io::Error` |
+| `Io { context, source }` | an I/O handle **you** handed over failed, carrying the `std::io::Error`: an `Err` item from `upload_file_chunked`'s chunk stream, or a writer that refused the bytes of a `download_file_verified_to` |
 | `Validation(String)` | a client-side rule about the *data* of one call was violated before any network call |
 | `ChecksumMismatch { expected, actual }` | a verified download's SHA-256 digest disagrees with the stored checksum |
 | `SizeMismatch { expected, actual }` | a verified download's byte count disagrees with the stored `size_bytes` |
@@ -42,31 +42,41 @@ one call.
 | missing host; a host URL carrying a path, query string or fragment; an unparseable host URL | `Config` |
 | missing `AUTH_TOKEN_URL` / `AUTH_CLIENT_ID` / `AUTH_CLIENT_SECRET` | `Config` |
 | a `ClientTlsConfig` the endpoint rejects | `Config` |
-| a zero `connect_timeout` or `request_timeout` | `Config` |
+| a zero `connect_timeout`, `request_timeout` or `max_file_bytes` | `Config` |
 | a failed dial, a DNS failure, a refused connection | `Connection` |
-| a zero page limit, an oversized file, a chunk stream whose length disagrees with the declared size | `Validation` |
+| a file over `max_file_bytes`, a zero page limit, a chunk stream whose length disagrees with the declared size | `Validation` |
 
 ### `Io`
 
-A fourth variant carries no status, for a third reason: the failure is in a
-source **you** handed over. `upload_file_chunked` takes a
-`Stream<Item = std::io::Result<Bytes>>`, and an `Err` item — a read that died on
-your file or socket — ends the upload and is reported here, ahead of whatever
-status the server returned for the stream that then stopped early. Nothing is
-pulled from the stream after the error, and nothing is stored: the server only
-publishes a file once it has received and validated the whole stream. See
-[files](files.md).
+A fourth variant carries no status, for a third reason: the failure is in an
+I/O handle **you** handed over. Two calls can raise it, and the `context` field
+says which:
+
+- `"the upload chunk stream"` — `upload_file_chunked` takes a
+  `Stream<Item = std::io::Result<Bytes>>`, and an `Err` item (a read that died
+  on your file or socket) ends the upload, ahead of whatever status the server
+  returned for the stream that then stopped early. Nothing is pulled from the
+  stream after the error, and nothing is stored: the server only publishes a
+  file once it has received and validated the whole stream.
+- `"writing the downloaded file"` — `download_file_verified_to` writes into a
+  `tokio::io::AsyncWrite` of yours, and a chunk it refuses (or a failing final
+  flush) abandons the download there. Whatever was already written is yours to
+  clean up.
+
+See [files](files.md).
 
 ### `ChecksumMismatch` and `SizeMismatch`
 
 These two are different again: the call *succeeded* and the data it returned
-is wrong. They are raised only by `download_file_verified` — no other call in
-this SDK verifies a download — and never by the server. The size is checked
-first, because a truncated transfer fails both checks and the byte count is
-the more actionable report. Both digests are carried raw rather than
+is wrong. They are raised only by the two verified downloads —
+`download_file_verified` and `download_file_verified_to`, the only calls in
+this SDK that check what they downloaded — and never by the server. The size
+is checked first, because a truncated transfer fails both checks and the byte
+count is the more actionable report. Both digests are carried raw rather than
 hex-encoded, so a caller can compare or store them without decoding;
 `Display` renders them as lowercase hex. See [files](files.md) for exactly
-what a match does and does not prove.
+what a match does and does not prove — and, for the writer variant, for why a
+mismatch leaves bytes behind for you to discard.
 
 ## Reading a status
 

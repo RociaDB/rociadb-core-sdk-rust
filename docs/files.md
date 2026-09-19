@@ -48,7 +48,9 @@ implement for you.
   is never a mixed file.
 - **Files over the server's `limits.max_file_bytes` (5 GiB by default) are
   rejected.** `upload_file` and `upload_file_chunked` check this client-side
-  and return `RociaDbError::Validation` before sending anything.
+  and return `RociaDbError::Validation` before sending anything. The ceiling
+  they check against is `RociaDbBuilder::max_file_bytes` — see
+  [the client-side ceiling](#the-client-side-size-ceiling).
 - **An empty file is valid and common**: exactly one message (metadata only,
   empty `chunk`) and no data messages. `upload_file` handles it.
 - **A file becomes visible only once the whole stream has been received and
@@ -74,7 +76,8 @@ handles that in two ways:
   ahead with the cached token, which may well still be valid; if it is not, the
   server says `UNAUTHENTICATED` and that reaches you.
 - `upload_file` and the call that *opens* a download (so `download_file_stream`,
-  `download_file` and `download_file_verified`) additionally get the same
+  `download_file`, `download_file_verified` and `download_file_verified_to`)
+  additionally get the same
   refresh-and-retry a unary RPC gets: an `UNAUTHENTICATED` answer triggers one
   coalesced refresh and one re-issue. `upload_file` can do this because it owns
   its buffer and re-sends under the same `request_id`, so a replay that lands on
@@ -285,6 +288,44 @@ a `checksum` that does not match the bytes, can still produce an upload that
 looks successful while carrying bad data. Prefer `upload_file_chunked`
 unless you specifically need to hand-build the message stream.
 
+## The client-side size ceiling
+
+`RociaDbBuilder::max_file_bytes(bytes)` sets the largest file `upload_file` and
+`upload_file_chunked` will send. It defaults to **5 GiB**, the default of the
+server setting it mirrors (`limits.max_file_bytes`), and a zero value is
+rejected at `build()` time with `RociaDbError::Config` like a zero timeout.
+
+```rust,no_run
+use rociadb_sdk::RociaDbBuilder;
+
+# #[tokio::main]
+# async fn main() -> rociadb_sdk::Result<()> {
+// This deployment never stores anything over 256 MiB, so an oversized upload
+// should fail here rather than after minutes on the wire.
+let client = RociaDbBuilder::new()
+    .disable_auth()
+    .max_file_bytes(256 * 1024 * 1024)
+    .build()
+    .await?;
+# let _ = client;
+# Ok(())
+# }
+```
+
+**It only mirrors the server's limit — the server always has the final say**,
+and the client cannot read its configuration:
+
+- set it **below** the server's limit and an oversized upload fails
+  immediately, locally and for free, with `RociaDbError::Validation` naming
+  both byte counts;
+- set it **above** and nothing is unlocked: the failure simply moves
+  server-side, arriving as an `INVALID_ARGUMENT` `RociaDbError::Status` once
+  enough of the stream has been sent for the server to say so;
+- leave it alone and you get the server's *default*, which is right until
+  somebody changes it on the server.
+
+`upload_file_stream` is unaffected: it validates nothing at all by design.
+
 ## Downloads
 
 ```rust,no_run
@@ -306,9 +347,42 @@ println!("{} / {} bytes", bytes.len(), verified.len());
 # }
 ```
 
-Streaming, when the file must not be buffered at all. The stream hands back
-a raw `tonic::Status` on failure rather than a `RociaDbError`, so an example
-that mixes the two uses a boxed error:
+Verified but **not** buffered: `download_file_verified_to` applies the same
+checks while writing into any `tokio::io::AsyncWrite` you hand it — a file, a
+socket, a `BufWriter`, a `Vec<u8>` — and returns the number of bytes written,
+so a 5 GiB file costs one chunk of memory instead of 5 GiB.
+
+```rust,no_run
+use rociadb_sdk::RociaDbBuilder;
+
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = RociaDbBuilder::new().disable_auth().build().await?;
+// Download to a temporary name, and publish it only once it has verified.
+let mut file = tokio::fs::File::create("report.csv.part").await?;
+match client
+    .download_file_verified_to("tenant-1", "reports", "report.csv", &mut file)
+    .await
+{
+    Ok(bytes) => {
+        tokio::fs::rename("report.csv.part", "report.csv").await?;
+        println!("{bytes} verified bytes");
+    }
+    Err(error) => {
+        // Verification can only fail at the end, so the partial file exists
+        // and is yours to remove.
+        tokio::fs::remove_file("report.csv.part").await?;
+        return Err(error.into());
+    }
+}
+# Ok(())
+# }
+```
+
+Raw and unverified, when what you need is the chunks themselves rather than a
+destination to put them in. The stream hands back a raw `tonic::Status` on
+failure rather than a `RociaDbError`, so an example that mixes the two uses a
+boxed error:
 
 ```rust,no_run
 use rociadb_sdk::RociaDbBuilder;
@@ -338,13 +412,18 @@ whatever the transport already provides — TLS and HTTP/2 framing catch
 corruption in transit, which says nothing about whether the bytes stored on
 the server still match what was uploaded.
 
-### `download_file_verified`, and what it actually proves
+### The verified downloads, and what they actually prove
 
-It calls `stat_file` first, streams the download while feeding every chunk
-to a SHA-256 hasher, and only then hands the buffer back — after checking
-the byte count against `StatResponse::size_bytes` and the digest against
-`StatResponse::checksum`. A file whose stored bytes have been corrupted or
-truncated fails here instead of being returned as if nothing were wrong.
+Both call `stat_file` first, stream the download while feeding every chunk to a
+SHA-256 hasher, and check the byte count against `StatResponse::size_bytes` and
+the digest against `StatResponse::checksum` before reporting success. A file
+whose stored bytes have been corrupted or truncated fails here instead of being
+returned as if nothing were wrong. They differ only in where the bytes go:
+
+| Method | Destination | Returns | Memory |
+| ------ | ----------- | ------- | ------ |
+| `download_file_verified` | a buffer it owns | `Vec<u8>` | the whole file |
+| `download_file_verified_to` | a `&mut W` you own, `W: AsyncWrite + Unpin + ?Sized` | `u64`, the bytes written | one chunk |
 
 **But the server never verified the uploader's checksum.** It checks that
 the value is 32 bytes long and stores it; it never hashes what it received
@@ -364,20 +443,36 @@ Failures are `RociaDbError::SizeMismatch` (checked first: a truncated stream
 fails both checks, and the byte count is the more actionable report) then
 `RociaDbError::ChecksumMismatch` — including when the stored checksum is not
 a 32-byte SHA-256 digest at all, since the comparison is over raw bytes.
-Otherwise whatever `stat_file` and the download return, `NOT_FOUND` for an
-unknown `file_id` included.
+`download_file_verified_to` adds one more: `RociaDbError::Io` with `context`
+`"writing the downloaded file"`, when your writer refuses a chunk or the final
+flush fails. Otherwise whatever `stat_file` and the download return, `NOT_FOUND`
+for an unknown `file_id` included.
 
-The whole file is buffered, like `download_file`. The buffer is
-pre-allocated from the reported size but **capped at 64 MiB**, so a server
-reporting an absurd `size_bytes` cannot make the client reserve gigabytes
-before a byte has arrived; a genuinely larger file simply grows its buffer
-as it streams. The stream is also abandoned as soon as it overshoots
-`size_bytes`, rather than being drained into memory only to be rejected at
-the end.
+`download_file_verified` buffers the whole file, like `download_file`. Its
+buffer is pre-allocated from the reported size but **capped at 64 MiB**, so a
+server reporting an absurd `size_bytes` cannot make the client reserve
+gigabytes before a byte has arrived; a genuinely larger file simply grows its
+buffer as it streams. Either way the stream is abandoned as soon as it
+overshoots `size_bytes` — that chunk is never written — rather than being
+drained to the end only to be rejected.
 
-A streaming caller who cannot buffer the file does the same thing by hand:
-hash each chunk as it arrives and compare the digest against `stat_file`'s
-`checksum` at the end.
+#### A failed verification has already written bytes
+
+This is the one thing `download_file_verified_to` asks of you in exchange for
+the memory it saves. **Verification can only fail at the end**: a file's digest
+is not known until its last byte has arrived, and a byte count cannot be
+checked earlier either. So when it returns `SizeMismatch` or
+`ChecksumMismatch`, your writer has already received most or all of the file,
+and **discarding it is your job** — delete the temporary file, roll back the
+transaction, truncate the buffer. Writing straight to the destination path
+makes a failure overwrite good data with bad; download to a temporary name and
+rename on `Ok`, as in the example above. `download_file_verified` has no such
+hazard: it owns the buffer it throws away, which is reason enough to prefer it
+whenever the file does fit in memory.
+
+A caller who needs the chunks themselves — rather than a writer to put them in
+— does the same thing by hand over `download_file_stream`: hash each chunk as
+it arrives and compare the digest against `stat_file`'s `checksum` at the end.
 
 ## Metadata, listing and deletion
 

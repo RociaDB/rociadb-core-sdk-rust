@@ -155,10 +155,10 @@ the 1.0 names are gone, and the table below maps every one of them.
   `Config { .. }` instead — the enum is `#[non_exhaustive]`, so a wildcard
   arm keeps compiling either way.
 - `tokio` is now depended on with only the features the library itself needs
-  (`rt`, `sync`, `time`, `macros`); 1.0 asked for `rt-multi-thread`, which
-  moved to `[dev-dependencies]`. A consumer that relied on this crate
-  enabling `rt-multi-thread` for them — through Cargo's feature unification —
-  must now enable it on their own `tokio` dependency.
+  (`io-util`, `rt`, `sync`, `time`, `macros`); 1.0 asked for
+  `rt-multi-thread`, which moved to `[dev-dependencies]`. A consumer that
+  relied on this crate enabling `rt-multi-thread` for them — through Cargo's
+  feature unification — must now enable it on their own `tokio` dependency.
 
 ### Added
 
@@ -191,6 +191,18 @@ the 1.0 names are gone, and the table below maps every one of them.
   the caller already has (custom connector, Unix socket, balanced list,
   in-process test server), skipping host validation and dialing while keeping
   the whole auth setup and the request deadline.
+- `RociaDbBuilder::max_file_bytes(u64)`: the largest file `upload_file` and
+  `upload_file_chunked` will send. **Defaults to 5 GiB**, unchanged from 1.0
+  where the same number was a hard-coded constant — so no existing upload
+  starts or stops being rejected. It only **mirrors** the server's configurable
+  `limits.max_file_bytes`, which the client cannot read and which always has
+  the final say: setting it below the server's limit turns an oversized upload
+  into an immediate local `RociaDbError::Validation` instead of a transfer that
+  fails after minutes, and setting it above merely moves the failure
+  server-side. A zero value is rejected by `build()` and `build_with_channel()`
+  with `RociaDbError::Config`, like a zero timeout, before any socket is
+  opened. The `Validation` message now names the configured ceiling instead of
+  saying "5 GiB"; `upload_file_stream` still validates nothing at all.
 - `RetryPolicy` (`#[non_exhaustive]`, `Debug + Clone + PartialEq + Eq +
   Default`, with `new()`, `with_max_attempts`, `with_base_delay`,
   `with_max_delay`, `with_retry_unavailable`) and
@@ -214,18 +226,40 @@ the 1.0 names are gone, and the table below maps every one of them.
   corruption, truncation and partial overwrites, and not an uploader whose
   declared digest never matched its own bytes. `download_file` and
   `download_file_stream` link to it where they describe that asymmetry.
-- `RociaDbError::Io { context: &'static str, source: std::io::Error }`, raised
-  only by `upload_file_chunked` when its `chunks` stream yields an `Err` — a
-  read that failed on the caller's own file or socket. Nothing further is pulled
-  from the stream, the upload is abandoned (so the server, which publishes a
-  file only once it has the whole stream, stores nothing), and this error is
-  reported **ahead of** whatever status the server returned for the stream that
-  then ended early — the same error-slot precedence the size-mismatch check
-  already had. `Display` folds in the `io::Error`, which stays reachable as the
-  `source` for a caller that needs its `kind()`.
+- `RociaDbClient::download_file_verified_to(tenant_id, bucket, file_id, writer)`
+  where `writer: &mut W, W: tokio::io::AsyncWrite + Unpin + ?Sized`: the same
+  verification with **no buffer at all**. It stats first, hashes and writes each
+  chunk as it arrives, bails the moment the byte count overshoots `size_bytes`
+  (without writing that chunk), checks the size then the digest, flushes, and
+  returns the number of bytes written — so a 5 GiB file costs one chunk of
+  memory rather than 5 GiB. `?Sized` means a `&mut dyn AsyncWrite + Unpin` works
+  as well as a `tokio::fs::File`, a `BufWriter`, a socket or a `Vec<u8>`.
+  `download_file_verified` is now this method pointed at a `Vec<u8>` (which is
+  itself an `AsyncWrite`), so the hashing and both checks exist once; its capped
+  pre-allocation is unchanged.
+
+  Two things to know. **A failed verification has already written bytes**: a
+  digest is only known at the last byte, so `SizeMismatch` / `ChecksumMismatch`
+  arrive with most or all of the file already in your writer, and discarding it
+  is yours to do — download to a temporary name and rename on `Ok`. And a
+  writer that refuses a chunk, or fails the final flush, surfaces as
+  `RociaDbError::Io` with `context: "writing the downloaded file"`. What a match
+  proves is exactly what `download_file_verified` proves, and no more.
+- `RociaDbError::Io { context: &'static str, source: std::io::Error }`, for an
+  I/O handle the caller supplied, raised by two calls that its `context` tells
+  apart. `"the upload chunk stream"` is `upload_file_chunked` when its `chunks`
+  stream yields an `Err` — a read that failed on the caller's own file or
+  socket. Nothing further is pulled from the stream, the upload is abandoned (so
+  the server, which publishes a file only once it has the whole stream, stores
+  nothing), and this error is reported **ahead of** whatever status the server
+  returned for the stream that then ended early — the same error-slot precedence
+  the size-mismatch check already had. `"writing the downloaded file"` is
+  `download_file_verified_to` when the writer it is filling refuses a chunk or
+  fails to flush. `Display` folds in the `io::Error`, which stays reachable as
+  the `source` for a caller that needs its `kind()`.
 - `RociaDbError::ChecksumMismatch { expected: Vec<u8>, actual: Vec<u8> }` and
   `RociaDbError::SizeMismatch { expected: u64, actual: u64 }`, raised only by
-  `download_file_verified`. Two flat variants rather than one nested
+  the two verified downloads. Two flat variants rather than one nested
   `Integrity` value, so a caller branches with one match arm per failure and
   reads the numbers straight off it. The size is checked first (a truncated
   transfer fails both, and the byte count is the more actionable report);
@@ -255,8 +289,8 @@ the 1.0 names are gone, and the table below maps every one of them.
     that lands on an upload it had already committed is absorbed rather than
     written twice.
   - The call that **opens** a download does too, so `download_file_stream`,
-    `download_file` and `download_file_verified` all recover from one
-    `UNAUTHENTICATED`. A server that rejects a server-streaming call answers
+    `download_file`, `download_file_verified` and `download_file_verified_to`
+    all recover from one `UNAUTHENTICATED`. A server that rejects a server-streaming call answers
     before any message exists, so that rejection resolves the opening call
     itself and there is nothing consumed to replay around. No `grpc-timeout`
     header is sent (`request_timeout` still does not apply to a transfer).
@@ -356,6 +390,12 @@ the 1.0 names are gone, and the table below maps every one of them.
   to replay, `upload_file`'s re-send of its own request stream. The `Upload` RPC
   is the only place left that calls a generated client directly, because its
   request is a stream rather than a cloneable message.
+- **The library's `tokio` dependency enables `io-util`.** It is what
+  `download_file_verified_to` drives the caller's writer with: the `AsyncWrite`
+  trait in its signature needs no feature, but the `AsyncWriteExt::write_all`
+  and `AsyncWriteExt::flush` it calls live behind that one. Nothing is added to
+  the dependency graph or to `Cargo.lock` — tokio declares `io-util =
+  ["bytes"]`, and `bytes` is already a direct dependency of this crate.
 - The neighbor page size used while walking every page in
   `get_outgoing_neighbor_nodes` / `get_incoming_neighbor_nodes` is a documented
   named constant instead of a literal `50` repeated at two call sites. The

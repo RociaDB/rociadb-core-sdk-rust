@@ -19,6 +19,7 @@ use futures::{Stream, StreamExt, stream};
 use sha2::{Digest, Sha256};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tonic::codec::Streaming;
 use tracing::debug;
 use uuid::Uuid;
@@ -39,8 +40,23 @@ const UPLOAD_OPERATION: &str = "failed to upload file";
 /// call had already been accepted.
 const DOWNLOAD_OPERATION: &str = "failed to start file download";
 
-/// Server-side max file size (`limits.max_file_bytes`, 5 GiB default).
-const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+/// Client-side max file size applied when
+/// [`RociaDbBuilder::max_file_bytes`](crate::RociaDbBuilder::max_file_bytes) was
+/// never called: 5 GiB, which is the server's own `limits.max_file_bytes`
+/// default.
+///
+/// Only a default, and only a mirror. The server's limit is configurable, so a
+/// deployment that raised or lowered it moves the number that actually decides
+/// — the client-side gate exists to fail an obviously oversized upload before a
+/// byte goes out, never to be the authority. See that setter.
+pub(crate) const DEFAULT_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// `context` on the [`RociaDbError::Io`] that
+/// [`RociaDbClient::download_file_verified_to`] reports when the caller's writer
+/// refuses bytes. One constant because the per-chunk write and the final flush
+/// are the same failure as far as a caller is concerned: the writer would not
+/// take the download.
+const DOWNLOAD_WRITE_CONTEXT: &str = "writing the downloaded file";
 
 /// Ceiling on the buffer [`RociaDbClient::download_file_verified`]
 /// pre-allocates from the `size_bytes` the server reported.
@@ -52,6 +68,10 @@ const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// enough to be an unremarkable allocation if the number is nonsense; a file
 /// genuinely larger than this just grows its buffer while streaming, the same
 /// way [`RociaDbClient::download_file`] always does.
+///
+/// There is nothing to cap in [`RociaDbClient::download_file_verified_to`],
+/// which pre-allocates nothing at all: it holds one chunk at a time and writes
+/// it straight out.
 pub(crate) const MAX_PREALLOCATED_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Default MIME type recorded for a file whose uploader did not name one.
@@ -303,10 +323,11 @@ impl RociaDbClient {
     /// last one possibly shorter; not configurable, see
     /// [`RociaDbClient::upload_file_stream`] for why. When
     /// [`FileUploadOptions::checksum`] is `None`, the SHA-256 digest of
-    /// `bytes` is computed and sent automatically. Files over 5 GiB
-    /// (`limits.max_file_bytes`, the server default) are rejected
-    /// client-side with a clear error instead of failing partway through the
-    /// upload.
+    /// `bytes` is computed and sent automatically. A file over
+    /// [`RociaDbBuilder::max_file_bytes`](crate::RociaDbBuilder::max_file_bytes)
+    /// (5 GiB by default, mirroring the server's `limits.max_file_bytes`) is
+    /// rejected client-side with a [`RociaDbError::Validation`] instead of
+    /// failing partway through the upload.
     ///
     /// `bytes` is taken as `impl Into<Vec<u8>>`, so both ownership styles
     /// are one call: a `Vec<u8>` you already hold — a file read off disk, a
@@ -351,7 +372,7 @@ impl RociaDbClient {
         let bytes = Arc::new(bytes.into());
         let size_bytes = u64::try_from(bytes.len())
             .map_err(|_| RociaDbError::validation("file is too large"))?;
-        validate_file_size(size_bytes)?;
+        validate_file_size(size_bytes, self.max_file_bytes)?;
 
         debug!(
             tenant_id = tenant_id,
@@ -473,6 +494,12 @@ impl RociaDbClient {
     /// for the stream that then ended early, because they say what actually
     /// went wrong.
     ///
+    /// A declared `size_bytes` over
+    /// [`RociaDbBuilder::max_file_bytes`](crate::RociaDbBuilder::max_file_bytes)
+    /// (5 GiB by default) is rejected before the call opens, exactly as in
+    /// [`RociaDbClient::upload_file`] — here it costs nothing to notice, since
+    /// the total is declared up front rather than measured.
+    ///
     /// # Authentication
     ///
     /// With auth enabled the token is refreshed before the call opens if
@@ -502,7 +529,7 @@ impl RociaDbClient {
     where
         S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
     {
-        validate_file_size(options.size_bytes)?;
+        validate_file_size(options.size_bytes, self.max_file_bytes)?;
         debug!(
             tenant_id = tenant_id,
             bucket = bucket,
@@ -562,12 +589,15 @@ impl RociaDbClient {
     /// which says nothing about whether the bytes stored on the server still
     /// match what was originally uploaded.
     ///
-    /// [`RociaDbClient::download_file_verified`] closes that gap for a file
-    /// that fits in memory: it stats first, hashes while it streams, and
-    /// fails rather than returning bytes that disagree with the metadata.
-    /// Streaming callers who cannot buffer the file do the same thing
-    /// themselves — hash each chunk as it arrives and compare the digest
-    /// against [`RociaDbClient::stat_file`]'s `checksum` at the end.
+    /// Two methods close that gap, both by stating first, hashing while they
+    /// stream, and failing rather than handing over bytes that disagree with
+    /// the metadata: [`RociaDbClient::download_file_verified`] for a file that
+    /// fits in memory, and [`RociaDbClient::download_file_verified_to`] for one
+    /// that does not — it writes into a `tokio::io::AsyncWrite` of your choice
+    /// and never buffers more than a chunk. Use this raw stream when you need
+    /// the chunks themselves; verifying it by hand then means hashing each one
+    /// as it arrives and comparing the digest against
+    /// [`RociaDbClient::stat_file`]'s `checksum` at the end.
     ///
     /// [`RociaDbBuilder::request_timeout`](crate::RociaDbBuilder::request_timeout)
     /// does **not** apply here, nor to [`RociaDbClient::download_file`]: how
@@ -625,7 +655,9 @@ impl RociaDbClient {
     /// corrupted or truncated in storage is still returned successfully,
     /// with its bad bytes intact and no error raised. Use
     /// [`RociaDbClient::download_file_verified`] when the bytes have to be
-    /// checked against the metadata the server recorded for them.
+    /// checked against the metadata the server recorded for them, or
+    /// [`RociaDbClient::download_file_verified_to`] when they also must not be
+    /// buffered.
     pub async fn download_file(
         &self,
         tenant_id: &str,
@@ -657,6 +689,10 @@ impl RociaDbClient {
     /// [`StatResponse::checksum`]. A file whose stored bytes have been
     /// corrupted or truncated therefore fails here instead of being returned
     /// as if nothing were wrong.
+    ///
+    /// [`RociaDbClient::download_file_verified_to`] applies exactly the same
+    /// checks without ever buffering the file: use it for anything whose size
+    /// you are not prepared to hold in memory.
     ///
     /// # What this proves, and what it does not
     ///
@@ -697,7 +733,8 @@ impl RociaDbClient {
     /// 64 MiB, so a server reporting an absurd `size_bytes` cannot make the
     /// client reserve gigabytes before a single byte has arrived; a genuinely
     /// larger file simply grows the buffer as it streams, exactly as
-    /// `download_file` does.
+    /// `download_file` does. [`RociaDbClient::download_file_verified_to`]
+    /// removes the buffer altogether.
     ///
     /// [`RociaDbBuilder::request_timeout`](crate::RociaDbBuilder::request_timeout)
     /// covers the `stat_file` call (a unary RPC) but not the download stream,
@@ -716,14 +753,159 @@ impl RociaDbClient {
             size_bytes = stat.size_bytes,
             "downloading file with verification"
         );
+        // A `Vec<u8>` is itself a `tokio::io::AsyncWrite` (writing to it is an
+        // infallible `extend_from_slice`), so the buffered variant is the
+        // streaming one pointed at a buffer — the capped pre-allocation still
+        // happens here, because the writer variant has nothing to pre-allocate.
+        let mut bytes = Vec::with_capacity(preallocated_download_capacity(stat.size_bytes));
+        self.download_verified_into(tenant_id, bucket, file_id, &stat, &mut bytes)
+            .await?;
+        Ok(bytes)
+    }
 
-        // Never trust `size_bytes` with an allocation: it is a number the
-        // server chose, and `Vec::with_capacity` would reserve it up front.
-        let capacity = usize::try_from(stat.size_bytes.min(MAX_PREALLOCATED_DOWNLOAD_BYTES))
-            .unwrap_or(usize::MAX);
-        let mut bytes = Vec::with_capacity(capacity);
-        let mut hasher = Sha256::new();
+    /// Download a file straight into `writer`, checking it against the
+    /// metadata the server recorded for it, without ever buffering it.
+    ///
+    /// Same checks as [`RociaDbClient::download_file_verified`] — the same
+    /// [`RociaDbClient::stat_file`] call first, the same SHA-256 fed chunk by
+    /// chunk, the same byte count against [`StatResponse::size_bytes`] and the
+    /// same digest against [`StatResponse::checksum`] — but nothing is kept:
+    /// each chunk is hashed and written out as it arrives, so a 5 GiB file
+    /// costs one chunk of memory rather than 5 GiB. Returns the number of bytes
+    /// written, which on success is necessarily
+    /// [`StatResponse::size_bytes`]. `writer` is flushed once, after every
+    /// check has passed.
+    ///
+    /// `W` is `?Sized`, so a `&mut dyn AsyncWrite + Unpin` works as well as a
+    /// concrete `tokio::fs::File`, a `tokio::io::BufWriter`, a socket or a
+    /// `Vec<u8>`. It is a separate method rather than an option on
+    /// [`RociaDbClient::download_file_verified`] because the two differ in what
+    /// they *return* as much as in where they write, and a borrowed writer is
+    /// not something an options struct can carry — the same reason the three
+    /// upload tiers are three methods.
+    ///
+    /// ```rust,no_run
+    /// # use rociadb_sdk::RociaDbBuilder;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let client = RociaDbBuilder::new().disable_auth().build().await?;
+    /// // Download to a temporary path, and publish it only once it verifies.
+    /// let mut file = tokio::fs::File::create("report.csv.part").await?;
+    /// match client
+    ///     .download_file_verified_to("tenant-1", "reports", "report.csv", &mut file)
+    ///     .await
+    /// {
+    ///     Ok(bytes) => {
+    ///         tokio::fs::rename("report.csv.part", "report.csv").await?;
+    ///         println!("{bytes} verified bytes");
+    ///     }
+    ///     Err(error) => {
+    ///         // The partial file is this caller's to clean up; see below.
+    ///         tokio::fs::remove_file("report.csv.part").await?;
+    ///         return Err(error.into());
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # A failed verification has already written bytes
+    ///
+    /// **Verification can only fail at the end**, because the digest of a file
+    /// is not known until its last byte has arrived — and a size check cannot
+    /// come earlier either. So when this returns
+    /// [`RociaDbError::SizeMismatch`] or [`RociaDbError::ChecksumMismatch`],
+    /// `writer` has already received most or all of the file, and **discarding
+    /// it is the caller's job**: delete the temporary file, roll back the
+    /// transaction, truncate the buffer. Writing to the destination path
+    /// directly makes a failure overwrite good data with bad; download to a
+    /// temporary name and rename it once this returns `Ok`, as above.
+    /// [`RociaDbClient::download_file_verified`] does not have this property —
+    /// it owns the buffer it would throw away — and is the better choice
+    /// whenever the file does fit in memory.
+    ///
+    /// # What this proves, and what it does not
+    ///
+    /// Exactly what [`RociaDbClient::download_file_verified`] proves, and no
+    /// more: the server never verified the uploader's checksum, so a match
+    /// shows the bytes received are the bytes the uploader *declared*. It
+    /// catches storage corruption, a truncated transfer and a partially
+    /// overwritten file; it does not catch an uploader whose declared digest
+    /// never matched its own payload. `stat_file` and the download are still
+    /// two calls, so a file replaced between them reads as a mismatch rather
+    /// than as the new version. See
+    /// [`download_file_verified`](RociaDbClient::download_file_verified) for the
+    /// full discussion.
+    ///
+    /// # Errors
+    ///
+    /// [`RociaDbError::Io`] with `context` `"writing the downloaded file"` when
+    /// `writer` refuses a chunk or the final flush fails — the download is
+    /// abandoned at that point and nothing further is read from the stream.
+    /// Then [`RociaDbError::SizeMismatch`] and
+    /// [`RociaDbError::ChecksumMismatch`] on the same terms, and in the same
+    /// order, as [`RociaDbClient::download_file_verified`]: the size first,
+    /// including as soon as the stream overshoots it mid-transfer (that chunk
+    /// is not written). Otherwise whatever `stat_file` and
+    /// [`RociaDbClient::download_file_stream`] return, `NOT_FOUND` for an
+    /// unknown `file_id` included.
+    ///
+    /// # Authentication
+    ///
+    /// As for every download: the token is refreshed before the stream opens if
+    /// little of its lifetime is left, and an `UNAUTHENTICATED` rejection of the
+    /// *opening* call triggers one coalesced refresh and one re-issue. Both come
+    /// from [`RociaDbClient::download_file_stream`], which this uses.
+    ///
+    /// [`RociaDbBuilder::request_timeout`](crate::RociaDbBuilder::request_timeout)
+    /// covers the `stat_file` call (a unary RPC) but not the download stream.
+    /// Bound the transfer with a `tokio::time::timeout` of your own if it needs
+    /// a deadline.
+    pub async fn download_file_verified_to<W>(
+        &self,
+        tenant_id: &str,
+        bucket: &str,
+        file_id: &str,
+        writer: &mut W,
+    ) -> Result<u64>
+    where
+        W: AsyncWrite + Unpin + ?Sized,
+    {
+        let stat = self.stat_file(tenant_id, bucket, file_id).await?;
+        debug!(
+            tenant_id = tenant_id,
+            bucket = bucket,
+            file_id = file_id,
+            size_bytes = stat.size_bytes,
+            "downloading file with verification into a caller-supplied writer"
+        );
+        self.download_verified_into(tenant_id, bucket, file_id, &stat, writer)
+            .await
+    }
 
+    /// Stream one download into `writer`, verifying it against `stat`, and
+    /// report how many bytes it carried.
+    ///
+    /// The whole of what the two verified downloads share, so the rules —
+    /// hash every chunk as it arrives, stop on an overshoot, check the size
+    /// before the digest, flush only once both agree — exist once.
+    /// [`RociaDbClient::download_file_verified`] passes a `Vec<u8>` it
+    /// pre-allocated; [`RociaDbClient::download_file_verified_to`] passes the
+    /// caller's writer. `stat` is taken by reference and never re-read here:
+    /// both callers have already issued it, and issuing it again would make the
+    /// verification compare against metadata the download did not start from.
+    async fn download_verified_into<W>(
+        &self,
+        tenant_id: &str,
+        bucket: &str,
+        file_id: &str,
+        stat: &StatResponse,
+        writer: &mut W,
+    ) -> Result<u64>
+    where
+        W: AsyncWrite + Unpin + ?Sized,
+    {
+        let mut verified = VerifiedDownload::new(stat.size_bytes);
         let mut stream = self
             .download_file_stream(tenant_id, bucket, file_id)
             .await?;
@@ -732,39 +914,14 @@ impl RociaDbClient {
             .await
             .status_context("file download stream failed")?
         {
-            // Hashed incrementally as the chunks arrive: a second pass over
-            // the assembled buffer would read the whole file twice for no
-            // gain.
-            hasher.update(&response.chunk);
-            bytes.extend_from_slice(&response.chunk);
-            // Stop as soon as the stream overshoots the size the metadata
-            // announced, rather than draining an arbitrarily long stream
-            // into memory only to reject it at the end: the outcome is the
-            // same mismatch, but the buffer never grows past `size_bytes`
-            // plus one chunk.
-            if bytes.len() as u64 > stat.size_bytes {
-                return Err(RociaDbError::SizeMismatch {
-                    expected: stat.size_bytes,
-                    actual: bytes.len() as u64,
-                });
-            }
+            verified.absorb(writer, &response.chunk).await?;
         }
-
-        let actual_size = bytes.len() as u64;
-        if actual_size != stat.size_bytes {
-            return Err(RociaDbError::SizeMismatch {
-                expected: stat.size_bytes,
-                actual: actual_size,
-            });
-        }
-        let digest: [u8; 32] = hasher.finalize().into();
-        if digest.as_slice() != stat.checksum.as_slice() {
-            return Err(RociaDbError::ChecksumMismatch {
-                expected: stat.checksum,
-                actual: digest.to_vec(),
-            });
-        }
-        Ok(bytes)
+        let written = verified.finish(&stat.checksum)?;
+        // Only now: a caller is going to discard whatever a failed
+        // verification wrote, so there is nothing worth pushing out of the
+        // writer's own buffers before the checks have passed.
+        writer.flush().await.map_err(download_write_error)?;
+        Ok(written)
     }
 
     /// Return metadata for one stored file.
@@ -910,19 +1067,136 @@ fn resolve_checksum(checksum: Option<[u8; 32]>, bytes: &[u8]) -> [u8; 32] {
     checksum.unwrap_or_else(|| Sha256::digest(bytes).into())
 }
 
-/// Validate that `size_bytes` does not exceed [`MAX_FILE_BYTES`] (5 GiB),
-/// before any network call. Shared by [`RociaDbClient::upload_file`] and
+/// Validate that `size_bytes` does not exceed `max_file_bytes`, before any
+/// network call. Shared by [`RociaDbClient::upload_file`] and
 /// [`RociaDbClient::upload_file_chunked`] so both reject an oversized file
 /// with the same client-side error instead of letting the upload run and
 /// fail server-side partway through.
-fn validate_file_size(size_bytes: u64) -> Result<()> {
-    if size_bytes > MAX_FILE_BYTES {
+///
+/// `max_file_bytes` is a parameter rather than a read of
+/// [`DEFAULT_MAX_FILE_BYTES`] because it is configurable per client (see
+/// [`RociaDbBuilder::max_file_bytes`](crate::RociaDbBuilder::max_file_bytes));
+/// keeping the rule in a pure function is what lets both the default and a
+/// lowered limit be asserted without a socket.
+fn validate_file_size(size_bytes: u64, max_file_bytes: u64) -> Result<()> {
+    if size_bytes > max_file_bytes {
         return Err(RociaDbError::validation(format!(
-            "file is {size_bytes} bytes, which exceeds the server's {MAX_FILE_BYTES}-byte \
-             (5 GiB) limit"
+            "file is {size_bytes} bytes, which exceeds the client's {max_file_bytes}-byte \
+             max_file_bytes limit"
         )));
     }
     Ok(())
+}
+
+/// Capacity [`RociaDbClient::download_file_verified`] reserves up front for a
+/// file the server reported as `size_bytes` bytes: that size, capped at
+/// [`MAX_PREALLOCATED_DOWNLOAD_BYTES`].
+///
+/// Never trust `size_bytes` with an allocation: it is a number the server
+/// chose, and `Vec::with_capacity` would reserve all of it before a byte has
+/// arrived. Pure and network-free so the cap can be asserted on its own.
+fn preallocated_download_capacity(size_bytes: u64) -> usize {
+    usize::try_from(size_bytes.min(MAX_PREALLOCATED_DOWNLOAD_BYTES)).unwrap_or(usize::MAX)
+}
+
+/// Map a write of downloaded bytes that the caller's writer refused into
+/// [`RociaDbError::Io`], the variant for a failure in something the *caller*
+/// handed over rather than in the server or the transport.
+fn download_write_error(source: std::io::Error) -> RociaDbError {
+    RociaDbError::Io {
+        context: DOWNLOAD_WRITE_CONTEXT,
+        source,
+    }
+}
+
+/// The running state of a verified download, and every rule the two verified
+/// downloads apply to one.
+///
+/// [`RociaDbClient::download_file_verified`] and
+/// [`RociaDbClient::download_file_verified_to`] differ only in *where* the
+/// bytes go — an owned `Vec<u8>` or the caller's writer — so the hashing, the
+/// byte counting and both mismatch checks live here once rather than twice.
+/// [`VerifiedDownload::record`] and [`VerifiedDownload::finish`] are pure: no
+/// socket, no writer, no runtime, so each rule is unit-testable on its own.
+/// [`VerifiedDownload::absorb`] is the one step that has to be `async`, and
+/// only because writing a chunk out is.
+struct VerifiedDownload {
+    /// The `size_bytes` [`RociaDbClient::stat_file`] reported: what the chunks
+    /// have to add up to, exactly.
+    expected_size: u64,
+    /// Fed each chunk as it arrives. Hashing an assembled buffer afterwards
+    /// would read the whole file a second time, and is not possible at all when
+    /// the bytes are handed to a writer and never kept.
+    hasher: Sha256,
+    /// Bytes accounted for so far, which on success is also the number
+    /// [`RociaDbClient::download_file_verified_to`] returns.
+    written: u64,
+}
+
+impl VerifiedDownload {
+    /// Begin verifying a download whose metadata reports `expected_size` bytes.
+    fn new(expected_size: u64) -> Self {
+        Self {
+            expected_size,
+            hasher: Sha256::new(),
+            written: 0,
+        }
+    }
+
+    /// Hash and count `chunk`, failing the moment the running total overshoots
+    /// `expected_size`.
+    ///
+    /// Stopping here rather than at the end of the stream is what keeps a
+    /// server that sends more than it promised from being drained into memory —
+    /// or onto the caller's disk — only to be rejected afterwards. The outcome
+    /// is the same [`RociaDbError::SizeMismatch`] either way, and `actual`
+    /// still counts the chunk that overshot.
+    fn record(&mut self, chunk: &[u8]) -> Result<()> {
+        self.hasher.update(chunk);
+        self.written = self.written.saturating_add(chunk.len() as u64);
+        if self.written > self.expected_size {
+            return Err(RociaDbError::SizeMismatch {
+                expected: self.expected_size,
+                actual: self.written,
+            });
+        }
+        Ok(())
+    }
+
+    /// [`VerifiedDownload::record`] `chunk`, then write it to `writer` — in
+    /// that order, so a chunk that overshoots `expected_size` is never handed
+    /// to the writer at all.
+    async fn absorb<W>(&mut self, writer: &mut W, chunk: &[u8]) -> Result<()>
+    where
+        W: AsyncWrite + Unpin + ?Sized,
+    {
+        self.record(chunk)?;
+        writer.write_all(chunk).await.map_err(download_write_error)
+    }
+
+    /// Check the finished download against the metadata and report how many
+    /// bytes it carried.
+    ///
+    /// The size is checked before the digest: a truncated stream fails both,
+    /// and the byte count is the more actionable of the two reports.
+    /// `expected_checksum` is compared as raw bytes, so a stored value that is
+    /// not a 32-byte SHA-256 digest at all simply cannot match.
+    fn finish(self, expected_checksum: &[u8]) -> Result<u64> {
+        if self.written != self.expected_size {
+            return Err(RociaDbError::SizeMismatch {
+                expected: self.expected_size,
+                actual: self.written,
+            });
+        }
+        let digest: [u8; 32] = self.hasher.finalize().into();
+        if digest.as_slice() != expected_checksum {
+            return Err(RociaDbError::ChecksumMismatch {
+                expected: expected_checksum.to_vec(),
+                actual: digest.to_vec(),
+            });
+        }
+        Ok(self.written)
+    }
 }
 
 /// Lazily build the per-chunk `UploadRequest` sequence for `bytes`.
@@ -1299,23 +1573,75 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CHUNK_SIZE, FileStreamUploadOptions, FileUploadOptions, MAX_FILE_BYTES,
-        MAX_PREALLOCATED_DOWNLOAD_BYTES, RechunkState, chunk_upload_requests,
-        default_upload_file_request_id, rechunk_upload_requests, resolve_checksum,
-        validate_file_size,
+        AsyncWrite, AsyncWriteExt, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_FILE_BYTES,
+        DOWNLOAD_WRITE_CONTEXT, FileStreamUploadOptions, FileUploadOptions,
+        MAX_PREALLOCATED_DOWNLOAD_BYTES, RechunkState, VerifiedDownload, chunk_upload_requests,
+        default_upload_file_request_id, preallocated_download_capacity, rechunk_upload_requests,
+        resolve_checksum, validate_file_size,
     };
     use crate::pb::upstream::v1::UploadRequest;
-    use crate::test_support::lazy_test_client;
+    use crate::test_support::{lazy_test_client, lazy_test_client_with_max_file_bytes};
     use crate::{Bytes, RociaDbError};
     use futures::executor::block_on;
     use futures::{StreamExt, stream};
+    use sha2::{Digest, Sha256};
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
 
     /// Length of a SHA-256 digest. The production code no longer needs this
     /// as a constant — `[u8; 32]` carries it — but the tests still assert
     /// against the number itself.
     const CHECKSUM_LEN: usize = 32;
+
+    /// An [`AsyncWrite`] that takes `allowed` bytes and then fails every
+    /// further write, standing in for the destination of a download running out
+    /// of room — a full disk, a closed socket — partway through.
+    ///
+    /// Never returns `Ok(0)`: that is how an `AsyncWrite` reports "no progress
+    /// but not an error", and `write_all` turns it into a `WriteZero` of its own
+    /// rather than the failure this stands for.
+    struct FailingWriter {
+        written: usize,
+        allowed: usize,
+    }
+
+    impl FailingWriter {
+        fn new(allowed: usize) -> Self {
+            Self {
+                written: 0,
+                allowed,
+            }
+        }
+    }
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let room = self.allowed.saturating_sub(self.written);
+            if room == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "the download destination went away",
+                )));
+            }
+            let accepted = room.min(buf.len());
+            self.written += accepted;
+            Poll::Ready(Ok(accepted))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     /// One source item, as `upload_file_chunked`'s stream yields them.
     fn chunk(bytes: Vec<u8>) -> std::io::Result<Bytes> {
@@ -1550,33 +1876,259 @@ mod tests {
         // The point of the cap: `download_file_verified` reserves
         // `min(size_bytes, cap)` up front, so the biggest allocation a
         // server can provoke with a made-up `size_bytes` is the cap — not
-        // the 5 GiB a file is actually allowed to reach, and not the 2^64
+        // the 5 GiB a file is allowed to reach by default, and not the 2^64
         // an unchecked `u64` would allow.
         assert_eq!(MAX_PREALLOCATED_DOWNLOAD_BYTES, 64 * 1024 * 1024);
         const {
-            assert!(MAX_PREALLOCATED_DOWNLOAD_BYTES < MAX_FILE_BYTES);
+            assert!(MAX_PREALLOCATED_DOWNLOAD_BYTES < DEFAULT_MAX_FILE_BYTES);
         }
         for reported in [0, 1, 4096, MAX_PREALLOCATED_DOWNLOAD_BYTES, u64::MAX] {
-            let capacity = usize::try_from(reported.min(MAX_PREALLOCATED_DOWNLOAD_BYTES))
-                .unwrap_or(usize::MAX);
+            let capacity = preallocated_download_capacity(reported);
             assert!(
                 capacity as u64 <= MAX_PREALLOCATED_DOWNLOAD_BYTES,
                 "a reported size of {reported} must never reserve more than the cap"
             );
         }
+        // Below the cap the reported size is reserved exactly, so a realistic
+        // file is allocated once rather than grown chunk by chunk.
+        assert_eq!(preallocated_download_capacity(4096), 4096);
+        assert_eq!(
+            preallocated_download_capacity(u64::MAX),
+            usize::try_from(MAX_PREALLOCATED_DOWNLOAD_BYTES).expect("64 MiB fits in a usize")
+        );
+    }
+
+    /// Drive a [`VerifiedDownload`] over `chunks` into `writer` exactly as
+    /// `RociaDbClient::download_verified_into` drives it over a real download
+    /// stream: record and write each chunk, check the totals, then flush.
+    ///
+    /// No server, no stream, and no tokio runtime — neither a `Vec<u8>` nor
+    /// [`FailingWriter`] ever reaches the reactor, so
+    /// `futures::executor::block_on` is enough to drive the writes.
+    fn verify_download<W>(
+        expected_size: u64,
+        expected_checksum: &[u8],
+        chunks: &[&[u8]],
+        writer: &mut W,
+    ) -> crate::Result<u64>
+    where
+        W: AsyncWrite + Unpin + ?Sized,
+    {
+        let mut verified = VerifiedDownload::new(expected_size);
+        for chunk in chunks {
+            block_on(verified.absorb(writer, chunk))?;
+        }
+        let written = verified.finish(expected_checksum)?;
+        block_on(writer.flush()).map_err(super::download_write_error)?;
+        Ok(written)
     }
 
     #[test]
-    fn validate_file_size_accepts_exactly_the_5_gib_limit() {
-        validate_file_size(MAX_FILE_BYTES).expect("exactly the limit must be accepted");
+    fn verified_download_checks_a_stream_against_its_metadata_with_no_writer_at_all() {
+        // `record` and `finish` are pure: they are the whole of the rule both
+        // verified downloads apply, and neither needs a destination to apply
+        // it. Everything below exercises them through `absorb`; this pins down
+        // that they stand on their own.
+        let payload = b"the quick brown fox";
+        let mut verified = VerifiedDownload::new(payload.len() as u64);
+        for chunk in payload.chunks(4) {
+            verified
+                .record(chunk)
+                .expect("no chunk overshoots the size");
+        }
+        let digest: [u8; 32] = Sha256::digest(payload).into();
+        assert_eq!(
+            verified
+                .finish(&digest)
+                .expect("a matching size and digest must verify"),
+            payload.len() as u64
+        );
     }
 
     #[test]
-    fn validate_file_size_rejects_one_byte_over_the_5_gib_limit() {
-        let error = validate_file_size(MAX_FILE_BYTES + 1)
+    fn verified_download_writes_every_chunk_and_reports_the_byte_count() {
+        let payload: Vec<u8> = (0..5000u32).map(|byte| (byte % 251) as u8).collect();
+        let digest: [u8; 32] = Sha256::digest(&payload).into();
+        let chunks: Vec<&[u8]> = payload.chunks(997).collect();
+        let mut written = Vec::new();
+        let count = verify_download(payload.len() as u64, &digest, &chunks, &mut written)
+            .expect("a stream that matches its metadata must verify");
+        assert_eq!(count, payload.len() as u64);
+        assert_eq!(
+            written, payload,
+            "the writer must receive the file byte for byte, in order"
+        );
+    }
+
+    #[test]
+    fn writing_through_async_write_keeps_the_buffers_preallocated_capacity() {
+        // The property that lets `download_file_verified` be the writer variant
+        // pointed at a `Vec<u8>` without losing its capped pre-allocation:
+        // `<Vec<u8> as AsyncWrite>::poll_write` is an `extend_from_slice`, so a
+        // buffer that was reserved up front is filled rather than regrown.
+        let payload: Vec<u8> = vec![1u8; 4096];
+        let digest: [u8; 32] = Sha256::digest(&payload).into();
+        let chunks: Vec<&[u8]> = payload.chunks(101).collect();
+        let capacity = preallocated_download_capacity(payload.len() as u64);
+        let mut written = Vec::with_capacity(capacity);
+        verify_download(payload.len() as u64, &digest, &chunks, &mut written)
+            .expect("the download must verify");
+        assert_eq!(
+            written.capacity(),
+            capacity,
+            "filling a pre-allocated buffer through AsyncWrite must not reallocate it"
+        );
+    }
+
+    #[test]
+    fn verified_download_rejects_a_digest_the_bytes_do_not_satisfy() {
+        let payload = b"stored bytes".as_slice();
+        let mut written = Vec::new();
+        let error = verify_download(
+            payload.len() as u64,
+            &[9u8; CHECKSUM_LEN],
+            &[payload],
+            &mut written,
+        )
+        .expect_err("a digest that disagrees must fail verification");
+        match error {
+            RociaDbError::ChecksumMismatch { expected, actual } => {
+                assert_eq!(expected, vec![9u8; CHECKSUM_LEN]);
+                assert_eq!(actual, Sha256::digest(payload).to_vec());
+            }
+            other => panic!("expected a checksum mismatch, got: {other}"),
+        }
+        assert_eq!(
+            written, payload,
+            "the writer has already received the whole file: discarding it is the caller's job"
+        );
+    }
+
+    #[test]
+    fn verified_download_rejects_a_stream_shorter_than_its_metadata() {
+        let payload = b"four".as_slice();
+        let mut written = Vec::new();
+        let error = verify_download(64, &[0u8; CHECKSUM_LEN], &[payload], &mut written)
+            .expect_err("a short stream must fail");
+        assert!(
+            matches!(
+                error,
+                RociaDbError::SizeMismatch {
+                    expected: 64,
+                    actual: 4
+                }
+            ),
+            "the size is checked before the digest, got: {error}"
+        );
+    }
+
+    #[test]
+    fn verified_download_stops_at_the_chunk_that_overshoots_without_writing_it() {
+        // The early exit: the chunk that pushes the total past `size_bytes` is
+        // recorded (so `actual` counts it, exactly as the buffered variant
+        // always reported) but never handed to the writer, so a server that
+        // never stops sending cannot fill the caller's disk.
+        let mut written = Vec::new();
+        let error = verify_download(
+            6,
+            &[0u8; CHECKSUM_LEN],
+            &[b"abcd".as_slice(), b"efgh".as_slice(), b"ijkl".as_slice()],
+            &mut written,
+        )
+        .expect_err("more bytes than the metadata declared must fail");
+        assert!(
+            matches!(
+                error,
+                RociaDbError::SizeMismatch {
+                    expected: 6,
+                    actual: 8
+                }
+            ),
+            "got: {error}"
+        );
+        assert_eq!(
+            written, b"abcd",
+            "only the chunks that fitted may have been written, and nothing after the overshoot"
+        );
+    }
+
+    #[test]
+    fn verified_download_surfaces_a_writer_that_fails_after_n_bytes_as_an_io_error() {
+        let payload: Vec<u8> = vec![3u8; 300];
+        let digest: [u8; 32] = Sha256::digest(&payload).into();
+        let chunks: Vec<&[u8]> = payload.chunks(100).collect();
+        // Room for the first chunk and half of the second.
+        let mut writer = FailingWriter::new(150);
+        let error = verify_download(payload.len() as u64, &digest, &chunks, &mut writer)
+            .expect_err("a writer that fails must fail the download");
+        let RociaDbError::Io { context, source } = &error else {
+            panic!("a failing writer must produce RociaDbError::Io, got: {error}");
+        };
+        assert_eq!(*context, DOWNLOAD_WRITE_CONTEXT);
+        assert_eq!(*context, "writing the downloaded file");
+        assert_eq!(source.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(
+            error
+                .to_string()
+                .contains("the download destination went away"),
+            "Display must fold in the writer's own message, got: {error}"
+        );
+        assert!(
+            error.code().is_none(),
+            "a failing writer is not a gRPC status, got: {error}"
+        );
+        assert_eq!(
+            writer.written, 150,
+            "everything the writer did accept must have been written before it refused"
+        );
+    }
+
+    #[test]
+    fn the_default_file_size_limit_mirrors_the_servers_five_gibibyte_default() {
+        assert_eq!(DEFAULT_MAX_FILE_BYTES, 5 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn validate_file_size_accepts_exactly_the_limit() {
+        validate_file_size(DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_FILE_BYTES)
+            .expect("exactly the limit must be accepted");
+    }
+
+    #[test]
+    fn validate_file_size_rejects_one_byte_over_the_limit_and_names_both_counts() {
+        let error = validate_file_size(DEFAULT_MAX_FILE_BYTES + 1, DEFAULT_MAX_FILE_BYTES)
             .expect_err("one byte over the limit must be rejected");
         assert!(matches!(error, RociaDbError::Validation(_)));
-        assert!(error.to_string().contains("5 GiB"));
+        let message = error.to_string();
+        assert!(
+            message.contains(&(DEFAULT_MAX_FILE_BYTES + 1).to_string()),
+            "the file's own size must be readable, got: {message}"
+        );
+        assert!(
+            message.contains(&DEFAULT_MAX_FILE_BYTES.to_string()),
+            "the limit must be readable, got: {message}"
+        );
+        assert!(
+            message.contains("max_file_bytes"),
+            "the message must name the setter to change, got: {message}"
+        );
+    }
+
+    #[test]
+    fn validate_file_size_follows_the_limit_it_is_given_in_both_directions() {
+        // The limit is a parameter precisely so
+        // `RociaDbBuilder::max_file_bytes` can move it: a file the 5 GiB
+        // default waves through must be rejected under a lowered one, and a
+        // raised one must accept a file no server default would.
+        let one_mib = DEFAULT_CHUNK_SIZE as u64;
+        validate_file_size(one_mib, DEFAULT_MAX_FILE_BYTES)
+            .expect("1 MiB is far under the default limit");
+        let error = validate_file_size(one_mib, 1024)
+            .expect_err("a lowered limit must reject what the default accepts");
+        assert!(matches!(error, RociaDbError::Validation(_)));
+        assert!(error.to_string().contains("1024"));
+        validate_file_size(DEFAULT_MAX_FILE_BYTES * 2, DEFAULT_MAX_FILE_BYTES * 4)
+            .expect("a raised limit must accept a file over the default");
     }
 
     // `upload_file_chunked`'s pre-flight size validation must run — and
@@ -1587,7 +2139,7 @@ mod tests {
     #[tokio::test]
     async fn upload_file_chunked_rejects_an_oversized_file_before_any_network_call() {
         let client = lazy_test_client();
-        let oversized = MAX_FILE_BYTES + 1;
+        let oversized = DEFAULT_MAX_FILE_BYTES + 1;
         let error = client
             .upload_file_chunked(
                 "tenant",
@@ -1597,9 +2149,62 @@ mod tests {
                 FileStreamUploadOptions::new(oversized, [0u8; CHECKSUM_LEN]),
             )
             .await
-            .expect_err("a file over the 5 GiB limit must be rejected");
+            .expect_err("a file over the default 5 GiB limit must be rejected");
         assert!(matches!(error, RociaDbError::Validation(_)));
-        assert!(error.to_string().contains("5 GiB"));
+        assert!(error.to_string().contains(&oversized.to_string()));
+    }
+
+    // Both ergonomic uploads read the ceiling off the *client*, not off the
+    // constant, so a client built with a lowered `max_file_bytes` rejects a
+    // file the default would have sent — and still does so before touching
+    // the network, which is why an unreachable host does not make this hang.
+    #[tokio::test]
+    async fn both_ergonomic_uploads_honour_the_clients_own_max_file_bytes() {
+        let client = lazy_test_client_with_max_file_bytes(1024);
+
+        let error = client
+            .upload_file(
+                "tenant",
+                "bucket",
+                "buffered.bin",
+                vec![7u8; 1025],
+                FileUploadOptions::new(),
+            )
+            .await
+            .expect_err("a file over the client's own limit must be rejected");
+        assert!(matches!(error, RociaDbError::Validation(_)));
+        assert!(error.to_string().contains("1024"));
+
+        let error = client
+            .upload_file_chunked(
+                "tenant",
+                "bucket",
+                "streamed.bin",
+                stream::empty::<std::io::Result<Bytes>>(),
+                FileStreamUploadOptions::new(1025, [0u8; CHECKSUM_LEN]),
+            )
+            .await
+            .expect_err("a declared size over the client's own limit must be rejected");
+        assert!(matches!(error, RociaDbError::Validation(_)));
+        assert!(error.to_string().contains("1024"));
+
+        // And exactly the limit still goes out: the gate is `>`, not `>=`.
+        // (It fails at the connection stage against the unreachable host,
+        // which is what proves the size check let it through.)
+        let error = client
+            .upload_file(
+                "tenant",
+                "bucket",
+                "exactly.bin",
+                vec![7u8; 1024],
+                FileUploadOptions::new(),
+            )
+            .await
+            .expect_err("the unreachable host must fail the call itself");
+        assert!(
+            !matches!(error, RociaDbError::Validation(_)),
+            "a file of exactly the limit must pass the size gate, got: {error}"
+        );
     }
 
     /// Drives [`rechunk_upload_requests`] to completion against an

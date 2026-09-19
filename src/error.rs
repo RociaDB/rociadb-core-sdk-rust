@@ -39,30 +39,37 @@ pub type Result<T> = std::result::Result<T, RociaDbError>;
 /// [`RociaDbError::Config`] is a *configuration* mistake, raised by
 /// [`crate::RociaDbBuilder`] before any connection is attempted (a missing
 /// host, a host URL carrying a path, a missing `AUTH_*` value, a zero
-/// timeout, a TLS config the endpoint rejects);
+/// timeout, a zero
+/// [`max_file_bytes`](crate::RociaDbBuilder::max_file_bytes), a TLS config the
+/// endpoint rejects);
 /// [`RociaDbError::Connection`] is a genuine dial or transport failure
 /// (DNS, a refused connection, a TLS handshake);
 /// [`RociaDbError::Validation`] is a client-side *data* rule checked on a
-/// per-call argument (a zero page limit, an oversized file, a chunk stream
+/// per-call argument (a zero page limit, a file over
+/// [`max_file_bytes`](crate::RociaDbBuilder::max_file_bytes), a chunk stream
 /// whose length disagrees with the declared size). A `Config` error is
 /// fixed by changing how the client is built, a `Connection` error by
 /// fixing the network or the server, a `Validation` error by changing the
 /// arguments of one call.
 ///
 /// [`RociaDbError::Io`] carries no status either, and for a third reason: the
-/// failure is in a source the *caller* handed over. It is raised only by
+/// failure is in an I/O handle the *caller* handed over. Two calls raise it,
+/// and its `context` says which:
 /// [`upload_file_chunked`](crate::RociaDbClient::upload_file_chunked), when the
 /// chunk stream it is draining yields an `Err` — a read that failed on the
 /// caller's file or socket, which ends the upload and is reported ahead of
-/// whatever the server made of the truncated stream.
+/// whatever the server made of the truncated stream — and
+/// [`download_file_verified_to`](crate::RociaDbClient::download_file_verified_to),
+/// when the writer it is filling refuses a chunk or fails to flush.
 ///
 /// Two more variants carry no status for a different reason: the call
 /// succeeded and the *data* it returned is wrong.
 /// [`RociaDbError::ChecksumMismatch`] and [`RociaDbError::SizeMismatch`] are
-/// raised only by
-/// [`download_file_verified`](crate::RociaDbClient::download_file_verified),
-/// which is the one call in this SDK that checks what it downloaded against
-/// what [`stat_file`](crate::RociaDbClient::stat_file) says.
+/// raised only by the two verified downloads,
+/// [`download_file_verified`](crate::RociaDbClient::download_file_verified) and
+/// [`download_file_verified_to`](crate::RociaDbClient::download_file_verified_to),
+/// the only calls in this SDK that check what they downloaded against what
+/// [`stat_file`](crate::RociaDbClient::stat_file) says.
 ///
 /// New variants may be added in a minor release: match on this enum with a
 /// wildcard arm to stay forward-compatible.
@@ -85,8 +92,9 @@ pub enum RociaDbError {
     /// [`crate::RociaDbBuilder`] *before* any connection is attempted: a
     /// missing host, a host URL carrying a path, query string or fragment, a
     /// missing `AUTH_TOKEN_URL` / `AUTH_CLIENT_ID` / `AUTH_CLIENT_SECRET`, a
-    /// zero [`connect_timeout`](crate::RociaDbBuilder::connect_timeout) or
-    /// [`request_timeout`](crate::RociaDbBuilder::request_timeout), or a
+    /// zero [`connect_timeout`](crate::RociaDbBuilder::connect_timeout),
+    /// [`request_timeout`](crate::RociaDbBuilder::request_timeout) or
+    /// [`max_file_bytes`](crate::RociaDbBuilder::max_file_bytes), or a
     /// [`ClientTlsConfig`](crate::ClientTlsConfig) the endpoint rejects.
     ///
     /// Nothing has been sent anywhere when this is returned, and retrying
@@ -174,21 +182,27 @@ pub enum RociaDbError {
         source: serde_json::Error,
     },
 
-    /// A source the SDK was reading on the caller's behalf failed with an I/O
-    /// error.
+    /// An I/O handle the caller handed over, and that the SDK was reading from
+    /// or writing to on their behalf, failed with an I/O error.
     ///
-    /// Raised only by
-    /// [`upload_file_chunked`](crate::RociaDbClient::upload_file_chunked),
-    /// whose `chunks` stream yields `std::io::Result<Bytes>`: an `Err` item —
-    /// a read error from the file, socket or pipe behind a
-    /// `tokio_util::io::ReaderStream`, say — ends the upload and surfaces
-    /// here. The failure is the caller's own source, not the server and not
-    /// the transport, which is why it carries neither a
-    /// [`tonic::Status`] nor a byte count: the upload was abandoned partway
-    /// through, so nothing was stored (the server only publishes a file once
-    /// it has received and validated the whole stream) and this error takes
-    /// precedence over whatever status the server made of the truncated
-    /// stream.
+    /// Raised by exactly two calls, told apart by `context`:
+    ///
+    /// - `"the upload chunk stream"`, from
+    ///   [`upload_file_chunked`](crate::RociaDbClient::upload_file_chunked),
+    ///   whose `chunks` stream yields `std::io::Result<Bytes>`: an `Err` item —
+    ///   a read error from the file, socket or pipe behind a
+    ///   `tokio_util::io::ReaderStream`, say — ends the upload and surfaces
+    ///   here. The failure is the caller's own source, not the server and not
+    ///   the transport, which is why it carries neither a [`tonic::Status`] nor
+    ///   a byte count: the upload was abandoned partway through, so nothing was
+    ///   stored (the server only publishes a file once it has received and
+    ///   validated the whole stream) and this error takes precedence over
+    ///   whatever status the server made of the truncated stream.
+    /// - `"writing the downloaded file"`, from
+    ///   [`download_file_verified_to`](crate::RociaDbClient::download_file_verified_to),
+    ///   when the writer it is streaming into refuses a chunk or fails on the
+    ///   final flush. The download is abandoned there, and whatever the writer
+    ///   already accepted is the caller's to discard.
     ///
     /// [`Display`](std::fmt::Display) folds in the underlying
     /// [`std::io::Error`], which is also available as the
@@ -205,20 +219,25 @@ pub enum RociaDbError {
     },
 
     /// A client-side rule about the *data* of one call was violated before
-    /// any network call was made: a zero page limit, a file size out of
-    /// bounds, or a chunk stream whose total byte count does not match the
-    /// declared `size_bytes`.
+    /// any network call was made: a zero page limit, a file over the client's
+    /// [`max_file_bytes`](crate::RociaDbBuilder::max_file_bytes), or a chunk
+    /// stream whose total byte count does not match the declared `size_bytes`.
     ///
     /// This is about the arguments of a single call, not about how the
     /// client was built — a builder or environment mistake is
-    /// [`RociaDbError::Config`].
+    /// [`RociaDbError::Config`]. The file size limit is where the two touch:
+    /// the *ceiling* comes from the builder (a zero one is a `Config` error),
+    /// and a file that exceeds it is this.
     #[error("{0}")]
     Validation(String),
 
     /// A downloaded file's SHA-256 digest does not match the checksum
     /// [`stat_file`](crate::RociaDbClient::stat_file) reported for it.
     ///
-    /// Produced by [`download_file_verified`](crate::RociaDbClient::download_file_verified)
+    /// Produced by the two verified downloads,
+    /// [`download_file_verified`](crate::RociaDbClient::download_file_verified)
+    /// and
+    /// [`download_file_verified_to`](crate::RociaDbClient::download_file_verified_to),
     /// and by nothing else — no other call in this SDK verifies a download.
     /// It means the bytes served differ from what the uploader declared when
     /// the file was written: storage corruption, a partial overwrite, or an
@@ -249,12 +268,16 @@ pub enum RociaDbError {
     /// A downloaded file's byte count does not match the `size_bytes`
     /// [`stat_file`](crate::RociaDbClient::stat_file) reported for it.
     ///
-    /// Produced by [`download_file_verified`](crate::RociaDbClient::download_file_verified)
+    /// Produced by the two verified downloads,
+    /// [`download_file_verified`](crate::RociaDbClient::download_file_verified)
+    /// and
+    /// [`download_file_verified_to`](crate::RociaDbClient::download_file_verified_to),
     /// and by nothing else. A short count usually means a truncated download
     /// stream; a long one means the stored file grew past what the metadata
-    /// records. It is checked before the digest, because "the file is the
-    /// wrong length" is the more actionable of the two reports a truncated
-    /// transfer would produce.
+    /// records — and is reported as soon as the stream overshoots, rather than
+    /// after draining all of it. It is checked before the digest, because "the
+    /// file is the wrong length" is the more actionable of the two reports a
+    /// truncated transfer would produce.
     #[error("downloaded file is {actual} bytes but the server reported {expected}")]
     SizeMismatch {
         /// Size [`stat_file`](crate::RociaDbClient::stat_file) reported.

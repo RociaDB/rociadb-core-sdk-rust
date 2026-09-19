@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWrite;
 
 /// A caller's own document type, to pin down that the generic reads decode
 /// into something other than `serde_json::Value`.
@@ -136,6 +137,54 @@ async fn a_verified_download_returns_bytes_or_names_the_mismatch(
         }
         Err(other) => Err(other),
     }
+}
+
+// `download_file_verified_to` runs the same checks without buffering, and its
+// `W: AsyncWrite + Unpin + ?Sized` bound has to accept every shape a caller
+// actually holds: a concrete `tokio::fs::File`, an in-memory `Vec<u8>`, and —
+// this is what `?Sized` is for — a `&mut dyn AsyncWrite` whose destination is
+// chosen at run time. It hands back a byte count, never the file.
+#[allow(dead_code)]
+async fn a_verified_download_streams_into_any_writer(
+    client: Arc<RociaDbClient>,
+    mut file: tokio::fs::File,
+) -> Result<()> {
+    let _to_disk: u64 = client
+        .download_file_verified_to("tenant", "assets", "manual.pdf", &mut file)
+        .await?;
+
+    let mut buffer: Vec<u8> = Vec::new();
+    let _to_memory: u64 = client
+        .download_file_verified_to("tenant", "assets", "manual.pdf", &mut buffer)
+        .await?;
+
+    let erased: &mut (dyn AsyncWrite + Unpin) = &mut buffer;
+    let _to_a_trait_object: u64 = client
+        .download_file_verified_to("tenant", "assets", "manual.pdf", erased)
+        .await?;
+
+    // And its integrity failures are the same two variants the buffered
+    // variant reports, plus the `Io` of a writer that refused the bytes.
+    let mut sink = tokio::io::sink();
+    match client
+        .download_file_verified_to("tenant", "assets", "manual.pdf", &mut sink)
+        .await
+    {
+        Ok(written) => {
+            let _: u64 = written;
+        }
+        Err(RociaDbError::SizeMismatch { expected, actual }) => {
+            let _: (u64, u64) = (expected, actual);
+        }
+        Err(RociaDbError::ChecksumMismatch { expected, actual }) => {
+            let _: (Vec<u8>, Vec<u8>) = (expected, actual);
+        }
+        Err(RociaDbError::Io { context, source }) => {
+            let _: (&'static str, std::io::Error) = (context, source);
+        }
+        Err(other) => return Err(other),
+    }
+    Ok(())
 }
 
 // Neighbor pagination returns the shared `Page<T>`, not a bespoke page type.
@@ -431,6 +480,9 @@ async fn the_builder_exposes_the_transport_hooks() -> Result<()> {
         .request_timeout(Duration::from_secs(10))
         .tls_config(ClientTlsConfig::new().with_native_roots())
         .http2_keep_alive(Duration::from_secs(30), Duration::from_secs(5))
+        // Not a transport setting: a client-side ceiling on the size of a file
+        // the two ergonomic uploads will send, mirroring the server's own.
+        .max_file_bytes(512 * 1024 * 1024)
         .disable_auth()
         .build()
         .await?;

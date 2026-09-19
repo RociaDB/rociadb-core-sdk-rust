@@ -1,15 +1,18 @@
 //! File RPCs against the in-process server: the chunked upload contract, the
 //! raw `upload_file_stream` escape hatch and the two server-side rules it can
-//! break, a byte-exact download of a file larger than one chunk, the
-//! verifying download and both of its failure modes, idempotent deletes, and
-//! the two listings.
+//! break, a byte-exact download of a file larger than one chunk, the two
+//! verifying downloads and every failure mode they have, the client-side file
+//! size ceiling, idempotent deletes, and the two listings.
 
 mod support;
 
 use rociadb_sdk::{
     Bytes, FileStreamUploadOptions, FileUploadOptions, RociaDbError, UploadRequest, WriteOptions,
 };
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use support::{FakeServer, payload, sha256};
+use tokio::io::AsyncWrite;
 
 const TENANT: &str = "tenant-1";
 const BUCKET: &str = "assets";
@@ -20,6 +23,61 @@ const ONE_MIB: usize = 1024 * 1024;
 /// their chunks in memory rather than reading them off a file.
 fn chunk(bytes: Vec<u8>) -> std::io::Result<Bytes> {
     Ok(Bytes::from(bytes))
+}
+
+/// A download destination that accepts `allowed` bytes and then fails every
+/// further write: a full disk, a closed pipe, a quota exhausted halfway
+/// through. Records what it did accept, so a test can tell where it stopped.
+///
+/// Never answers `Ok(0)` — that means "no progress, but not an error", which
+/// `write_all` reports as a `WriteZero` of its own rather than as the failure
+/// this stands in for.
+struct FailingWriter {
+    written: usize,
+    allowed: usize,
+}
+
+impl FailingWriter {
+    fn new(allowed: usize) -> Self {
+        Self {
+            written: 0,
+            allowed,
+        }
+    }
+}
+
+impl AsyncWrite for FailingWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let room = self.allowed.saturating_sub(self.written);
+        if room == 0 {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "the download destination went away",
+            )));
+        }
+        let accepted = room.min(buf.len());
+        self.written += accepted;
+        Poll::Ready(Ok(accepted))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// A unique path under the system temporary directory, for the tests that
+/// download to a real file. Includes the process id and `name`, so parallel
+/// tests never collide.
+fn temp_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("rociadb-sdk-{name}-{}.bin", std::process::id()))
 }
 
 #[tokio::test]
@@ -321,10 +379,7 @@ async fn upload_file_chunked_takes_a_reader_stream_over_a_real_file_unadapted() 
     // to reassemble the reader's own 4 KiB-ish slices into 1 MiB messages and
     // end with a short one.
     let bytes = payload(ONE_MIB + 7919);
-    let path = std::env::temp_dir().join(format!(
-        "rociadb-sdk-reader-stream-{}.bin",
-        std::process::id()
-    ));
+    let path = temp_path("reader-stream");
     std::fs::write(&path, &bytes).expect("writing the temporary source file must succeed");
 
     let file = tokio::fs::File::open(&path)
@@ -556,6 +611,298 @@ async fn download_file_verified_propagates_a_missing_file_as_not_found() {
     // It fails on the stat, before any download is attempted.
     assert_eq!(server.call_count("Stat"), 1);
     assert_eq!(server.call_count("Download"), 0);
+}
+
+#[tokio::test]
+async fn download_file_verified_to_streams_a_multi_chunk_file_into_a_writer() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    // Several server-side download chunks, and a size that is a multiple of
+    // none of them, so the writer has to receive the pieces in order and the
+    // last one short.
+    let bytes = payload(ONE_MIB + 12_345);
+    client
+        .upload_file(
+            TENANT,
+            BUCKET,
+            "streamed-out.bin",
+            bytes.clone(),
+            FileUploadOptions::new(),
+        )
+        .await
+        .expect("the upload must succeed");
+
+    let mut written: Vec<u8> = Vec::new();
+    let count = client
+        .download_file_verified_to(TENANT, BUCKET, "streamed-out.bin", &mut written)
+        .await
+        .expect("a file whose stored checksum matches its bytes must verify");
+
+    assert_eq!(count, bytes.len() as u64, "the byte count must be reported");
+    assert_eq!(
+        written, bytes,
+        "the writer must receive the file byte for byte, whatever chunk size the server chose"
+    );
+    // The same two calls the buffered variant costs: one stat, one download.
+    assert_eq!(server.call_count("Stat"), 1);
+    assert_eq!(server.call_count("Download"), 1);
+}
+
+#[tokio::test]
+async fn download_file_verified_to_writes_a_verified_file_to_disk() {
+    // The case the method exists for: a `tokio::fs::File` as the destination,
+    // so nothing is ever buffered. Read back through the filesystem rather
+    // than through the handle, which is also what makes the final `flush()`
+    // load-bearing — tokio's `File` holds writes in a buffer of its own.
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let bytes = payload(ONE_MIB + 999);
+    client
+        .upload_file(
+            TENANT,
+            BUCKET,
+            "on-disk.bin",
+            bytes.clone(),
+            FileUploadOptions::new(),
+        )
+        .await
+        .expect("the upload must succeed");
+
+    let path = temp_path("verified-download");
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .expect("creating the temporary destination must succeed");
+    let result = client
+        .download_file_verified_to(TENANT, BUCKET, "on-disk.bin", &mut file)
+        .await;
+    drop(file);
+    let readback = tokio::fs::read(&path).await;
+    // Remove the file before asserting, so a failure leaves nothing behind.
+    let _ = tokio::fs::remove_file(&path).await;
+
+    assert_eq!(
+        result.expect("the verified download must succeed"),
+        bytes.len() as u64
+    );
+    assert_eq!(
+        readback.expect("the destination file must be readable"),
+        bytes,
+        "the file on disk must match the uploaded bytes exactly"
+    );
+}
+
+#[tokio::test]
+async fn download_file_verified_to_rejects_bytes_that_do_not_match_the_stored_checksum() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let bytes = payload(4096);
+    client
+        .upload_file(
+            TENANT,
+            BUCKET,
+            "tampered-out.bin",
+            bytes.clone(),
+            FileUploadOptions::new(),
+        )
+        .await
+        .expect("the upload must succeed");
+    // Same length, different bytes: only the digest can catch this.
+    server.corrupt_stored_bytes(TENANT, BUCKET, "tampered-out.bin");
+
+    let mut written: Vec<u8> = Vec::new();
+    let error = client
+        .download_file_verified_to(TENANT, BUCKET, "tampered-out.bin", &mut written)
+        .await
+        .expect_err("corrupted bytes must not be reported as verified");
+    match error {
+        RociaDbError::ChecksumMismatch { expected, actual } => {
+            assert_eq!(expected, sha256(&bytes).to_vec());
+            assert_eq!(actual.len(), 32);
+            assert_ne!(actual, expected);
+        }
+        other => panic!("expected a checksum mismatch, got: {other}"),
+    }
+    assert_eq!(
+        written.len(),
+        bytes.len(),
+        "the writer has already received the whole file — discarding it is the caller's job"
+    );
+}
+
+#[tokio::test]
+async fn download_file_verified_to_rejects_a_download_shorter_than_its_metadata() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let bytes = payload(4096);
+    client
+        .upload_file(
+            TENANT,
+            BUCKET,
+            "truncated-out.bin",
+            bytes.clone(),
+            FileUploadOptions::new(),
+        )
+        .await
+        .expect("the upload must succeed");
+    server.drop_stored_byte(TENANT, BUCKET, "truncated-out.bin");
+
+    let mut written: Vec<u8> = Vec::new();
+    let error = client
+        .download_file_verified_to(TENANT, BUCKET, "truncated-out.bin", &mut written)
+        .await
+        .expect_err("a truncated file must not be reported as verified");
+    match error {
+        RociaDbError::SizeMismatch { expected, actual } => {
+            assert_eq!(expected, bytes.len() as u64);
+            assert_eq!(actual, bytes.len() as u64 - 1);
+        }
+        other => panic!("expected a size mismatch — it is checked first — got: {other}"),
+    }
+    assert_eq!(
+        written.len(),
+        bytes.len() - 1,
+        "everything that arrived was written before the shortfall could be noticed"
+    );
+}
+
+#[tokio::test]
+async fn download_file_verified_to_surfaces_a_failing_writer_as_an_io_error() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    // Comfortably more than one server-side download chunk, so the writer
+    // fails partway through a real multi-chunk transfer.
+    let bytes = payload(512 * 1024);
+    client
+        .upload_file(
+            TENANT,
+            BUCKET,
+            "unwritable.bin",
+            bytes.clone(),
+            FileUploadOptions::new(),
+        )
+        .await
+        .expect("the upload must succeed");
+
+    let mut writer = FailingWriter::new(70_000);
+    let error = client
+        .download_file_verified_to(TENANT, BUCKET, "unwritable.bin", &mut writer)
+        .await
+        .expect_err("a writer that refuses bytes must fail the download");
+    match &error {
+        RociaDbError::Io { context, source } => {
+            assert_eq!(*context, "writing the downloaded file");
+            assert_eq!(source.kind(), std::io::ErrorKind::BrokenPipe);
+        }
+        other => panic!("expected an Io error, got: {other}"),
+    }
+    assert!(
+        error.code().is_none(),
+        "a failing writer is the caller's own I/O, not a gRPC status, got: {error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("the download destination went away"),
+        "the writer's own message must be readable, got: {error}"
+    );
+    assert_eq!(
+        writer.written, 70_000,
+        "everything the writer accepted must have been written before it refused"
+    );
+}
+
+#[tokio::test]
+async fn download_file_verified_to_propagates_a_missing_file_as_not_found() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let mut written: Vec<u8> = Vec::new();
+    let error = client
+        .download_file_verified_to(TENANT, BUCKET, "absent-out.bin", &mut written)
+        .await
+        .expect_err("an unknown file must fail");
+    assert!(error.is_not_found(), "got: {error}");
+    // It fails on the stat, before any download is attempted — and so before
+    // the writer is touched.
+    assert_eq!(server.call_count("Stat"), 1);
+    assert_eq!(server.call_count("Download"), 0);
+    assert!(written.is_empty());
+}
+
+#[tokio::test]
+async fn a_lowered_max_file_bytes_rejects_an_upload_and_a_raised_one_lets_it_through() {
+    let server = FakeServer::start().await;
+    let bytes = payload(4096);
+
+    // A ceiling under the file: rejected client-side, and the recorder proves
+    // the server was never even contacted.
+    let strict = server
+        .builder()
+        .max_file_bytes(1024)
+        .build_with_channel(server.channel())
+        .await
+        .expect("building a client with a lowered file size ceiling must succeed");
+    let error = strict
+        .upload_file(
+            TENANT,
+            BUCKET,
+            "gated.bin",
+            bytes.clone(),
+            FileUploadOptions::new(),
+        )
+        .await
+        .expect_err("a file over the client's own ceiling must be rejected");
+    assert!(matches!(error, RociaDbError::Validation(_)), "got: {error}");
+    assert!(error.to_string().contains("1024"));
+
+    // The chunked path reads the same ceiling, and declares its size up front,
+    // so it too never opens a call.
+    let error = strict
+        .upload_file_chunked(
+            TENANT,
+            BUCKET,
+            "gated-stream.bin",
+            futures::stream::iter(vec![chunk(bytes.clone())]),
+            FileStreamUploadOptions::new(bytes.len() as u64, sha256(&bytes)),
+        )
+        .await
+        .expect_err("a declared size over the client's own ceiling must be rejected");
+    assert!(matches!(error, RociaDbError::Validation(_)), "got: {error}");
+    assert!(
+        server.calls().is_empty(),
+        "a client-side rejection must reach the server not at all, got: {:?}",
+        server.calls()
+    );
+
+    // The very same upload, on a client whose ceiling is exactly the file's
+    // size: through it goes, and the server stores it.
+    let generous = server
+        .builder()
+        .max_file_bytes(bytes.len() as u64)
+        .build_with_channel(server.channel())
+        .await
+        .expect("building a client with a raised file size ceiling must succeed");
+    generous
+        .upload_file(
+            TENANT,
+            BUCKET,
+            "gated.bin",
+            bytes.clone(),
+            FileUploadOptions::new(),
+        )
+        .await
+        .expect("a file of exactly the ceiling must be sent: the gate is >, not >=");
+    assert_eq!(
+        server.call_count("Upload"),
+        1,
+        "exactly one upload may have reached the server"
+    );
+    assert_eq!(
+        generous
+            .download_file(TENANT, BUCKET, "gated.bin")
+            .await
+            .expect("the download must succeed"),
+        bytes
+    );
 }
 
 #[tokio::test]

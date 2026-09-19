@@ -88,12 +88,12 @@ same is true of each attempt made by `RociaDbClient::retry`.
 
 **File transfers are deliberately not covered** — neither the two streaming
 RPCs (`upload_file_stream`, `download_file_stream`) nor the `upload_file`,
-`upload_file_chunked`, `download_file` and `download_file_verified` helpers
-built on them (the `stat_file` call inside the last of those is a unary RPC
-and is covered). How long a stream takes is a property of its own data rate,
-not of the SDK, and a deadline meant for a single round trip would abort a
-perfectly healthy multi-gigabyte transfer. Bound those with a
-`tokio::time::timeout` of your own.
+`upload_file_chunked`, `download_file`, `download_file_verified` and
+`download_file_verified_to` helpers built on them (the `stat_file` call inside
+the last two is a unary RPC and is covered). How long a stream takes is a
+property of its own data rate, not of the SDK, and a deadline meant for a
+single round trip would abort a perfectly healthy multi-gigabyte transfer.
+Bound those with a `tokio::time::timeout` of your own.
 
 That holds even for the *opening* call of a download, which otherwise goes
 through the same path as a unary RPC: the exclusion is about the `grpc-timeout`
@@ -104,6 +104,17 @@ takes longer than the deadline, reporting `CANCELLED` for a transfer that was
 merely slow to start. And the gRPC specification makes the header a deadline for
 the entire call, which most implementations honour by cutting the stream once it
 expires.
+
+## Maximum file size
+
+`max_file_bytes` is the one builder setting that has nothing to do with the
+transport: it caps the size of a file `upload_file` and `upload_file_chunked`
+will send, defaults to **5 GiB** (the default of the server's own
+`limits.max_file_bytes`, which it only mirrors — the server still has the final
+say), and rejects a zero value at `build()` time with `RociaDbError::Config`
+like both timeouts. It applies identically to a client built with
+`build_with_channel`, since no dialing is involved. See
+[files](files.md#the-client-side-size-ceiling).
 
 ## Custom TLS
 

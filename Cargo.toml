@@ -71,10 +71,15 @@ sha2 = "0.10"
 thiserror = "2"
 # The library needs `rt` (the token-refresh task spawned in `src/auth.rs`),
 # `sync` (its `Mutex`/`Notify`/`oneshot`), `time` and `macros` (its
-# `tokio::select!`). `rt-multi-thread` is a test-only need — `#[tokio::main]`
-# in the doctests defaults to the multi-thread runtime — and lives in
-# `[dev-dependencies]` so a consumer does not pay for it.
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+# `tokio::select!`), and `io-util` for the `AsyncWriteExt::{write_all, flush}`
+# that `download_file_verified_to` drives the caller's writer with — the
+# `AsyncWrite` trait in its public signature is available without that feature,
+# but the two extension methods are not. `io-util = ["bytes"]` in tokio's own
+# manifest, so it adds no crate this build did not already compile. `rt-multi-thread`
+# is a test-only need — `#[tokio::main]` in the doctests defaults to the
+# multi-thread runtime — and lives in `[dev-dependencies]` so a consumer does
+# not pay for it.
+tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"] }
 # `default-features = false` drops tonic's default `router` and `server`
 # feature stack (axum, matchit, hyper's server support, hyper-util's
 # server-auto) — this SDK is a gRPC client only, build.rs disables server

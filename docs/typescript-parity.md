@@ -15,14 +15,21 @@ other.**
 > remove this note.
 
 > **Parity unverified for what 2.0 added.** `download_file_verified`,
-> `neighbor_nodes_out` / `neighbor_nodes_in`, the `Config`,
-> `ChecksumMismatch` and `SizeMismatch` error variants, `RetryPolicy` /
-> `RociaDbClient::retry`, `request_timeout`, `tls_config`,
-> `http2_keep_alive` and `build_with_channel` are all new on the Rust side
-> in 2.0. Whether the TypeScript package has equivalents has **not** been
-> checked from this repository. Confirm each against
+> `download_file_verified_to`, `neighbor_nodes_out` / `neighbor_nodes_in`, the
+> `Config`, `Io`, `ChecksumMismatch` and `SizeMismatch` error variants,
+> `RetryPolicy` / `RociaDbClient::retry`, `request_timeout`, `tls_config`,
+> `http2_keep_alive`, `max_file_bytes` and `build_with_channel` are all new on
+> the Rust side in 2.0. Whether the TypeScript package has equivalents has
+> **not** been checked from this repository. Confirm each against
 > `rociadb-core-sdk-ts`, then fold the ones that match into the table below
 > and open an issue there for the ones that do not.
+>
+> Two of them will not translate mechanically even if the capability is
+> matched, and belong in the table below once confirmed:
+> `download_file_verified_to` takes a `tokio::io::AsyncWrite`, where the
+> TypeScript equivalent of "verify without buffering" would be a
+> `WritableStream` or a `Writable`; and none of the 23 RPCs changed, so the
+> count above still holds.
 
 Neither SDK imitates the other's syntax — this crate stays
 snake_case/`Result`-idiomatic Rust, the TypeScript package stays
@@ -71,8 +78,9 @@ set of causes in its own language.
 
 The sets themselves no longer line up exactly. Rust 2.0 split configuration
 mistakes out of `Connection` into their own `Config` variant, added
-`ChecksumMismatch` / `SizeMismatch` for `download_file_verified`, and added `Io`
-for a chunk stream whose source failed to read. A
+`ChecksumMismatch` / `SizeMismatch` for the two verified downloads, and added
+`Io` for an I/O handle the caller supplied — a chunk stream that failed to read,
+or a download writer that refused the bytes. A
 TypeScript caller porting a `match` will find four arms with no `kind` to
 narrow on — see the unverified-parity note above, and
 [errors and retries](errors-and-retries.md) for what each one means.
