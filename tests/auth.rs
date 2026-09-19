@@ -33,6 +33,44 @@ const BUCKET: &str = "assets";
 /// clock at all by the unit tests of `TokenManager::ensure_fresh`.
 const INSIDE_THE_REFRESH_MARGIN_SECS: u64 = 4;
 
+/// Poll the server with cheap reads until the bearer header it records is no
+/// longer `previous`, and return the header that replaced it.
+///
+/// A refreshed token becomes observable in two steps: the provider answers
+/// (which is what [`MockIdp::wait_for_requests`] sees) and, a few milliseconds
+/// later, the client parses the body and installs the new header. A test that
+/// called the server between those two steps would still carry the old token
+/// — so this polls the only thing the assertion is really about, the header
+/// actually attached to a call, and gives up loudly after `timeout`.
+async fn wait_for_token_in_use(
+    client: &rociadb_sdk::RociaDbClient,
+    server: &FakeServer,
+    previous: &str,
+    timeout: Duration,
+) -> String {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        client
+            .list_tenants(None, None)
+            .await
+            .expect("the read must succeed");
+        let header = server
+            .authorizations()
+            .last()
+            .cloned()
+            .flatten()
+            .expect("the call must carry a bearer header");
+        if header != previous {
+            return header;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the token in use was still {previous} after {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn the_interceptor_attaches_the_idp_token_to_every_call() {
     let idp = MockIdp::start().await;
@@ -632,13 +670,13 @@ async fn invalidate_auth_token_wakes_the_background_refresh_without_blocking() {
         "the refresh took {waited:?}, which is not \"at the next opportunity\""
     );
 
-    client
-        .list_tenants(None, None)
-        .await
-        .expect("the read must succeed");
+    // The provider has answered, but the client installs the new header a
+    // few milliseconds after that: poll the header in use rather than assume
+    // the very next call already carries it.
+    let header =
+        wait_for_token_in_use(&client, &server, "Bearer token-1", Duration::from_secs(5)).await;
     assert_eq!(
-        server.authorizations(),
-        vec![Some("Bearer token-2".to_string())],
+        header, "Bearer token-2",
         "calls after the requested refresh must carry the new token"
     );
 }
@@ -673,20 +711,13 @@ async fn a_failed_background_refresh_is_retried_on_the_documented_backoff() {
         idp.issued_tokens()
     );
 
-    client
-        .list_tenants(None, None)
-        .await
-        .expect("the read must succeed");
-    let header = server
-        .authorizations()
-        .first()
-        .cloned()
-        .flatten()
-        .expect("the call must carry a bearer header");
-    assert_ne!(
-        header, "Bearer token-1",
-        "the token in use must have changed after the background refresh"
-    );
+    // Request 3 being counted means the provider has answered, not that the
+    // client has installed the token it carried — that happens a few
+    // milliseconds later. Poll the header in use instead of assuming the very
+    // next call already has the new one (with a two-second lifetime the token
+    // keeps rotating, so only "no longer token-1" is asserted).
+    let header =
+        wait_for_token_in_use(&client, &server, "Bearer token-1", Duration::from_secs(5)).await;
     assert!(header.starts_with("Bearer token-"), "got: {header}");
 }
 
