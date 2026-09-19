@@ -17,7 +17,7 @@ to stay forward-compatible. Every variant implements `std::error::Error`, so
 | `Connection { message, source }` | a genuine dial or transport failure: DNS, a refused or reset connection, a connect timeout, a TLS handshake |
 | `Auth { message, source }` | obtaining or refreshing the upstream token failed |
 | `Encode { context, source }` | a value could not be serialized to JSON before being sent |
-| `Decode { context, source }` | a JSON payload received from upstream could not be decoded; for a page of documents the message leads with `"item <index>: "`, naming the offending position |
+| `Decode { context, source }` | a value received from upstream could not be decoded: a JSON payload (for a page of documents the message leads with `"item <index>: "`, naming the offending position), or — with `context: "file timestamp"` — a `FileTimestamp` a caller asked to parse and that is not RFC 3339 |
 | `Io { context, source }` | an I/O handle **you** handed over failed, carrying the `std::io::Error`: an `Err` item from `upload_file_chunked`'s chunk stream, or a writer that refused the bytes of a `download_file_verified_to` |
 | `Validation(String)` | a client-side rule about the *data* of one call was violated before any network call |
 | `ChecksumMismatch { expected, actual }` | a verified download's SHA-256 digest disagrees with the stored checksum |
@@ -28,6 +28,12 @@ to stay forward-compatible. Every variant implements `std::error::Error`, so
 a TLS mismatch from a refused connection. `Io` does the same with its
 `std::io::Error`, which stays reachable as the `source` when you need to match on
 its `kind()`.
+
+`Decode` is the one variant a *successful* call can still hand you later:
+`stat_file` never parses the timestamps it returns, so
+`FileTimestamp::system_time()` (or `unix_nanos()`) is what reports a format this
+SDK cannot read — and the raw string stays available through `as_str()`
+regardless. See [files](files.md#what-filetimestamp-assumes-and-what-it-does-when-it-is-wrong).
 
 ### `Config` vs `Connection` vs `Validation`
 

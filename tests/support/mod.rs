@@ -19,10 +19,17 @@
 //! pagination over a sorted key order, `total_count` on the three document
 //! listings, the `(from, label, to)` edge uniqueness rule, idempotent
 //! deletes, the 1 MiB upload chunk cap, a 32-byte checksum length check that
-//! never looks at the bytes, and the `reason` trailing metadata the real
-//! server attaches to every error. It is not a RocksDB or a TiKV: no
+//! never looks at the bytes, `created_at` / `updated_at` as RFC 3339 instants
+//! that a replacement upload moves forward, and the `reason` trailing metadata
+//! the real server attaches to every error. It is not a RocksDB or a TiKV: no
 //! transactions, no indexes, no garbage collection, and nothing here proves
 //! anything about the real server's behaviour — only about the client's.
+//!
+//! The clock is where it is deliberately *less* real than it could be: a fixed
+//! base plus one second per write, so a timestamp does not depend on when the
+//! suite runs. The format is a guess, and knowingly so — nothing in this
+//! repository states the real server's — which is why the SDK parses those two
+//! fields lazily and why [`FakeServer::emit_non_rfc3339_timestamps`] exists.
 //!
 //! # Test knobs
 //!
@@ -35,6 +42,14 @@
 //!   outside a named set with `UNAUTHENTICATED`, which is how a test proves
 //!   *which* token a call carried — including one that no refresh-and-retry
 //!   could rescue, as for the streaming uploads.
+//! - [`FakeServer::emit_non_rfc3339_timestamps`] formats file timestamps the way
+//!   a server that does not speak RFC 3339 would, for the test that a caller
+//!   keeps the raw string when
+//!   [`FileTimestamp::system_time`](rociadb_sdk::FileTimestamp::system_time)
+//!   cannot read it.
+//! - [`FakeServer::corrupt_stored_bytes`], [`FakeServer::corrupt_stored_checksum`]
+//!   and [`FakeServer::drop_stored_byte`] move a stored file and its metadata
+//!   apart, which is what the verified downloads are checked against.
 //! - Every call is recorded with the `authorization` metadata it carried and
 //!   its full request as JSON ([`FakeServer::calls_for`]), so "the node
 //!   binding wrote this node id with that payload and reused the document's
@@ -93,6 +108,18 @@ const DOWNLOAD_CHUNK: usize = 64 * 1024 + 7;
 /// Length of the SHA-256 digest the upload RPC requires — and, like the real
 /// server, the only thing it checks about it.
 const CHECKSUM_LEN: usize = 32;
+
+/// The instant this server's clock starts at: 2024-01-01T00:00:00Z, as seconds
+/// since the Unix epoch.
+///
+/// A fixed base plus one second per write (see [`State::tick`]) is what makes
+/// `created_at` and `updated_at` deterministic across runs while still ordering
+/// two writes to the same file. The real server's clock is a real clock; the
+/// only thing the suite may rely on is the *shape* of what it sends.
+const TIMESTAMP_BASE_UNIX_SECONDS: i64 = 1_704_067_200;
+
+/// Seconds in a day, for the two timestamp formatters.
+const SECONDS_PER_DAY: i64 = 86_400;
 
 /// One recorded call, as the server saw it.
 #[derive(Debug, Clone)]
@@ -196,8 +223,14 @@ struct State {
     /// Every call the server saw, in order.
     calls: Vec<RecordedCall>,
     /// Monotonic clock for `created_at` / `updated_at`, so timestamps are
-    /// deterministic instead of wall-clock.
+    /// deterministic instead of wall-clock: one second per write from
+    /// [`TIMESTAMP_BASE_UNIX_SECONDS`].
     writes: u64,
+    /// Set by [`FakeServer::emit_non_rfc3339_timestamps`], after which
+    /// [`State::tick`] formats every timestamp without its offset. Named for
+    /// the departure rather than for the norm so that the default — a server
+    /// that does speak RFC 3339 — is the `bool`'s own `false`.
+    non_rfc3339_timestamps: bool,
 }
 
 /// The four service implementations, sharing one store.
@@ -388,6 +421,27 @@ impl FakeServer {
             .map(|token| format!("Bearer {}", token.as_ref()))
             .collect();
         self.lock().accepted_tokens = Some(accepted);
+    }
+
+    /// From now on, format `created_at` and `updated_at` the way a server that
+    /// does not speak RFC 3339 would: `YYYY-MM-DD hh:mm:ss`, with the time zone
+    /// left to the reader's imagination.
+    ///
+    /// Not a straw man — dropping the offset is what a server rendering a
+    /// database timestamp with its default `to_string` does, and it is the one
+    /// format most likely to be mistaken for RFC 3339 while not being it. The
+    /// point of the knob is that nothing in `proto/` says which format the real
+    /// server uses, so the SDK must keep the string readable whatever it is:
+    /// with this set, a caller's
+    /// [`FileTimestamp::system_time`](rociadb_sdk::FileTimestamp::system_time)
+    /// fails while
+    /// [`FileTimestamp::as_str`](rociadb_sdk::FileTimestamp::as_str) still
+    /// hands back exactly what was sent.
+    ///
+    /// Affects writes made after this call; the clock itself is unchanged, so
+    /// the timestamps stay deterministic and ordered either way.
+    pub fn emit_non_rfc3339_timestamps(&self) {
+        self.lock().non_rfc3339_timestamps = true;
     }
 
     /// Read one stored file back, as the server holds it.
@@ -597,11 +651,26 @@ impl State {
         self.tenants.insert(tenant_id.to_string());
     }
 
-    /// A monotonically increasing pseudo-timestamp, so `created_at` and
-    /// `updated_at` are deterministic across runs.
+    /// The next timestamp this server stamps a write with: one second later
+    /// than the last, counting from [`TIMESTAMP_BASE_UNIX_SECONDS`].
+    ///
+    /// Deterministic rather than wall-clock — the suite must not depend on when
+    /// it runs — and monotonic, so a replacement upload's `updated_at` is
+    /// genuinely later than the `created_at` it leaves alone. Formatted as
+    /// RFC 3339 in UTC, which is what a caller's
+    /// [`FileTimestamp::system_time`](rociadb_sdk::FileTimestamp::system_time)
+    /// can read, unless [`FakeServer::emit_non_rfc3339_timestamps`] has asked
+    /// for the offset to be dropped.
     fn tick(&mut self) -> String {
         self.writes += 1;
-        format!("1970-01-01T00:00:{:02}Z", self.writes % 60)
+        let writes =
+            i64::try_from(self.writes).expect("no test performs 2^63 writes against one server");
+        let unix_seconds = TIMESTAMP_BASE_UNIX_SECONDS + writes;
+        if self.non_rfc3339_timestamps {
+            format_local_date_time(unix_seconds)
+        } else {
+            format_rfc3339(unix_seconds)
+        }
     }
 
     /// Neighbors of `node_id` over `label`, keyed by edge id — which is also
@@ -1355,6 +1424,76 @@ impl TenantService for FakeService {
 // ---------------------------------------------------------------------------
 // Assertions shared by several test files
 // ---------------------------------------------------------------------------
+
+/// Format `unix_seconds` as an RFC 3339 timestamp in UTC
+/// (`YYYY-MM-DDThh:mm:ssZ`), the shape the real server's `created_at` and
+/// `updated_at` are assumed to have.
+///
+/// Written here rather than reached for from a date-time crate: the fake server
+/// must produce a timestamp the SDK's own parser has never seen, and building it
+/// from the same crate the parser avoided would only prove the two agree.
+/// Second resolution is enough — the SDK's parser treats the fraction as
+/// optional, and the suite asserts on the instant, not on the digits.
+fn format_rfc3339(unix_seconds: i64) -> String {
+    let (year, month, day, hour, minute, second) = civil_from_unix(unix_seconds);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// The same instant as [`format_rfc3339`], without the `Z` that makes it an
+/// instant: what [`FakeServer::emit_non_rfc3339_timestamps`] switches to.
+fn format_local_date_time(unix_seconds: i64) -> String {
+    let (year, month, day, hour, minute, second) = civil_from_unix(unix_seconds);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+}
+
+/// Split `unix_seconds` into `(year, month, day, hour, minute, second)` in UTC.
+///
+/// The date half is Howard Hinnant's `civil_from_days`, the inverse of the
+/// `days_from_civil` the SDK's parser runs — deliberately the other direction,
+/// so a bug shared by both would have to be a bug in the algorithm rather than
+/// in one transcription of it. Exact for any instant this harness produces.
+fn civil_from_unix(unix_seconds: i64) -> (i64, i64, i64, i64, i64, i64) {
+    let days = unix_seconds.div_euclid(SECONDS_PER_DAY);
+    let seconds_of_day = unix_seconds.rem_euclid(SECONDS_PER_DAY);
+
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097; // [0, 146096]
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365; // [0, 399]
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // [0, 365]
+    let shifted_month = (5 * day_of_year + 2) / 153; // [0, 11], with March as 0
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1; // [1, 31]
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    }; // [1, 12]
+    let year = if month <= 2 { year + 1 } else { year };
+
+    (
+        year,
+        month,
+        day,
+        seconds_of_day / 3_600,
+        (seconds_of_day / 60) % 60,
+        seconds_of_day % 60,
+    )
+}
+
+/// The instant this server stamps its `nth` write with, `nth` counting from 1 —
+/// what a [`FileTimestamp`](rociadb_sdk::FileTimestamp) from that write has to
+/// parse to.
+///
+/// Built from a `Duration` here and formatted as text over there, so an
+/// assertion against it closes the loop the suite actually cares about: the
+/// server formats an instant, the wire carries a string, and the SDK's parser
+/// recovers the instant the server meant.
+pub fn nth_write_time(nth: u64) -> std::time::SystemTime {
+    let base = u64::try_from(TIMESTAMP_BASE_UNIX_SECONDS).expect("the base instant is after 1970");
+    std::time::UNIX_EPOCH + Duration::from_secs(base + nth)
+}
 
 /// The SHA-256 digest of `bytes`, for comparing against what an upload sent
 /// or a stat reported.

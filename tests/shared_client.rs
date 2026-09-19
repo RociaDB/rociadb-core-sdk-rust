@@ -14,9 +14,9 @@ use futures::stream;
 use rociadb_sdk::{
     Bytes, Channel, ClientTlsConfig, DocumentPage, DocumentQueryFilter, DocumentQueryOperator,
     DocumentQuerySort, DocumentQuerySortDirection, DocumentWriteOptions, Edge, EdgeInput,
-    ExposeSecret, FileStreamUploadOptions, FileUploadOptions, Neighbor, NeighborNode, NodeBinding,
-    NodeInput, Page, Result, RetryPolicy, RociaDbBuilder, RociaDbClient, RociaDbError,
-    SecretString, StatResponse, UploadRequest, WriteOptions,
+    ExposeSecret, FileMetadata, FileStreamUploadOptions, FileTimestamp, FileUploadOptions,
+    Neighbor, NeighborNode, NodeBinding, NodeInput, Page, Result, RetryPolicy, RociaDbBuilder,
+    RociaDbClient, RociaDbError, SecretString, UploadRequest, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -43,7 +43,7 @@ async fn reads_through_an_arc(client: Arc<RociaDbClient>) -> Result<()> {
     let _ = client.list_collections("tenant", Some(20), None).await?;
     let _ = client.list_graphs("tenant", None, None).await?;
     let _ = client.list_nodes("tenant", "catalog", None, None).await?;
-    let _: StatResponse = client.stat_file("tenant", "assets", "manual.txt").await?;
+    let _: FileMetadata = client.stat_file("tenant", "assets", "manual.txt").await?;
     let _ = client.list_buckets("tenant", None, None).await?;
     let _ = client.list_files("tenant", "assets", None, None).await?;
     let _: Vec<u8> = client
@@ -184,6 +184,40 @@ async fn a_verified_download_streams_into_any_writer(
         }
         Err(other) => return Err(other),
     }
+    Ok(())
+}
+
+// `stat_file` hands back the SDK's own `FileMetadata`, whose two timestamps are
+// readable as text without a parse and convertible into a `SystemTime` with one.
+// Nothing here needs `chrono` or `time`: `SystemTime` is the hand-off point, and
+// both of those implement `From<SystemTime>`.
+#[allow(dead_code)]
+async fn file_metadata_reads_as_text_or_as_an_instant(client: Arc<RociaDbClient>) -> Result<()> {
+    let metadata: FileMetadata = client.stat_file("tenant", "assets", "manual.pdf").await?;
+    let _: u64 = metadata.size_bytes;
+    let _: &str = metadata.content_type.as_str();
+    let _: &[u8] = &metadata.checksum;
+
+    let created: &FileTimestamp = &metadata.created_at;
+    let _: &str = created.as_str();
+    let _: String = created.to_string();
+    let _: String = format!("{}", metadata.updated_at);
+
+    // Both accessors are ordinary `rociadb_sdk::Result`s, and a server that
+    // formatted its timestamps some other way is a `Decode` to match on rather
+    // than a call that failed.
+    match metadata.created_at.system_time() {
+        Ok(instant) => {
+            let _: std::time::SystemTime = instant;
+        }
+        Err(RociaDbError::Decode { context, source }) => {
+            let _: (&'static str, serde_json::Error) = (context, source);
+        }
+        Err(other) => return Err(other),
+    }
+    let _: i128 = metadata.updated_at.unix_nanos()?;
+    let _: bool = metadata.created_at == metadata.updated_at;
+    let _: FileMetadata = metadata.clone();
     Ok(())
 }
 

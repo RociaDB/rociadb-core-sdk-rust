@@ -406,7 +406,7 @@ println!("{total} bytes");
 no integrity verification of its own; `download_file` collects that stream
 into one buffer and performs none either. That is a real asymmetry with the
 upload path: every upload method sends a SHA-256 checksum with the file, and
-`StatResponse::checksum` exposes the one recorded for a stored file, but
+`FileMetadata::checksum` exposes the one recorded for a stored file, but
 nothing on the download side checks anything. The only protection is
 whatever the transport already provides — TLS and HTTP/2 framing catch
 corruption in transit, which says nothing about whether the bytes stored on
@@ -415,8 +415,8 @@ the server still match what was uploaded.
 ### The verified downloads, and what they actually prove
 
 Both call `stat_file` first, stream the download while feeding every chunk to a
-SHA-256 hasher, and check the byte count against `StatResponse::size_bytes` and
-the digest against `StatResponse::checksum` before reporting success. A file
+SHA-256 hasher, and check the byte count against `FileMetadata::size_bytes` and
+the digest against `FileMetadata::checksum` before reporting success. A file
 whose stored bytes have been corrupted or truncated fails here instead of being
 returned as if nothing were wrong. They differ only in where the bytes go:
 
@@ -476,8 +476,97 @@ it arrives and compare the digest against `stat_file`'s `checksum` at the end.
 
 ## Metadata, listing and deletion
 
-`stat_file` returns a `StatResponse` with `size_bytes`, `content_type`,
-`checksum`, `created_at` and `updated_at`.
+`stat_file` returns a `FileMetadata`, a type this SDK owns:
+
+| Field | Type | What it is |
+| ----- | ---- | ---------- |
+| `size_bytes` | `u64` | the stored file's length, which the server checked against the chunks it received |
+| `content_type` | `String` | the MIME type the uploader declared, recorded without ever being confirmed against the bytes |
+| `checksum` | `Vec<u8>` | the SHA-256 digest the uploader declared, 32 raw bytes, **never verified by the server** |
+| `created_at` | `FileTimestamp` | when this `file_id` was first uploaded |
+| `updated_at` | `FileTimestamp` | when it was most recently uploaded — equal to `created_at` until the file is replaced |
+
+It describes the **published** version, so an upload still in flight is
+`NOT_FOUND` here until its stream has been received in full.
+
+```rust,no_run
+use rociadb_sdk::RociaDbBuilder;
+use std::time::{Duration, SystemTime};
+
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = RociaDbBuilder::new().disable_auth().build().await?;
+let metadata = client.stat_file("tenant-1", "assets", "manual.txt").await?;
+// A timestamp prints as the server wrote it, with no parsing involved.
+println!(
+    "{} bytes of {}, last written {}",
+    metadata.size_bytes, metadata.content_type, metadata.updated_at,
+);
+
+// Ask for an instant and you get a `SystemTime`, and an error if the server's
+// format is not one this SDK reads.
+let updated = metadata.updated_at.system_time()?;
+if SystemTime::now().duration_since(updated)? > Duration::from_secs(24 * 3_600) {
+    println!("more than a day old");
+}
+
+// Compare timestamps as instants, never as strings: two spellings of one
+// instant are not the same text.
+if metadata.updated_at.system_time()? > metadata.created_at.system_time()? {
+    println!("this file has been replaced at least once");
+}
+# Ok(())
+# }
+```
+
+`chrono::DateTime<Utc>` and `time::OffsetDateTime` both implement
+`From<SystemTime>`, so `system_time()` is one hop from whichever date-time type
+you already use, and this crate depends on neither. `unix_nanos()` is the same
+instant as an `i128` of nanoseconds since the epoch, which is the easier form to
+order, subtract or store — and the one that needs no special case before 1970,
+where `SystemTime::duration_since(UNIX_EPOCH)` returns an error.
+
+### What `FileTimestamp` assumes, and what it does when it is wrong
+
+The two timestamps are `string` fields on the wire, and **nothing in the
+`.proto` says which format the server writes them in.** So the SDK does not bet
+a `stat_file` call on a guess: `FileTimestamp` keeps the server's own text and
+parses it only when asked.
+
+- `as_str()` and `Display` always work, whatever the server sent.
+- `system_time()` and `unix_nanos()` parse **RFC 3339** — the conventional wire
+  form for an instant carried as a string: `2026-09-19T14:03:07Z`,
+  `2026-09-19 14:03:07.250+02:00`. A `T` in either case or a single space
+  separates the date from the time, the fraction is optional and may be any
+  number of digits (the first nine are kept, the rest truncated), and the offset
+  is `Z`, `z` or `±hh:mm`. Every field is range-checked against the calendar.
+  Anything else is rejected — a **missing offset included**, which is the
+  likeliest departure a server makes.
+- A rejection is `RociaDbError::Decode` with `context` `"file timestamp"`,
+  quoting the value and saying what is wrong with it. The rest of the response
+  is unaffected: the call itself succeeded, and the string is still there.
+
+```rust,no_run
+# use rociadb_sdk::RociaDbBuilder;
+# #[tokio::main]
+# async fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let client = RociaDbBuilder::new().disable_auth().build().await?;
+let metadata = client.stat_file("tenant-1", "assets", "manual.txt").await?;
+match metadata.created_at.system_time() {
+    Ok(created) => println!("created at {created:?}"),
+    // Not RFC 3339 — log the text the server did send, and carry on.
+    Err(error) => println!("created at {} ({error})", metadata.created_at),
+}
+# Ok(())
+# }
+```
+
+Two decisions worth stating: a **leap second** (`:60`) is rejected, because Unix
+time has no separate instant to map one to and moving it silently would be
+worse; and an instant **before 1970** is supported, as `UNIX_EPOCH - Duration`
+from `system_time()` and as a negative number from `unix_nanos()`.
+
+### Listing and deletion
 
 ```rust,no_run
 # use rociadb_sdk::{RociaDbBuilder, WriteOptions};

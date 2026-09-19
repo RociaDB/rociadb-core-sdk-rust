@@ -169,15 +169,30 @@ pub enum RociaDbError {
         source: serde_json::Error,
     },
 
-    /// Failed to decode a JSON payload received from upstream.
+    /// Failed to decode a value received from upstream.
+    ///
+    /// Almost always a JSON payload — a document, a node, an edge — that
+    /// `serde_json` refused, or that would not deserialize into the type the
+    /// caller asked for. The exception is `context` `"file timestamp"`, from
+    /// [`FileTimestamp::system_time`](crate::FileTimestamp::system_time) and
+    /// [`FileTimestamp::unix_nanos`](crate::FileTimestamp::unix_nanos): a
+    /// `created_at` or `updated_at` the server did not write in the format
+    /// those parse. Nothing is lost when that happens — the string is still
+    /// there, through [`FileTimestamp::as_str`](crate::FileTimestamp::as_str) —
+    /// and it says nothing about the rest of the
+    /// [`stat_file`](crate::RociaDbClient::stat_file) response, which is why it
+    /// is raised by the accessor rather than by the call.
     #[error("failed to decode {context}: {source}")]
     Decode {
-        /// Name of the payload that could not be decoded (for example
-        /// `"document json"`).
+        /// Name of the value that could not be decoded (for example
+        /// `"document json"`, or `"file timestamp"`).
         context: &'static str,
         /// The deserialization error `serde_json` reported. For a page of
         /// documents its message leads with `"item <index>: "`, naming the
-        /// zero-based position of the offending item within the page.
+        /// zero-based position of the offending item within the page. For a
+        /// file timestamp it is a message built by this crate — quoting the
+        /// value and saying what is wrong with it — carried in the same type
+        /// for want of a second one, with no JSON involved.
         #[source]
         source: serde_json::Error,
     },
@@ -243,7 +258,8 @@ pub enum RociaDbError {
     /// the file was written: storage corruption, a partial overwrite, or an
     /// upload whose declared checksum never matched its own bytes in the
     /// first place (the server records the uploader's checksum without
-    /// checking it — see [`StatResponse::checksum`](crate::StatResponse)).
+    /// checking it — see
+    /// [`FileMetadata::checksum`](crate::FileMetadata::checksum)).
     /// Retrying changes nothing on its own.
     ///
     /// Both digests are carried raw rather than hex-encoded, so a caller can

@@ -1,8 +1,9 @@
 //! File RPCs against the in-process server: the chunked upload contract, the
 //! raw `upload_file_stream` escape hatch and the two server-side rules it can
 //! break, a byte-exact download of a file larger than one chunk, the two
-//! verifying downloads and every failure mode they have, the client-side file
-//! size ceiling, idempotent deletes, and the two listings.
+//! verifying downloads and every failure mode they have, the metadata `stat_file`
+//! reports and its two timestamps, the client-side file size ceiling, idempotent
+//! deletes, and the two listings.
 
 mod support;
 
@@ -11,7 +12,8 @@ use rociadb_sdk::{
 };
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use support::{FakeServer, payload, sha256};
+use std::time::Duration;
+use support::{FakeServer, nth_write_time, payload, sha256};
 use tokio::io::AsyncWrite;
 
 const TENANT: &str = "tenant-1";
@@ -903,6 +905,210 @@ async fn a_lowered_max_file_bytes_rejects_an_upload_and_a_raised_one_lets_it_thr
             .expect("the download must succeed"),
         bytes
     );
+}
+
+#[tokio::test]
+async fn stat_file_reports_timestamps_that_parse_into_the_instant_the_server_stamped() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    client
+        .upload_file(
+            TENANT,
+            BUCKET,
+            "stamped.bin",
+            b"bytes".as_slice(),
+            FileUploadOptions::new(),
+        )
+        .await
+        .expect("the upload must succeed");
+
+    let metadata = client
+        .stat_file(TENANT, BUCKET, "stamped.bin")
+        .await
+        .expect("stat must succeed");
+    let stored = server
+        .stored_file(TENANT, BUCKET, "stamped.bin")
+        .expect("the server must hold the file it just accepted");
+
+    // The server's own text reaches the caller untouched, through both
+    // accessors: whatever else happens, nothing rewrites the string.
+    assert_eq!(metadata.created_at.as_str(), stored.created_at);
+    assert_eq!(metadata.updated_at.as_str(), stored.updated_at);
+    assert_eq!(metadata.created_at.to_string(), stored.created_at);
+
+    // And it parses back to the instant the server formatted — the first write
+    // of a fresh server — which is the whole round trip: instant, to text, to
+    // the wire, to an instant again.
+    let created = metadata
+        .created_at
+        .system_time()
+        .expect("an RFC 3339 timestamp must parse");
+    assert_eq!(created, nth_write_time(1));
+    assert_eq!(
+        metadata
+            .updated_at
+            .system_time()
+            .expect("an RFC 3339 timestamp must parse"),
+        created,
+        "a file that has never been replaced was written exactly once"
+    );
+    assert_eq!(
+        metadata.created_at, metadata.updated_at,
+        "and the two strings are identical, not merely equivalent"
+    );
+    let nanos_since_epoch = created
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the harness stamps instants after 1970")
+        .as_nanos();
+    assert_eq!(
+        metadata
+            .created_at
+            .unix_nanos()
+            .expect("an RFC 3339 timestamp must parse"),
+        i128::try_from(nanos_since_epoch).expect("an instant fits in an i128"),
+        "the numeric accessor must agree with the SystemTime one"
+    );
+}
+
+#[tokio::test]
+async fn a_replacement_upload_moves_updated_at_and_leaves_created_at_alone() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let upload = |bytes: Vec<u8>| {
+        let client = client.clone();
+        async move {
+            client
+                .upload_file(
+                    TENANT,
+                    BUCKET,
+                    "replaced.bin",
+                    bytes,
+                    FileUploadOptions::new(),
+                )
+                .await
+                .expect("the upload must succeed");
+        }
+    };
+
+    upload(payload(128)).await;
+    let first = client
+        .stat_file(TENANT, BUCKET, "replaced.bin")
+        .await
+        .expect("stat must succeed");
+    assert_eq!(first.created_at, first.updated_at);
+
+    // Re-uploading an existing `file_id` replaces it — no delete first, no
+    // error for the duplicate.
+    upload(payload(256)).await;
+    let second = client
+        .stat_file(TENANT, BUCKET, "replaced.bin")
+        .await
+        .expect("stat must succeed");
+
+    assert_eq!(
+        second.created_at, first.created_at,
+        "created_at records the first upload of this file_id and must not move"
+    );
+    assert_ne!(
+        second.updated_at, first.updated_at,
+        "updated_at must record the replacement"
+    );
+    assert_eq!(second.size_bytes, 256, "the metadata is the new file's");
+
+    let created = second
+        .created_at
+        .system_time()
+        .expect("an RFC 3339 timestamp must parse");
+    let updated = second
+        .updated_at
+        .system_time()
+        .expect("an RFC 3339 timestamp must parse");
+    assert!(
+        updated > created,
+        "the replacement must be the later instant, got {updated:?} after {created:?}"
+    );
+    assert!(
+        updated
+            .duration_since(created)
+            .expect("updated_at is the later instant")
+            >= Duration::from_secs(1),
+        "the harness advances its clock a second per write"
+    );
+    assert!(
+        second.updated_at.unix_nanos().expect("parses")
+            > second.created_at.unix_nanos().expect("parses"),
+        "the numeric accessor must order the two the same way"
+    );
+}
+
+#[tokio::test]
+async fn a_timestamp_the_server_did_not_write_as_rfc3339_still_reaches_the_caller_raw() {
+    // Nothing in `proto/` says which format the server writes these in, so the
+    // SDK parses lazily and keeps the string. This is that promise under test:
+    // a server formatting a local date and time with no offset costs the caller
+    // `system_time()` and nothing else.
+    let server = FakeServer::start().await;
+    server.emit_non_rfc3339_timestamps();
+    let client = server.client().await;
+    client
+        .upload_file(
+            TENANT,
+            BUCKET,
+            "other-format.bin",
+            b"bytes".as_slice(),
+            FileUploadOptions::new(),
+        )
+        .await
+        .expect("the upload must succeed");
+
+    let metadata = client
+        .stat_file(TENANT, BUCKET, "other-format.bin")
+        .await
+        .expect("an unreadable timestamp must not fail the call itself");
+    let stored = server
+        .stored_file(TENANT, BUCKET, "other-format.bin")
+        .expect("the server must hold the file it just accepted");
+    assert!(
+        stored.created_at.contains(' ') && !stored.created_at.ends_with('Z'),
+        "the knob must have dropped the offset, got: {}",
+        stored.created_at
+    );
+
+    // The raw string is still exactly what the server sent.
+    assert_eq!(metadata.created_at.as_str(), stored.created_at);
+    assert_eq!(metadata.updated_at.to_string(), stored.updated_at);
+
+    // Only the parse fails, and it says what it refused and why.
+    let error = metadata
+        .created_at
+        .system_time()
+        .expect_err("a timestamp with no offset must not resolve to an instant");
+    match &error {
+        RociaDbError::Decode { context, .. } => assert_eq!(*context, "file timestamp"),
+        other => panic!("expected a Decode error, got: {other}"),
+    }
+    let message = error.to_string();
+    assert!(
+        message.contains(&stored.created_at),
+        "the error must quote the value it refused, got: {message}"
+    );
+    assert!(
+        message.contains("offset"),
+        "the error must name what is missing, got: {message}"
+    );
+    assert!(
+        error.code().is_none(),
+        "a timestamp this SDK cannot read is not a gRPC status, got: {error}"
+    );
+    assert!(
+        metadata.updated_at.unix_nanos().is_err(),
+        "both accessors run the same parser"
+    );
+
+    // And the rest of the response is untouched: the call succeeded.
+    assert_eq!(metadata.size_bytes, 5);
+    assert_eq!(metadata.content_type, "application/octet-stream");
+    assert_eq!(metadata.checksum, sha256(b"bytes").to_vec());
 }
 
 #[tokio::test]

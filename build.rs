@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // set, and with it every comment. That is deliberate: the canonical
     // `.proto` is mirrored byte for byte from the server repository, comments
     // included, and those comments are written in French. Carried through,
-    // they would become rustdoc on the generated types — and five of those
+    // they would become rustdoc on the generated types — and four of those
     // types are re-exported at the crate root, so the text would ship on
     // docs.rs. The English documentation attached below is the single source
     // of truth for callers; the `.proto` stays the source of truth for the
@@ -127,7 +127,9 @@ fn doc_attribute(doc: &str) -> String {
 /// Documentation for the generated messages that appear in a public method
 /// signature and are therefore re-exported at the crate root. The rest of the
 /// generated code is internal to the crate and left undocumented (`pb` carries
-/// `#[allow(missing_docs)]`).
+/// `#[allow(missing_docs)]`) — `StatResponse` included, since
+/// `RociaDbClient::stat_file` converts it into the SDK's own `FileMetadata`,
+/// which carries that documentation instead.
 const DOCS: &[(&str, &str)] = &[
     (
         ".rocia.v1.CollectionInfo",
@@ -139,12 +141,6 @@ const DOCS: &[(&str, &str)] = &[
         "One graph neighbor: the node reached and the edge that reaches it. Returned by \
          [`RociaDbClient::neighbors_out`](crate::RociaDbClient::neighbors_out) and \
          [`RociaDbClient::neighbors_in`](crate::RociaDbClient::neighbors_in).",
-    ),
-    (
-        ".rocia.v1.StatResponse",
-        "Metadata recorded for one stored file, as returned by \
-         [`RociaDbClient::stat_file`](crate::RociaDbClient::stat_file). Describes the published \
-         version of the file: an upload still in flight is not visible here.",
     ),
     (
         ".rocia.v1.UploadRequest",
@@ -187,30 +183,6 @@ const FIELD_DOCS: &[(&str, &str)] = &[
         "Id of the edge connecting the queried node to `node_id`. Pass it to \
          [`RociaDbClient::get_edge`](crate::RociaDbClient::get_edge) to read the edge's own \
          properties.",
-    ),
-    (
-        ".rocia.v1.StatResponse.size_bytes",
-        "Total size of the stored file in bytes.",
-    ),
-    (
-        ".rocia.v1.StatResponse.content_type",
-        "MIME type recorded at upload time, exactly as the uploader declared it. The server does \
-         not inspect the bytes to confirm it.",
-    ),
-    (
-        ".rocia.v1.StatResponse.checksum",
-        "SHA-256 digest recorded at upload time, as 32 raw bytes. The server stores what the \
-         uploader declared without verifying it against the bytes received, so this confirms what \
-         was claimed for the file, not what the file contains.",
-    ),
-    (
-        ".rocia.v1.StatResponse.created_at",
-        "Timestamp of the first upload of this `file_id`, as a string formatted by the server.",
-    ),
-    (
-        ".rocia.v1.StatResponse.updated_at",
-        "Timestamp of the most recent upload of this `file_id`, as a string formatted by the \
-         server. Equal to `created_at` until the file is replaced.",
     ),
     (
         ".rocia.v1.UploadRequest.tenant_id",

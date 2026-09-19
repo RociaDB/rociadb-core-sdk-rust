@@ -1,11 +1,13 @@
 //! File upload/download helpers.
 //!
-//! The option types this module defines are re-exported at the crate root
-//! ([`crate::FileUploadOptions`], [`crate::FileStreamUploadOptions`]), and
-//! the RPCs are inherent methods on [`RociaDbClient`].
-//! [`RociaDbClient::upload_file_stream`] documents the server's upload wire
-//! contract in full — including the 1 MiB per-message cap every upload path
-//! here respects.
+//! The types this module defines are re-exported at the crate root — the two
+//! option types ([`crate::FileUploadOptions`],
+//! [`crate::FileStreamUploadOptions`]) and the two
+//! [`RociaDbClient::stat_file`] returns ([`crate::FileMetadata`],
+//! [`crate::FileTimestamp`]) — and the RPCs are inherent methods on
+//! [`RociaDbClient`]. [`RociaDbClient::upload_file_stream`] documents the
+//! server's upload wire contract in full — including the 1 MiB per-message cap
+//! every upload path here respects.
 use crate::error::StatusResultExt;
 use crate::pb::upstream::v1::{
     DeleteRequest, DownloadRequest, DownloadResponse, ListBucketsRequest, ListFilesRequest,
@@ -19,6 +21,7 @@ use futures::{Stream, StreamExt, stream};
 use sha2::{Digest, Sha256};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tonic::codec::Streaming;
 use tracing::debug;
@@ -76,6 +79,491 @@ pub(crate) const MAX_PREALLOCATED_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Default MIME type recorded for a file whose uploader did not name one.
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// `context` on the [`RociaDbError::Decode`] that [`FileTimestamp::system_time`]
+/// and [`FileTimestamp::unix_nanos`] report for a string they cannot parse. One
+/// constant because both run the same parser, so a caller matching on the
+/// context must see one value from either.
+const FILE_TIMESTAMP_CONTEXT: &str = "file timestamp";
+
+/// How much of an unparseable timestamp [`FileTimestamp::decode_error`] quotes.
+///
+/// The value is the server's, so its length is not this crate's to trust: a
+/// server answering `Stat` with a megabyte in `created_at` must not turn every
+/// log line about it into a megabyte. Comfortably longer than any timestamp a
+/// server plausibly sends — a date, a time, nine fractional digits and a
+/// `±hh:mm` offset is 35 characters — so a realistic mistake is quoted whole.
+const MAX_QUOTED_TIMESTAMP_CHARS: usize = 64;
+
+/// Metadata recorded for one stored file, as returned by
+/// [`RociaDbClient::stat_file`].
+///
+/// Describes the **published** version of the file: an upload still in flight
+/// is invisible here, exactly as it is to `list_files` and the downloads (see
+/// [`RociaDbClient::upload_file_stream`]).
+///
+/// This is an SDK-owned type rather than the protobuf message the server
+/// answers with, which is what lets [`created_at`](Self::created_at) and
+/// [`updated_at`](Self::updated_at) be [`FileTimestamp`]s — a value that keeps
+/// the server's own text and parses it only when asked — instead of bare
+/// [`String`]s. The other three fields carry exactly what the wire carries.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMetadata {
+    /// Total size of the stored file in bytes.
+    ///
+    /// The server can be trusted with this one: it rejects an upload whose
+    /// chunks do not add up to the `size_bytes` declared on the first message,
+    /// so the number describes bytes it actually received. It is still not a
+    /// measurement of what is stored *now*, which is why
+    /// [`RociaDbClient::download_file_verified`] checks the download against
+    /// it rather than assuming.
+    pub size_bytes: u64,
+    /// MIME type recorded at upload time, exactly as the uploader declared it.
+    /// The server does not inspect the bytes to confirm it. The two ergonomic
+    /// uploads always declare one — `"application/octet-stream"` when the caller
+    /// named nothing (see [`FileUploadOptions::content_type`]) — so an empty
+    /// value here means the file was written by
+    /// [`RociaDbClient::upload_file_stream`], which declares nothing for you, or
+    /// by another client altogether.
+    pub content_type: String,
+    /// SHA-256 digest recorded at upload time, as 32 raw bytes.
+    ///
+    /// **Never verified by the server.** It checks that the value the uploader
+    /// sent is 32 bytes long and stores it; it never hashes the bytes it
+    /// received to confirm the two agree. So this is what was *claimed* for the
+    /// file, not a fact about its contents — which is the whole reason
+    /// [`RociaDbClient::download_file_verified`] exists, and the limit of what
+    /// that method can prove.
+    ///
+    /// Held as a `Vec<u8>` rather than a `[u8; 32]` because the length is the
+    /// server's to report: the upload path rejects any other length, but
+    /// nothing promises one on read, and a stored value that is not a 32-byte
+    /// digest simply cannot match anything a verified download computes.
+    pub checksum: Vec<u8>,
+    /// When this `file_id` was **first** uploaded, as the server formatted it.
+    ///
+    /// Unchanged by a replacement: re-uploading an existing `file_id` moves
+    /// [`updated_at`](Self::updated_at) and leaves this alone.
+    pub created_at: FileTimestamp,
+    /// When this `file_id` was **most recently** uploaded, as the server
+    /// formatted it. Equal to [`created_at`](Self::created_at) until the file
+    /// is replaced.
+    pub updated_at: FileTimestamp,
+}
+
+impl From<StatResponse> for FileMetadata {
+    fn from(response: StatResponse) -> Self {
+        Self {
+            size_bytes: response.size_bytes,
+            content_type: response.content_type,
+            checksum: response.checksum,
+            created_at: FileTimestamp::new(response.created_at),
+            updated_at: FileTimestamp::new(response.updated_at),
+        }
+    }
+}
+
+/// A timestamp on [`FileMetadata`], kept as the server wrote it and parsed
+/// only on demand.
+///
+/// The protobuf field behind [`FileMetadata::created_at`] and
+/// [`FileMetadata::updated_at`] is a plain `string`, and **nothing in the
+/// schema says which format the server writes it in**. So this type does not
+/// bet a `stat_file` call on a guess: it holds the server's own text, which
+/// [`as_str`](Self::as_str) and [`Display`](std::fmt::Display) hand back
+/// verbatim, and parses it only when a caller asks for an instant through
+/// [`system_time`](Self::system_time) or [`unix_nanos`](Self::unix_nanos). A
+/// server whose format this SDK cannot read therefore costs you those two
+/// methods, and nothing else.
+///
+/// # The format this parses
+///
+/// RFC 3339 — the conventional wire form for an instant carried as a string,
+/// and the profile of ISO 8601 that a date and time with an offset already
+/// looks like:
+///
+/// ```text
+/// 2026-09-19T14:03:07Z
+/// 2026-09-19T14:03:07.250Z
+/// 2026-09-19 14:03:07.123456789+02:00
+/// 2026-09-19t14:03:07-05:30
+/// ```
+///
+/// Precisely: a four-digit year, month and day separated by `-`; a `T` (either
+/// case) or a single space; two-digit hours, minutes and seconds separated by
+/// `:`; optionally a `.` and **any** number of fractional digits, of which the
+/// first nine are kept and the rest truncated rather than rounded; and then
+/// either `Z` (either case) or a `±hh:mm` offset. Every field is range-checked
+/// against the calendar — `2000-02-29` is a date, `1900-02-29` and
+/// `2100-02-29` are not — and **anything else is rejected**, including a
+/// missing offset, an unpadded field, a `±hhmm` offset without its colon, and
+/// trailing text of any kind.
+///
+/// Two deliberate decisions, both of which a caller can work around by reading
+/// [`as_str`](Self::as_str) and parsing it themselves:
+///
+/// - **A leap second is rejected.** RFC 3339 allows `:60` for a positive leap
+///   second; Unix time has no distinct instant to map it to, so
+///   [`system_time`](Self::system_time) refuses it rather than silently moving
+///   it by a second.
+/// - **An instant before 1970 is supported**, as `UNIX_EPOCH - Duration`:
+///   [`system_time`](Self::system_time) handles it, and
+///   [`unix_nanos`](Self::unix_nanos) simply reports a negative number.
+///
+/// # Equality
+///
+/// [`PartialEq`] compares the raw strings, so two spellings of the same
+/// instant (`2026-09-19T00:00:00Z` and `2026-09-19T02:00:00+02:00`) are **not**
+/// equal. Compare [`system_time`](Self::system_time) or
+/// [`unix_nanos`](Self::unix_nanos) when the instant is what matters.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTimestamp {
+    /// The string the server sent, stored and never rewritten. Private because
+    /// [`FileTimestamp::as_str`] is how it is read — one accessor rather than
+    /// two ways to reach the same bytes.
+    raw: String,
+}
+
+impl FileTimestamp {
+    /// Wrap one timestamp string exactly as the server sent it.
+    ///
+    /// Crate-private on purpose: a `FileTimestamp` means "what the server
+    /// reported for this file", and nothing validates the string here — the
+    /// parse happens in [`FileTimestamp::system_time`], on demand.
+    pub(crate) fn new(raw: impl Into<String>) -> Self {
+        Self { raw: raw.into() }
+    }
+
+    /// The timestamp exactly as the server wrote it, parsed or not.
+    ///
+    /// Always available, whatever format the server used, and the fallback
+    /// whenever [`system_time`](Self::system_time) reports
+    /// [`RociaDbError::Decode`].
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    /// The instant this timestamp names, as a [`SystemTime`].
+    ///
+    /// Parses [the format above](Self#the-format-this-parses) on every call —
+    /// nothing is cached, and the cost is a walk over a couple of dozen bytes.
+    /// An instant before 1970 comes back as `UNIX_EPOCH - Duration`, so a
+    /// caller who then wants a number should ask [`unix_nanos`](Self::unix_nanos)
+    /// rather than `duration_since(UNIX_EPOCH)`, which fails for exactly those.
+    ///
+    /// Both [`chrono::DateTime<Utc>`](https://docs.rs/chrono) and
+    /// [`time::OffsetDateTime`](https://docs.rs/time) implement
+    /// `From<SystemTime>`, so this is the one hop to whichever date-time type
+    /// a caller already uses:
+    ///
+    /// ```rust,no_run
+    /// # use rociadb_sdk::RociaDbBuilder;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let client = RociaDbBuilder::new().disable_auth().build().await?;
+    /// let metadata = client.stat_file("tenant-1", "assets", "manual.txt").await?;
+    /// match metadata.updated_at.system_time() {
+    ///     Ok(updated) => {
+    ///         let age = std::time::SystemTime::now().duration_since(updated)?;
+    ///         println!("last written {} seconds ago", age.as_secs());
+    ///     }
+    ///     // The server formatted it some other way; the text is still there.
+    ///     Err(error) => println!("{}: {error}", metadata.updated_at),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`RociaDbError::Decode`] with `context` `"file timestamp"` when the
+    /// string is not the format above — including when it is a perfectly good
+    /// timestamp in another one — and when the instant is outside the range
+    /// this platform's [`SystemTime`] can represent. The error quotes the
+    /// offending value (bounded in length) and says what is wrong with it; its
+    /// `source` is a [`serde_json::Error`] because that is the shape this
+    /// variant has, not because any JSON was involved.
+    pub fn system_time(&self) -> Result<SystemTime> {
+        let (seconds, nanos) = self.unix_instant()?;
+        unix_instant_to_system_time(seconds, nanos).ok_or_else(|| {
+            self.decode_error("the instant is outside the range SystemTime can represent here")
+        })
+    }
+
+    /// The instant this timestamp names, in nanoseconds since the Unix epoch —
+    /// negative before it.
+    ///
+    /// The numeric counterpart of [`system_time`](Self::system_time), parsing
+    /// exactly the same format and failing on exactly the same terms. Prefer it
+    /// for ordering, differences and storage: it is one `i128` comparison, it
+    /// needs no case for an instant before 1970 (where
+    /// `SystemTime::duration_since(UNIX_EPOCH)` returns an error), and it
+    /// cannot lose the sub-second part the way a seconds count would.
+    ///
+    /// Fractional digits past the ninth are truncated, so the value never
+    /// claims more precision than it has.
+    ///
+    /// # Errors
+    ///
+    /// [`RociaDbError::Decode`] with `context` `"file timestamp"`, on the same
+    /// terms as [`system_time`](Self::system_time) — bar the platform range,
+    /// which an `i128` of nanoseconds cannot run out of for any year this
+    /// parser accepts.
+    pub fn unix_nanos(&self) -> Result<i128> {
+        let (seconds, nanos) = self.unix_instant()?;
+        Ok(i128::from(seconds) * 1_000_000_000 + i128::from(nanos))
+    }
+
+    /// Parse the raw string into whole seconds since the Unix epoch plus a
+    /// nanosecond remainder, mapping the parser's report into the public error.
+    /// The one place the two public accessors share, so they cannot disagree
+    /// about what is a valid timestamp.
+    fn unix_instant(&self) -> Result<(i64, u32)> {
+        parse_rfc3339(&self.raw).map_err(|problem| self.decode_error(problem))
+    }
+
+    /// The [`RociaDbError::Decode`] both accessors report: what is wrong, and
+    /// the value it is wrong about, quoted and bounded by
+    /// [`MAX_QUOTED_TIMESTAMP_CHARS`].
+    fn decode_error(&self, problem: &str) -> RociaDbError {
+        use serde::de::Error as _;
+
+        let quoted: String = self.raw.chars().take(MAX_QUOTED_TIMESTAMP_CHARS).collect();
+        let truncated = if quoted.len() < self.raw.len() {
+            " (truncated)"
+        } else {
+            ""
+        };
+        RociaDbError::Decode {
+            context: FILE_TIMESTAMP_CONTEXT,
+            source: serde_json::Error::custom(format!("{quoted:?}{truncated}: {problem}")),
+        }
+    }
+}
+
+impl std::fmt::Display for FileTimestamp {
+    /// The timestamp exactly as the server wrote it — the same string
+    /// [`FileTimestamp::as_str`] returns, parsed or not.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.raw)
+    }
+}
+
+/// Parse an RFC 3339 timestamp into whole seconds since the Unix epoch and a
+/// nanosecond remainder (always positive, even before 1970), or say in a few
+/// words why it is not one.
+///
+/// Pure, allocation-free and dependency-free: the whole of what this SDK knows
+/// about the format lives here, so every rule is assertable on its own string
+/// without a server, a clock or a date-time crate. The grammar it accepts — and
+/// the two decisions it encodes, that a leap second is refused and that an
+/// instant before 1970 is not — are documented on [`FileTimestamp`], which is
+/// where a caller reads about them.
+fn parse_rfc3339(raw: &str) -> std::result::Result<(i64, u32), &'static str> {
+    /// Reported for anything whose shape is wrong, as opposed to a field whose
+    /// value is out of range: one message, because "which byte of the layout
+    /// disagreed" helps nobody read their own timestamp.
+    const MISSHAPEN: &str = "expected YYYY-MM-DDThh:mm:ss with a Z or +hh:mm offset";
+
+    let bytes = raw.as_bytes();
+    // The date, the separator and the time are a fixed 19 bytes. Checking that
+    // much up front is what lets every index below be a constant rather than a
+    // bounds check of its own — and stopping at 19 rather than at 20 leaves the
+    // offset to `parse_offset`, so the likeliest thing a server that does not
+    // speak RFC 3339 sends (a local time, exactly 19 bytes, with no offset at
+    // all) is refused by name instead of as a length.
+    if bytes.len() < 19 {
+        return Err(MISSHAPEN);
+    }
+    if bytes[4] != b'-' || bytes[7] != b'-' || bytes[13] != b':' || bytes[16] != b':' {
+        return Err(MISSHAPEN);
+    }
+    // RFC 3339 §5.6 spells the date/time separator `T`, allows a lower-case
+    // `t`, and lets an implementation accept a space in its place (§5.6, NOTE).
+    // All three are taken; nothing else is.
+    if !matches!(bytes[10], b'T' | b't' | b' ') {
+        return Err(MISSHAPEN);
+    }
+    let year = digits(&bytes[0..4]).ok_or(MISSHAPEN)?;
+    let month = digits(&bytes[5..7]).ok_or(MISSHAPEN)?;
+    let day = digits(&bytes[8..10]).ok_or(MISSHAPEN)?;
+    let hour = digits(&bytes[11..13]).ok_or(MISSHAPEN)?;
+    let minute = digits(&bytes[14..16]).ok_or(MISSHAPEN)?;
+    let second = digits(&bytes[17..19]).ok_or(MISSHAPEN)?;
+    let (nanos, rest) = parse_fraction(&bytes[19..])?;
+    let offset_seconds = parse_offset(rest)?;
+
+    if !(1..=12).contains(&month) {
+        return Err("month is out of range");
+    }
+    if day < 1 || day > days_in_month(year, month) {
+        return Err("day is out of range for that month");
+    }
+    if hour > 23 {
+        return Err("hour is out of range");
+    }
+    if minute > 59 {
+        return Err("minute is out of range");
+    }
+    if second > 59 {
+        // 60 is a leap second in RFC 3339, and Unix time has no separate
+        // instant for one. See `FileTimestamp`.
+        return Err("second is out of range (a leap second is not accepted)");
+    }
+
+    let seconds = days_from_civil(i64::from(year), month, day) * 86_400
+        + i64::from(hour) * 3_600
+        + i64::from(minute) * 60
+        + i64::from(second)
+        - offset_seconds;
+    Ok((seconds, nanos))
+}
+
+/// Read `bytes` as a decimal number, rejecting anything that is not ASCII
+/// digits — a sign, a space, a letter, or any byte of a multi-byte character.
+///
+/// Called only on slices of at most four bytes, so the accumulator cannot
+/// overflow.
+fn digits(bytes: &[u8]) -> Option<u32> {
+    let mut value = 0;
+    for byte in bytes {
+        let digit = byte.checked_sub(b'0').filter(|digit| *digit <= 9)?;
+        value = value * 10 + u32::from(digit);
+    }
+    Some(value)
+}
+
+/// Split the optional fractional seconds off the front of `rest`, returning the
+/// nanoseconds they denote and whatever follows them.
+///
+/// Any number of digits is accepted. The first nine are kept and the rest are
+/// **truncated**, not rounded: nothing finer than a nanosecond survives in a
+/// [`SystemTime`] anyway, and rounding would let a value name an instant the
+/// server never wrote. Fewer than nine are padded on the right, so `.5` is
+/// half a second rather than five nanoseconds.
+fn parse_fraction(rest: &[u8]) -> std::result::Result<(u32, &[u8]), &'static str> {
+    let Some(tail) = rest.strip_prefix(b".") else {
+        return Ok((0, rest));
+    };
+    let digit_count = tail.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    if digit_count == 0 {
+        return Err("a decimal point must be followed by at least one digit");
+    }
+    // Split first: reading nine bytes straight out of `tail` would walk past
+    // the fraction and pick digits out of the offset that follows it.
+    let (fraction, rest) = tail.split_at(digit_count);
+    let mut nanos = 0;
+    for index in 0..9 {
+        let digit = fraction.get(index).map_or(0, |byte| u32::from(byte - b'0'));
+        nanos = nanos * 10 + digit;
+    }
+    Ok((nanos, rest))
+}
+
+/// Read the whole of `rest` as a UTC offset, in seconds to subtract from the
+/// local time that preceded it.
+///
+/// `Z` and `z` are zero. `-00:00`, which RFC 3339 gives the separate meaning
+/// "offset unknown", is read as the zero it numerically is — the instant is
+/// the same either way, and this type reports instants. Anything left over
+/// after the offset is a rejection: a timestamp with trailing text is not one.
+fn parse_offset(rest: &[u8]) -> std::result::Result<i64, &'static str> {
+    /// Reported for an offset of the wrong shape, including an absent one —
+    /// the mistake a server formatting local time without an offset makes.
+    const OFFSET: &str = "expected a Z or +hh:mm offset at the end";
+
+    match rest {
+        [b'Z' | b'z'] => Ok(0),
+        [sign, hour_tens, hour_units, b':', minute_tens, minute_units] => {
+            let sign = match sign {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return Err(OFFSET),
+            };
+            let hours = digits(&[*hour_tens, *hour_units]).ok_or(OFFSET)?;
+            let minutes = digits(&[*minute_tens, *minute_units]).ok_or(OFFSET)?;
+            if hours > 23 {
+                return Err("offset hour is out of range");
+            }
+            if minutes > 59 {
+                return Err("offset minute is out of range");
+            }
+            Ok(sign * (i64::from(hours) * 3_600 + i64::from(minutes) * 60))
+        }
+        _ => Err(OFFSET),
+    }
+}
+
+/// Whether `year` is a leap year in the proleptic Gregorian calendar: every
+/// fourth year, except centuries, except every fourth century.
+fn is_leap_year(year: u32) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
+/// How many days `month` has in `year`, or zero for a month number that does
+/// not exist — which [`parse_rfc3339`] turns into a rejection, since no day is
+/// then in range.
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Days from the Unix epoch to `year-month-day` in the proleptic Gregorian
+/// calendar, negative before 1970-01-01.
+///
+/// Howard Hinnant's `days_from_civil`: shifting the year to start in March puts
+/// the leap day at its end, which is what turns the leap rule into two
+/// divisions and removes every table and every special case. Exact for every
+/// year this parser accepts (`0000` to `9999`) and far beyond — an era is 400
+/// years of exactly 146 097 days — and the 719 468 is the day count from
+/// 0000-03-01 to 1970-01-01, which is what makes the result epoch-relative.
+///
+/// `month` and `day` must already be valid for `year`; [`parse_rfc3339`] checks
+/// that before calling this.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let month = i64::from(month);
+    // March is the first month of the shifted year, so January and February
+    // belong to the year before.
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400; // [0, 399]
+    let day_of_year =
+        (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + i64::from(day) - 1; // [0, 365]
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year; // [0, 146096]
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Turn whole seconds since the Unix epoch plus a nanosecond remainder into a
+/// [`SystemTime`], or `None` when this platform cannot represent that instant.
+///
+/// An instant before 1970 is `UNIX_EPOCH - Duration`, which is why the negative
+/// case cannot simply negate: the remainder counts *forward* from the second
+/// below it, so subtracting needs one second less and the complement of the
+/// nanoseconds. Built from a [`Duration`] of seconds and nanoseconds rather
+/// than from nanoseconds alone, which would overflow the `u64`
+/// `Duration::from_nanos` takes for any year past 2554. `nanos` is below one
+/// second in both branches, so neither `Duration::new` can carry into its
+/// seconds — the one way that constructor panics.
+fn unix_instant_to_system_time(seconds: i64, nanos: u32) -> Option<SystemTime> {
+    if seconds >= 0 {
+        return UNIX_EPOCH.checked_add(Duration::new(u64::try_from(seconds).ok()?, nanos));
+    }
+    let magnitude = if nanos == 0 {
+        Duration::new(seconds.unsigned_abs(), 0)
+    } else {
+        // `seconds` is negative and `nanos` positive, so the magnitude is one
+        // whole second less than `|seconds|`, plus the rest of that second.
+        Duration::new(seconds.unsigned_abs() - 1, 1_000_000_000 - nanos)
+    };
+    UNIX_EPOCH.checked_sub(magnitude)
+}
 
 /// Options applied to [`RociaDbClient::upload_file`], the in-memory
 /// byte-buffer upload.
@@ -580,7 +1068,7 @@ impl RociaDbClient {
     /// as-is. That is a real asymmetry with the upload path: every upload
     /// method on this client sends a SHA-256 checksum with the file (and
     /// [`RociaDbClient::upload_file`] computes it for you), and
-    /// [`StatResponse::checksum`] exposes the checksum recorded for a stored
+    /// [`FileMetadata::checksum`] exposes the checksum recorded for a stored
     /// file — but nothing on the download side ever computes or checks a
     /// checksum against the chunks the server sends back, and the server
     /// does not send one on download for this method to check. The only
@@ -685,8 +1173,8 @@ impl RociaDbClient {
     /// calls [`RociaDbClient::stat_file`] first, streams the download while
     /// feeding every chunk to a SHA-256 hasher, and only then hands the
     /// buffer back — after checking both the byte count against
-    /// [`StatResponse::size_bytes`] and the digest against
-    /// [`StatResponse::checksum`]. A file whose stored bytes have been
+    /// [`FileMetadata::size_bytes`] and the digest against
+    /// [`FileMetadata::checksum`]. A file whose stored bytes have been
     /// corrupted or truncated therefore fails here instead of being returned
     /// as if nothing were wrong.
     ///
@@ -699,7 +1187,7 @@ impl RociaDbClient {
     /// **The server never verified the uploader's checksum.** It checks that
     /// the value is 32 bytes long and stores it; it never hashes the bytes it
     /// received to confirm the two agree (see
-    /// [`StatResponse::checksum`] and
+    /// [`FileMetadata::checksum`] and
     /// [`RociaDbClient::upload_file_stream`]). So a match here proves the
     /// bytes you just received are the bytes the uploader *declared* — it
     /// catches storage corruption, a truncated transfer, and a partially
@@ -745,20 +1233,20 @@ impl RociaDbClient {
         bucket: &str,
         file_id: &str,
     ) -> Result<Vec<u8>> {
-        let stat = self.stat_file(tenant_id, bucket, file_id).await?;
+        let metadata = self.stat_file(tenant_id, bucket, file_id).await?;
         debug!(
             tenant_id = tenant_id,
             bucket = bucket,
             file_id = file_id,
-            size_bytes = stat.size_bytes,
+            size_bytes = metadata.size_bytes,
             "downloading file with verification"
         );
         // A `Vec<u8>` is itself a `tokio::io::AsyncWrite` (writing to it is an
         // infallible `extend_from_slice`), so the buffered variant is the
         // streaming one pointed at a buffer — the capped pre-allocation still
         // happens here, because the writer variant has nothing to pre-allocate.
-        let mut bytes = Vec::with_capacity(preallocated_download_capacity(stat.size_bytes));
-        self.download_verified_into(tenant_id, bucket, file_id, &stat, &mut bytes)
+        let mut bytes = Vec::with_capacity(preallocated_download_capacity(metadata.size_bytes));
+        self.download_verified_into(tenant_id, bucket, file_id, &metadata, &mut bytes)
             .await?;
         Ok(bytes)
     }
@@ -768,12 +1256,12 @@ impl RociaDbClient {
     ///
     /// Same checks as [`RociaDbClient::download_file_verified`] — the same
     /// [`RociaDbClient::stat_file`] call first, the same SHA-256 fed chunk by
-    /// chunk, the same byte count against [`StatResponse::size_bytes`] and the
-    /// same digest against [`StatResponse::checksum`] — but nothing is kept:
+    /// chunk, the same byte count against [`FileMetadata::size_bytes`] and the
+    /// same digest against [`FileMetadata::checksum`] — but nothing is kept:
     /// each chunk is hashed and written out as it arrives, so a 5 GiB file
     /// costs one chunk of memory rather than 5 GiB. Returns the number of bytes
     /// written, which on success is necessarily
-    /// [`StatResponse::size_bytes`]. `writer` is flushed once, after every
+    /// [`FileMetadata::size_bytes`]. `writer` is flushed once, after every
     /// check has passed.
     ///
     /// `W` is `?Sized`, so a `&mut dyn AsyncWrite + Unpin` works as well as a
@@ -871,19 +1359,19 @@ impl RociaDbClient {
     where
         W: AsyncWrite + Unpin + ?Sized,
     {
-        let stat = self.stat_file(tenant_id, bucket, file_id).await?;
+        let metadata = self.stat_file(tenant_id, bucket, file_id).await?;
         debug!(
             tenant_id = tenant_id,
             bucket = bucket,
             file_id = file_id,
-            size_bytes = stat.size_bytes,
+            size_bytes = metadata.size_bytes,
             "downloading file with verification into a caller-supplied writer"
         );
-        self.download_verified_into(tenant_id, bucket, file_id, &stat, writer)
+        self.download_verified_into(tenant_id, bucket, file_id, &metadata, writer)
             .await
     }
 
-    /// Stream one download into `writer`, verifying it against `stat`, and
+    /// Stream one download into `writer`, verifying it against `metadata`, and
     /// report how many bytes it carried.
     ///
     /// The whole of what the two verified downloads share, so the rules —
@@ -891,21 +1379,22 @@ impl RociaDbClient {
     /// before the digest, flush only once both agree — exist once.
     /// [`RociaDbClient::download_file_verified`] passes a `Vec<u8>` it
     /// pre-allocated; [`RociaDbClient::download_file_verified_to`] passes the
-    /// caller's writer. `stat` is taken by reference and never re-read here:
-    /// both callers have already issued it, and issuing it again would make the
-    /// verification compare against metadata the download did not start from.
+    /// caller's writer. `metadata` is taken by reference and never re-read
+    /// here: both callers have already issued the [`RociaDbClient::stat_file`]
+    /// that produced it, and issuing it again would make the verification
+    /// compare against metadata the download did not start from.
     async fn download_verified_into<W>(
         &self,
         tenant_id: &str,
         bucket: &str,
         file_id: &str,
-        stat: &StatResponse,
+        metadata: &FileMetadata,
         writer: &mut W,
     ) -> Result<u64>
     where
         W: AsyncWrite + Unpin + ?Sized,
     {
-        let mut verified = VerifiedDownload::new(stat.size_bytes);
+        let mut verified = VerifiedDownload::new(metadata.size_bytes);
         let mut stream = self
             .download_file_stream(tenant_id, bucket, file_id)
             .await?;
@@ -916,7 +1405,7 @@ impl RociaDbClient {
         {
             verified.absorb(writer, &response.chunk).await?;
         }
-        let written = verified.finish(&stat.checksum)?;
+        let written = verified.finish(&metadata.checksum)?;
         // Only now: a caller is going to discard whatever a failed
         // verification wrote, so there is nothing worth pushing out of the
         // writer's own buffers before the checks have passed.
@@ -924,13 +1413,35 @@ impl RociaDbClient {
         Ok(written)
     }
 
-    /// Return metadata for one stored file.
+    /// Return metadata for one stored file: its size, its recorded MIME type
+    /// and checksum, and when it was first and last written.
+    ///
+    /// Reads the **published** version, so an upload still in flight is
+    /// `NOT_FOUND` here until its stream has been received and validated in
+    /// full. It is also the call the two verified downloads make first, and the
+    /// way to find out whether a file exists at all — [`delete_file`] being
+    /// idempotent, it cannot tell you.
+    ///
+    /// The two timestamps are [`FileTimestamp`]s: the server's own string,
+    /// available verbatim through [`FileTimestamp::as_str`], and parsed into a
+    /// [`SystemTime`] only if you ask for one. See that type for the format it
+    /// reads and what happens when a server writes another.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` for a `file_id` that is not published in this bucket, and
+    /// whatever else the server reports. Nothing about the response is
+    /// validated client-side: a timestamp only fails when a caller asks it to
+    /// parse, and the `checksum` is compared only by the two verified
+    /// downloads.
+    ///
+    /// [`delete_file`]: RociaDbClient::delete_file
     pub async fn stat_file(
         &self,
         tenant_id: &str,
         bucket: &str,
         file_id: &str,
-    ) -> Result<StatResponse> {
+    ) -> Result<FileMetadata> {
         debug!(
             tenant_id = tenant_id,
             bucket = bucket,
@@ -942,11 +1453,13 @@ impl RociaDbClient {
             bucket: bucket.to_string(),
             file_id: file_id.to_string(),
         };
-        self.unary("failed to stat file", request, |request| {
-            let mut upstream = self.upstream_file.clone();
-            async move { upstream.stat(request).await }
-        })
-        .await
+        let response: StatResponse = self
+            .unary("failed to stat file", request, |request| {
+                let mut upstream = self.upstream_file.clone();
+                async move { upstream.stat(request).await }
+            })
+            .await?;
+        Ok(FileMetadata::from(response))
     }
 
     /// Return one paginated page of bucket names holding at least one file.
@@ -1574,12 +2087,14 @@ where
 mod tests {
     use super::{
         AsyncWrite, AsyncWriteExt, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_FILE_BYTES,
-        DOWNLOAD_WRITE_CONTEXT, FileStreamUploadOptions, FileUploadOptions,
-        MAX_PREALLOCATED_DOWNLOAD_BYTES, RechunkState, VerifiedDownload, chunk_upload_requests,
-        default_upload_file_request_id, preallocated_download_capacity, rechunk_upload_requests,
-        resolve_checksum, validate_file_size,
+        DOWNLOAD_WRITE_CONTEXT, FILE_TIMESTAMP_CONTEXT, FileMetadata, FileStreamUploadOptions,
+        FileTimestamp, FileUploadOptions, MAX_PREALLOCATED_DOWNLOAD_BYTES,
+        MAX_QUOTED_TIMESTAMP_CHARS, RechunkState, VerifiedDownload, chunk_upload_requests,
+        days_from_civil, default_upload_file_request_id, is_leap_year, parse_rfc3339,
+        preallocated_download_capacity, rechunk_upload_requests, resolve_checksum,
+        validate_file_size,
     };
-    use crate::pb::upstream::v1::UploadRequest;
+    use crate::pb::upstream::v1::{StatResponse, UploadRequest};
     use crate::test_support::{lazy_test_client, lazy_test_client_with_max_file_bytes};
     use crate::{Bytes, RociaDbError};
     use futures::executor::block_on;
@@ -1589,6 +2104,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
+    use std::time::{Duration, UNIX_EPOCH};
 
     /// Length of a SHA-256 digest. The production code no longer needs this
     /// as a constant — `[u8; 32]` carries it — but the tests still assert
@@ -2592,5 +3108,467 @@ mod tests {
         }
         assert!(!last.chunk.is_empty());
         assert!(last.chunk.len() <= DEFAULT_CHUNK_SIZE);
+    }
+
+    // -----------------------------------------------------------------------
+    // FileMetadata and FileTimestamp
+    // -----------------------------------------------------------------------
+
+    /// Seconds from the Unix epoch to 2024-01-01T00:00:00Z: a round anchor
+    /// several assertions below count from, and one that is easy to check
+    /// against any independent source.
+    const NEW_YEAR_2024: i64 = 1_704_067_200;
+
+    /// Parse `raw` and report the instant it names as (whole seconds since the
+    /// Unix epoch, nanoseconds into that second), after asserting that all
+    /// three public ways of reaching that instant agree.
+    ///
+    /// The [`std::time::SystemTime`] is cross-checked by reading it back as a
+    /// single signed nanosecond count through `duration_since(UNIX_EPOCH)` —
+    /// arithmetic the implementation does not share, since it builds the value
+    /// by adding or subtracting a `Duration` of seconds *and* nanoseconds.
+    fn instant(raw: &str) -> (i64, u32) {
+        let (seconds, nanos) =
+            parse_rfc3339(raw).unwrap_or_else(|problem| panic!("{raw:?} must parse: {problem}"));
+        let timestamp = FileTimestamp::new(raw);
+        let unix_nanos = timestamp
+            .unix_nanos()
+            .expect("a parseable timestamp must report its nanos");
+        assert_eq!(
+            unix_nanos,
+            i128::from(seconds) * 1_000_000_000 + i128::from(nanos),
+            "unix_nanos must report the parsed instant, for {raw:?}"
+        );
+        let system_time = timestamp
+            .system_time()
+            .expect("a parseable timestamp must resolve to an instant");
+        let read_back = match system_time.duration_since(UNIX_EPOCH) {
+            Ok(after) => i128::try_from(after.as_nanos()).expect("an instant fits in an i128"),
+            Err(before) => {
+                -i128::try_from(before.duration().as_nanos()).expect("an instant fits in an i128")
+            }
+        };
+        assert_eq!(
+            read_back, unix_nanos,
+            "system_time and unix_nanos must name the same instant, for {raw:?}"
+        );
+        (seconds, nanos)
+    }
+
+    /// Whole seconds since the Unix epoch for a timestamp with no fractional
+    /// part, asserting there is none.
+    fn unix_seconds(raw: &str) -> i64 {
+        let (seconds, nanos) = instant(raw);
+        assert_eq!(nanos, 0, "{raw:?} carries no fractional seconds");
+        seconds
+    }
+
+    /// The `Display` of the error `raw` produces, after asserting it is the
+    /// documented [`RociaDbError::Decode`] and that both accessors reject it.
+    ///
+    /// Both, every time: `system_time` and `unix_nanos` run one parser, and a
+    /// string one of them accepted while the other refused would be a bug no
+    /// single-accessor test could see.
+    fn rejection(raw: &str) -> String {
+        let timestamp = FileTimestamp::new(raw);
+        let error = match timestamp.system_time() {
+            Ok(parsed) => panic!("{raw:?} must not parse, got {parsed:?}"),
+            Err(error) => error,
+        };
+        let RociaDbError::Decode { context, .. } = &error else {
+            panic!("an unparseable timestamp must be a Decode error, got: {error}");
+        };
+        assert_eq!(*context, FILE_TIMESTAMP_CONTEXT);
+        assert_eq!(*context, "file timestamp");
+        assert!(
+            timestamp.unix_nanos().is_err(),
+            "unix_nanos must reject exactly what system_time rejects, for {raw:?}"
+        );
+        assert!(
+            error.code().is_none(),
+            "a timestamp this SDK cannot read is not a gRPC status, got: {error}"
+        );
+        error.to_string()
+    }
+
+    #[test]
+    fn file_metadata_carries_the_wire_message_field_for_field() {
+        let metadata = FileMetadata::from(StatResponse {
+            size_bytes: 4096,
+            content_type: "text/csv".to_string(),
+            checksum: vec![7u8; CHECKSUM_LEN],
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-03-01T12:30:45.5+02:00".to_string(),
+        });
+        assert_eq!(metadata.size_bytes, 4096);
+        assert_eq!(metadata.content_type, "text/csv");
+        assert_eq!(metadata.checksum, vec![7u8; CHECKSUM_LEN]);
+        // The two timestamps keep the server's own text, byte for byte: the
+        // conversion parses nothing.
+        assert_eq!(metadata.created_at.as_str(), "2024-01-01T00:00:00Z");
+        assert_eq!(metadata.updated_at.as_str(), "2024-03-01T12:30:45.5+02:00");
+        assert_eq!(metadata, metadata.clone());
+    }
+
+    #[test]
+    fn a_timestamp_hands_back_the_servers_own_string_whatever_its_format() {
+        // The property that makes the lazy parse safe: text this SDK cannot
+        // read is still text the caller can, through both `as_str` and
+        // `Display`, and neither has to succeed at parsing to work.
+        for raw in [
+            "2024-01-01T00:00:00Z",
+            "2024-01-01 00:00:00",
+            "01/01/2024 00:00:00 CET",
+            "1704067200",
+            "",
+        ] {
+            let timestamp = FileTimestamp::new(raw);
+            assert_eq!(timestamp.as_str(), raw);
+            assert_eq!(timestamp.to_string(), raw);
+        }
+    }
+
+    #[test]
+    fn the_unix_epoch_parses_to_zero() {
+        assert_eq!(unix_seconds("1970-01-01T00:00:00Z"), 0);
+        assert_eq!(
+            FileTimestamp::new("1970-01-01T00:00:00Z")
+                .system_time()
+                .expect("the epoch must parse"),
+            UNIX_EPOCH
+        );
+    }
+
+    #[test]
+    fn known_instants_parse_to_their_documented_unix_seconds() {
+        // Four fixed points, each checkable against any other implementation:
+        // the epoch's billionth second, the start of 2024, the last second a
+        // 32-bit `time_t` can hold, and one right after it.
+        assert_eq!(unix_seconds("2001-09-09T01:46:40Z"), 1_000_000_000);
+        assert_eq!(unix_seconds("2024-01-01T00:00:00Z"), NEW_YEAR_2024);
+        assert_eq!(unix_seconds("2038-01-19T03:14:07Z"), 2_147_483_647);
+        assert_eq!(unix_seconds("2038-01-19T03:14:08Z"), 2_147_483_648);
+        // And the arithmetic inside a day, hour and minute.
+        assert_eq!(
+            unix_seconds("2024-01-01T01:02:03Z"),
+            NEW_YEAR_2024 + 3_600 + 120 + 3
+        );
+        assert_eq!(
+            unix_seconds("2024-12-31T23:59:59Z"),
+            NEW_YEAR_2024 + 366 * 86_400 - 1,
+            "2024 is a leap year, so it is 366 days long"
+        );
+    }
+
+    #[test]
+    fn leap_years_follow_the_gregorian_rule_rather_than_the_every_fourth_year_one() {
+        // The whole point of the century exceptions: 2000 is a leap year
+        // because it divides by 400, while 1900 and 2100 are not because they
+        // only divide by 100.
+        assert_eq!(
+            unix_seconds("2000-02-29T00:00:00Z"),
+            951_782_400,
+            "2000 divides by 400, so it has a 29 February"
+        );
+        assert_eq!(unix_seconds("2024-02-29T12:00:00Z"), 1_709_208_000);
+        for absent in [
+            "1900-02-29T00:00:00Z",
+            "2100-02-29T00:00:00Z",
+            "2023-02-29T00:00:00Z",
+            "2024-02-30T00:00:00Z",
+        ] {
+            assert!(
+                rejection(absent).contains("day is out of range"),
+                "{absent:?} is not a date"
+            );
+        }
+        // And the rule itself, since the parser is the only thing that reads it.
+        assert!(is_leap_year(2000) && is_leap_year(2024) && is_leap_year(1600));
+        assert!(!is_leap_year(1900) && !is_leap_year(2100) && !is_leap_year(2023));
+        // A day the calendar does have, on both sides of each exception.
+        unix_seconds("1900-02-28T00:00:00Z");
+        unix_seconds("1900-03-01T00:00:00Z");
+    }
+
+    #[test]
+    fn month_lengths_are_enforced_and_so_are_the_month_and_day_numbers_themselves() {
+        for last_day in [
+            "2023-01-31T00:00:00Z",
+            "2023-04-30T00:00:00Z",
+            "2023-06-30T00:00:00Z",
+            "2023-09-30T00:00:00Z",
+            "2023-11-30T00:00:00Z",
+            "2023-12-31T00:00:00Z",
+        ] {
+            instant(last_day);
+        }
+        for overrun in [
+            "2023-04-31T00:00:00Z",
+            "2023-06-31T00:00:00Z",
+            "2023-09-31T00:00:00Z",
+            "2023-11-31T00:00:00Z",
+            "2023-01-32T00:00:00Z",
+            "2023-01-00T00:00:00Z",
+        ] {
+            assert!(
+                rejection(overrun).contains("day is out of range"),
+                "{overrun:?} is not a date"
+            );
+        }
+        for month in ["2023-00-10T00:00:00Z", "2023-13-10T00:00:00Z"] {
+            assert!(
+                rejection(month).contains("month is out of range"),
+                "{month:?} is not a date"
+            );
+        }
+        // December of one year and January of the next are one day apart,
+        // which is the arithmetic `days_from_civil`'s year shift exists for.
+        assert_eq!(
+            unix_seconds("2024-01-01T00:00:00Z") - unix_seconds("2023-12-31T00:00:00Z"),
+            86_400
+        );
+    }
+
+    #[test]
+    fn fractional_seconds_of_any_length_are_kept_to_the_nanosecond_and_then_truncated() {
+        // One, three, six and nine digits: a tenth, a millisecond, a
+        // microsecond and a nanosecond, each padded on the right rather than
+        // read as its digits.
+        assert_eq!(instant("2024-01-01T00:00:00.5Z").1, 500_000_000);
+        assert_eq!(instant("2024-01-01T00:00:00.001Z").1, 1_000_000);
+        assert_eq!(instant("2024-01-01T00:00:00.000001Z").1, 1_000);
+        assert_eq!(instant("2024-01-01T00:00:00.000000001Z").1, 1);
+        assert_eq!(instant("2024-01-01T00:00:00.123456789Z").1, 123_456_789);
+        // Past the ninth digit the parser truncates rather than rounds, so a
+        // value never names an instant later than the one the server wrote.
+        assert_eq!(instant("2024-01-01T00:00:00.1234567891Z").1, 123_456_789);
+        assert_eq!(
+            instant("2024-01-01T00:00:00.999999999999999Z").1,
+            999_999_999
+        );
+        assert_eq!(instant("2024-01-01T00:00:00.0000000009Z").1, 0);
+        // The seconds are untouched by any of it, and the fraction survives an
+        // offset following it.
+        assert_eq!(instant("2024-01-01T00:00:00.250Z").0, NEW_YEAR_2024);
+        assert_eq!(
+            instant("2024-01-01T02:00:00.250+02:00"),
+            (NEW_YEAR_2024, 250_000_000)
+        );
+    }
+
+    #[test]
+    fn an_offset_moves_the_instant_in_both_directions() {
+        // Same instant, four spellings: UTC, two positive offsets and one
+        // negative half-hour one.
+        assert_eq!(unix_seconds("2024-01-01T00:00:00Z"), NEW_YEAR_2024);
+        assert_eq!(unix_seconds("2024-01-01T00:00:00z"), NEW_YEAR_2024);
+        assert_eq!(unix_seconds("2024-01-01T02:00:00+02:00"), NEW_YEAR_2024);
+        assert_eq!(unix_seconds("2023-12-31T18:30:00-05:30"), NEW_YEAR_2024);
+        assert_eq!(unix_seconds("2024-01-01T14:00:00+14:00"), NEW_YEAR_2024);
+        // A zero offset written either way is UTC. RFC 3339 gives `-00:00` the
+        // separate meaning "offset unknown"; the instant is the same, and an
+        // instant is all this type reports.
+        assert_eq!(unix_seconds("2024-01-01T00:00:00+00:00"), NEW_YEAR_2024);
+        assert_eq!(unix_seconds("2024-01-01T00:00:00-00:00"), NEW_YEAR_2024);
+        // The minutes of an offset count too, and an offset may cross a day.
+        assert_eq!(
+            unix_seconds("2024-01-01T00:00:00+00:45"),
+            NEW_YEAR_2024 - 45 * 60
+        );
+        assert_eq!(
+            unix_seconds("2024-01-01T00:30:00-23:59"),
+            NEW_YEAR_2024 + 30 * 60 + 23 * 3_600 + 59 * 60
+        );
+        // And an offset outside the two-digit range is not one.
+        assert!(rejection("2024-01-01T00:00:00+24:00").contains("offset hour is out of range"));
+        assert!(rejection("2024-01-01T00:00:00+01:60").contains("offset minute is out of range"));
+    }
+
+    #[test]
+    fn the_date_and_time_may_be_separated_by_a_space_or_a_lowercase_t() {
+        // RFC 3339 spells the separator `T`, allows `t`, and lets an
+        // implementation take a space. All three name the same instant here.
+        assert_eq!(unix_seconds("2024-01-01T00:00:00Z"), NEW_YEAR_2024);
+        assert_eq!(unix_seconds("2024-01-01t00:00:00Z"), NEW_YEAR_2024);
+        assert_eq!(unix_seconds("2024-01-01 00:00:00Z"), NEW_YEAR_2024);
+        assert_eq!(
+            instant("2024-01-01 00:00:00.5z"),
+            (NEW_YEAR_2024, 500_000_000),
+            "a space separator, a lower-case z and a fraction compose"
+        );
+        // Nothing else is a separator, however plausible.
+        for wrong in [
+            "2024-01-01_00:00:00Z",
+            "2024-01-01X00:00:00Z",
+            "2024-01-01-00:00:00Z",
+        ] {
+            assert!(rejection(wrong).contains("expected YYYY-MM-DD"));
+        }
+    }
+
+    #[test]
+    fn a_leap_second_is_rejected_rather_than_quietly_moved() {
+        // RFC 3339 allows `:60` for a positive leap second, and Unix time has
+        // no separate instant to map it to. Refusing says so; the raw string
+        // is still there for a caller who needs it.
+        let message = rejection("2016-12-31T23:59:60Z");
+        assert!(
+            message.contains("second is out of range") && message.contains("leap second"),
+            "the message must say why 60 is refused, got: {message}"
+        );
+        assert_eq!(
+            FileTimestamp::new("2016-12-31T23:59:60Z").as_str(),
+            "2016-12-31T23:59:60Z"
+        );
+        // The second before it is an ordinary instant.
+        unix_seconds("2016-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn an_instant_before_1970_lands_before_the_epoch_rather_than_failing() {
+        // Supported, not rejected: `UNIX_EPOCH - Duration` on the way out, and
+        // a negative number from `unix_nanos`.
+        assert_eq!(unix_seconds("1969-12-31T23:59:59Z"), -1);
+        assert_eq!(unix_seconds("1969-01-01T00:00:00Z"), -31_536_000);
+        assert_eq!(unix_seconds("1900-01-01T00:00:00Z"), -2_208_988_800);
+        assert_eq!(unix_seconds("0000-01-01T00:00:00Z"), -62_167_219_200);
+
+        // The sub-second part still counts forward from the second below it,
+        // which is the one place the conversion cannot simply negate: half a
+        // second before the epoch is -500 000 000 ns, not -1.5 s.
+        let (seconds, nanos) = instant("1969-12-31T23:59:59.5Z");
+        assert_eq!((seconds, nanos), (-1, 500_000_000));
+        assert_eq!(
+            FileTimestamp::new("1969-12-31T23:59:59.5Z")
+                .unix_nanos()
+                .expect("a pre-epoch instant must still report its nanos"),
+            -500_000_000
+        );
+        assert_eq!(
+            FileTimestamp::new("1969-12-31T23:59:59.5Z")
+                .system_time()
+                .expect("a pre-epoch instant must resolve"),
+            UNIX_EPOCH - Duration::from_millis(500)
+        );
+        assert_eq!(
+            FileTimestamp::new("1969-12-31T23:59:59Z")
+                .system_time()
+                .expect("a pre-epoch instant must resolve"),
+            UNIX_EPOCH - Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_timestamp_is_a_decode_error_naming_the_value_and_the_problem() {
+        // Every shape a server might plausibly send that this parser does not
+        // read, plus the outright garbage. None of them may panic, and none of
+        // them may resolve to an instant.
+        let cases = [
+            ("", "empty"),
+            ("2024-01-01", "a date with no time"),
+            ("2024-01-01T00:00:00", "a time with no offset"),
+            ("2024-01-01 00:00:00", "a SQL-style local time"),
+            ("00:00:00Z", "a time with no date"),
+            ("1704067200", "epoch seconds"),
+            ("2024-1-1T00:00:00Z", "unpadded date fields"),
+            ("2024-01-01T0:00:00Z", "an unpadded hour"),
+            ("2024-01-01T00:00:00+0200", "an offset without its colon"),
+            ("2024-01-01T00:00:00+02", "an offset with no minutes"),
+            ("2024-01-01T00:00:00Z ", "a trailing space"),
+            ("2024-01-01T00:00:00Zulu", "trailing text"),
+            (" 2024-01-01T00:00:00Z", "a leading space"),
+            ("2024-01-01T00:00:00.Z", "a decimal point with no digits"),
+            ("2024-01-01T00:00:00,5Z", "a comma for the decimal point"),
+            ("2024-01-01T24:00:00Z", "hour 24"),
+            ("2024-01-01T00:60:00Z", "minute 60"),
+            ("2024/01/01T00:00:00Z", "slashes for dashes"),
+            ("not a timestamp at all", "prose"),
+            ("20240101T000000Z", "the basic ISO 8601 format"),
+            ("2024-01-01T00:00:0あZ", "a multi-byte character mid-field"),
+            ("+024-01-01T00:00:00Z", "a signed year"),
+        ];
+        for (raw, what) in cases {
+            let message = rejection(raw);
+            assert!(
+                message.starts_with("failed to decode file timestamp: "),
+                "the error must name the context first ({what}), got: {message}"
+            );
+            assert!(
+                message.contains(&format!("{raw:?}")),
+                "the error must quote the value it refused ({what}), got: {message}"
+            );
+        }
+        // The two out-of-range cases above are worth pinning by message: they
+        // are the ones a reader is most likely to have to act on.
+        assert!(rejection("2024-01-01T24:00:00Z").contains("hour is out of range"));
+        assert!(rejection("2024-01-01T00:60:00Z").contains("minute is out of range"));
+        assert!(
+            rejection("2024-01-01T00:00:00").contains("expected a Z or +hh:mm offset"),
+            "a missing offset must say so: it is the likeliest thing a server gets wrong"
+        );
+    }
+
+    #[test]
+    fn a_long_unreadable_timestamp_is_quoted_only_up_to_the_documented_bound() {
+        // The value is the server's, so its length is not this crate's to
+        // trust. A megabyte in `created_at` must not become a megabyte in
+        // every log line about it.
+        let huge = "9".repeat(4096);
+        let message = rejection(&huge);
+        assert!(
+            message.len() < MAX_QUOTED_TIMESTAMP_CHARS + 200,
+            "the message must stay bounded, got {} characters",
+            message.len()
+        );
+        assert!(
+            message.contains("(truncated)"),
+            "a truncated quote must say so, got: {message}"
+        );
+        // A timestamp-sized value is quoted whole, with no truncation marker.
+        let message = rejection("2024-01-01T00:00:00.123456789012+02:00 (Europe/Paris)");
+        assert!(!message.contains("(truncated)"), "got: {message}");
+    }
+
+    #[test]
+    fn equality_is_over_the_raw_string_rather_than_the_instant() {
+        // Documented, and worth pinning: two spellings of one instant are not
+        // equal, which is why the docs point at `system_time`/`unix_nanos` for
+        // comparisons that are about time.
+        let utc = FileTimestamp::new("2024-01-01T00:00:00Z");
+        let offset = FileTimestamp::new("2024-01-01T02:00:00+02:00");
+        assert_ne!(utc, offset);
+        assert_eq!(
+            utc.unix_nanos().expect("parses"),
+            offset.unix_nanos().expect("parses"),
+            "the two must still name the same instant"
+        );
+        assert_eq!(utc, FileTimestamp::new("2024-01-01T00:00:00Z"));
+        assert_eq!(utc, utc.clone());
+    }
+
+    #[test]
+    fn days_from_civil_agrees_with_known_day_counts_on_both_sides_of_the_epoch() {
+        // The date half of the parser, on its own: the epoch is day zero, the
+        // day before it is -1, and an era boundary (400 years, 146 097 days)
+        // lands where the algorithm's constant says it does.
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
+        assert_eq!(days_from_civil(1970, 1, 2), 1);
+        assert_eq!(days_from_civil(2024, 1, 1), NEW_YEAR_2024 / 86_400);
+        assert_eq!(
+            days_from_civil(2000, 3, 1) - days_from_civil(1600, 3, 1),
+            146_097,
+            "one Gregorian era is exactly 146 097 days"
+        );
+        assert_eq!(
+            days_from_civil(2001, 1, 1) - days_from_civil(2000, 1, 1),
+            366,
+            "2000 is a leap year"
+        );
+        assert_eq!(
+            days_from_civil(1901, 1, 1) - days_from_civil(1900, 1, 1),
+            365,
+            "1900 is not"
+        );
     }
 }

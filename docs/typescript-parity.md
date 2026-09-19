@@ -18,7 +18,8 @@ other.**
 > `download_file_verified_to`, `neighbor_nodes_out` / `neighbor_nodes_in`, the
 > `Config`, `Io`, `ChecksumMismatch` and `SizeMismatch` error variants,
 > `RetryPolicy` / `RociaDbClient::retry`, `request_timeout`, `tls_config`,
-> `http2_keep_alive`, `max_file_bytes` and `build_with_channel` are all new on
+> `http2_keep_alive`, `max_file_bytes`, `build_with_channel` and the
+> `FileMetadata` / `FileTimestamp` pair `stat_file` now returns are all new on
 > the Rust side in 2.0. Whether the TypeScript package has equivalents has
 > **not** been checked from this repository. Confirm each against
 > `rociadb-core-sdk-ts`, then fold the ones that match into the table below
@@ -28,8 +29,9 @@ other.**
 > matched, and belong in the table below once confirmed:
 > `download_file_verified_to` takes a `tokio::io::AsyncWrite`, where the
 > TypeScript equivalent of "verify without buffering" would be a
-> `WritableStream` or a `Writable`; and none of the 23 RPCs changed, so the
-> count above still holds.
+> `WritableStream` or a `Writable`; and `stat_file`'s two timestamps are a
+> `FileTimestamp` rather than a `string` or a `Date` (the row below). None of the
+> 23 RPCs changed, so the count above still holds.
 
 Neither SDK imitates the other's syntax — this crate stays
 snake_case/`Result`-idiomatic Rust, the TypeScript package stays
@@ -60,7 +62,8 @@ name nor a gap in major version is a signal of a capability difference.
 | Lazy token invalidation at the level of the background refresh task itself (not the `RociaDbClient`-level wrapper, which *does* translate mechanically: `invalidate_auth_token` ↔ `invalidateToken`) | `TokenManager::request_refresh` | `TokenManager.invalidate()` | Different verb chosen independently on each side for the same "mark it stale, wake the background task, do not block" idea. |
 | Standalone OAuth2 token fetch, usable outside of `TokenManager` | `auth::fetch_token` | `fetchOAuthToken` (exported from `auth.ts`, re-exported at the package root) | TypeScript needed a name that does not collide with the `fetch` Web API it wraps; Rust has no such collision. |
 | Discriminating why an `Err` happened | `RociaDbError` — a `match`-able `#[non_exhaustive]` enum: `Status { .. }` / `Config { .. }` / `Connection { .. }` / `Auth { .. }` / `Encode { .. }` / `Decode { .. }` / `Io { .. }` / `Validation(String)` / `ChecksumMismatch { .. }` / `SizeMismatch { .. }` | `RociaDbError.kind: RociaDbErrorKind`, one class with a `"status" \| "connection" \| "auth" \| "encode" \| "decode" \| "validation"` field | Different shape, not just a different name — see below. The Rust enum also carries four causes the TypeScript union above does not name, all added in 2.0. |
-| Escape hatch to the raw generated protobuf/gRPC types, to build a custom client against the same `.proto` | **none** — the generated module is private (`pub(crate) mod pb`). The generated types that reach a public signature are re-exported at the crate root instead: `CollectionInfo`, `StatResponse`, `Neighbor`, `UploadRequest`, `DownloadResponse`, and `Streaming` | the `rocia-db-sdk/proto` subpath export | **A real capability gap, not a naming difference.** TypeScript lets a caller reach every generated type; Rust deliberately does not, because the crate's public surface is under semantic versioning from 2.0.0 onward and generated code is reshaped by any prost or tonic upgrade. Reopen this if a Rust consumer needs it — it would be an addition, not a removal. |
+| Escape hatch to the raw generated protobuf/gRPC types, to build a custom client against the same `.proto` | **none** — the generated module is private (`pub(crate) mod pb`). The generated types that reach a public signature are re-exported at the crate root instead: `CollectionInfo`, `Neighbor`, `UploadRequest`, `DownloadResponse`, and `Streaming` | the `rocia-db-sdk/proto` subpath export | **A real capability gap, not a naming difference.** TypeScript lets a caller reach every generated type; Rust deliberately does not, because the crate's public surface is under semantic versioning from 2.0.0 onward and generated code is reshaped by any prost or tonic upgrade. Reopen this if a Rust consumer needs it — it would be an addition, not a removal. |
+| File metadata, and the two timestamps on it | `stat_file -> FileMetadata`, an SDK-owned struct whose `created_at` / `updated_at` are `FileTimestamp`: the server's raw string, with `system_time()` / `unix_nanos()` parsing RFC 3339 on demand | **not checked from this repository** | **A shape difference, and an unconfirmed one.** Rust 2.0 stopped handing back the generated `Stat` response message — it is no longer re-exported at the crate root — so that the two timestamps could be a type rather than a bare `string`, and so that a server whose format the SDK cannot read costs a caller one accessor instead of the whole call. The wire is unchanged: both fields are still `string`. A TypeScript equivalent would most likely be a `Date`-or-`string` pair, since `new Date(..)` reads RFC 3339 natively and yields `Invalid Date` instead of throwing — but what the package does today has **not** been checked from here. Confirm it before folding this row into the parity claim. |
 
 ## The error-kind trap, spelled out
 

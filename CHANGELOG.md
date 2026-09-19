@@ -50,6 +50,7 @@ the 1.0 names are gone, and the table below maps every one of them.
   | `upload_file_owned(t, b, f, bytes: Vec<u8>, opts)` | `upload_file(t, b, f, bytes, opts)` (a `Vec<u8>` still moves without a copy) |
   | `upload_file_chunked(t, b, f, size_bytes, checksum, chunks, opts)` | `upload_file_chunked(t, b, f, chunks, FileStreamUploadOptions::new(size_bytes, checksum))` |
   | `upload_file_chunked` with `chunks: Stream<Item = Vec<u8>>` | `chunks: Stream<Item = std::io::Result<bytes::Bytes>>` — pass a `tokio_util::io::ReaderStream` straight in, or wrap each piece as `Ok(Bytes::from(piece))` |
+  | `stat_file(t, b, f) -> StatResponse` | `stat_file(t, b, f) -> FileMetadata` — the three data fields keep their names and types; `created_at` / `updated_at` are now `FileTimestamp`, whose `as_str()` is the string 1.0 handed over |
   | `delete_file(t, b, f)` | `delete_file(t, b, f, WriteOptions::new())` |
   | `delete_file_with_request_id(t, b, f, rid)` | `delete_file(t, b, f, WriteOptions::new().with_request_id(rid))` |
   | `FileUploadOptions { checksum: Option<Vec<u8>>, .. }` | `FileUploadOptions::new().with_checksum([u8; 32])` |
@@ -97,6 +98,27 @@ the 1.0 names are gone, and the table below maps every one of them.
   SHA-256 digest is still computed for you when `FileUploadOptions::checksum`
   is `None`. Callers holding a `Vec<u8>` convert with
   `<[u8; 32]>::try_from(v.as_slice())`.
+- **`stat_file` returns the SDK's own `FileMetadata`, and `StatResponse` is no
+  longer re-exported.** The three data fields are unchanged in name and type
+  (`size_bytes: u64`, `content_type: String`, `checksum: Vec<u8>`), so only code
+  that *named* the response type, or that read the timestamps as strings, has to
+  change:
+
+  | 1.0 | 2.0 |
+  | --- | --- |
+  | `let stat: StatResponse = client.stat_file(..).await?;` | `let metadata: FileMetadata = client.stat_file(..).await?;` |
+  | `stat.created_at` (a `String`) | `metadata.created_at.as_str()`, or `metadata.created_at` wherever a `Display` will do |
+  | parse `stat.updated_at` yourself | `metadata.updated_at.system_time()?` — see the Added section |
+
+  The reason for the change is the timestamps. Both are `string` on the wire and
+  **nothing in the `.proto` states their format**, so the SDK cannot offer a
+  parsed type without betting every `stat_file` call on a guess about the server.
+  An SDK-owned struct lets them be a type that keeps the raw string and parses
+  only when asked, which costs a caller one accessor — not the call — when the
+  server formats them some other way. The generated types re-exported at the
+  crate root are down to four (`CollectionInfo`, `Neighbor`, `UploadRequest`,
+  `DownloadResponse`), and the English documentation the build script used to
+  attach to `StatResponse` and its fields now lives on `FileMetadata`.
 - **`add_edge` now defaults its `request_id` to `add_edge:<uuid>`** instead
   of a bare UUID with no prefix — on the single-item and batch paths alike.
   It was the only write whose generated key carried no operation prefix. A
@@ -245,6 +267,39 @@ the 1.0 names are gone, and the table below maps every one of them.
   writer that refuses a chunk, or fails the final flush, surfaces as
   `RociaDbError::Io` with `context: "writing the downloaded file"`. What a match
   proves is exactly what `download_file_verified` proves, and no more.
+- `FileMetadata`, the type `stat_file` now returns: `#[non_exhaustive]`,
+  `Debug + Clone + PartialEq + Eq`, with `size_bytes`, `content_type`,
+  `checksum`, `created_at` and `updated_at` all `pub` for reading. No
+  constructor and no setters — it is a value the server produced, not a request
+  a caller builds.
+- `FileTimestamp`, the type of `FileMetadata::created_at` and
+  `FileMetadata::updated_at`: `#[non_exhaustive]`,
+  `Debug + Clone + PartialEq + Eq`, wrapping the raw string the server sent.
+  - `as_str()` and `Display` hand that string back verbatim, whatever it is.
+  - `system_time()` parses it into a `std::time::SystemTime`, and `unix_nanos()`
+    into an `i128` of nanoseconds since the epoch. Both parse on every call
+    (nothing is cached) and both run one parser, so they accept and reject
+    exactly the same strings. `chrono::DateTime<Utc>` and `time::OffsetDateTime`
+    each implement `From<SystemTime>`, so either is one hop away; this crate
+    depends on neither, and the parser is hand-written with no new dependency.
+  - The format is **RFC 3339** — a four-digit date, a `T` (either case) or a
+    single space, a 24-hour time, optional fractional seconds of any length (the
+    first nine kept, the rest truncated rather than rounded), and a `Z`, `z` or
+    `±hh:mm` offset — with every field range-checked against the proleptic
+    Gregorian calendar. Anything else is rejected, **a missing offset included**.
+    RFC 3339 is what the SDK assumes because it is the conventional wire form
+    for an instant carried as a string, not because the schema says so: a server
+    writing another format still exposes it through `as_str()`, and only these
+    two methods stop working.
+  - A failure is `RociaDbError::Decode` with `context` `"file timestamp"`,
+    quoting the offending value (bounded in length) and saying what is wrong
+    with it. It is raised by the accessor rather than by `stat_file`, so an
+    unreadable timestamp never fails a call or hides the rest of the response.
+  - Two decisions worth knowing: a **leap second** (`:60`, which RFC 3339
+    allows) is rejected, because Unix time has no separate instant to map one to
+    and moving it by a second silently would be worse; and an instant **before
+    1970** is supported, as `UNIX_EPOCH - Duration` from `system_time()` and as a
+    negative number from `unix_nanos()`.
 - `RociaDbError::Io { context: &'static str, source: std::io::Error }`, for an
   I/O handle the caller supplied, raised by two calls that its `context` tells
   apart. `"the upload chunk stream"` is `upload_file_chunked` when its `chunks`
@@ -324,10 +379,10 @@ the 1.0 names are gone, and the table below maps every one of them.
   plus the variants of `DocumentQueryOperator` and
   `DocumentQuerySortDirection`.
 - English documentation on the generated types re-exported at the crate root
-  (`CollectionInfo`, `StatResponse`, `Neighbor`, `UploadRequest`,
-  `DownloadResponse`) and on each of their fields, describing the wire
-  semantics. It is attached by the build script, so it is regenerated with
-  the code rather than drifting from it.
+  (`CollectionInfo`, `Neighbor`, `UploadRequest`, `DownloadResponse`) and on each
+  of their fields, describing the wire semantics. It is attached by the build
+  script, so it is regenerated with the code rather than drifting from it. The
+  file metadata's own documentation moved to `FileMetadata` with the type.
 - A `docs/` directory of guides — authentication, errors and retries,
   documents, graph, files, pagination, tenancy and authorization, transport
   and TLS, and parity with the TypeScript SDK — carrying the reference

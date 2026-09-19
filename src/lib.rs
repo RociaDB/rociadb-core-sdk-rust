@@ -165,8 +165,9 @@
 //!   `total_count` costs.
 //! - `docs/graph.md` — nodes, edges, the `(from, label, to)` uniqueness
 //!   rule, batches, and neighbor traversal.
-//! - `docs/files.md` — the upload wire contract, the three upload tiers, and
-//!   verified downloads.
+//! - `docs/files.md` — the upload wire contract, the three upload tiers,
+//!   verified downloads, and the metadata [`stat_file`](RociaDbClient::stat_file)
+//!   reports — including what its two [`FileTimestamp`]s do and do not promise.
 //! - `docs/pagination.md` — limits, cursors, and the one correct stop
 //!   condition.
 //! - `docs/tenancy.md` — what `tenant_id` is and is not, the token scopes,
@@ -198,11 +199,14 @@
 //! the `.proto` files by prost and tonic, and is not covered by that
 //! promise. A routine prost or tonic upgrade can reshape those generated
 //! types without
-//! this SDK's own API changing. Five of them — [`CollectionInfo`],
-//! [`StatResponse`], [`Neighbor`], [`UploadRequest`] and
-//! [`DownloadResponse`] — appear in public signatures and are re-exported at
-//! the crate root for that reason; depend on the re-exports: the `pb` module
-//! itself is private.
+//! this SDK's own API changing. Four of them — [`CollectionInfo`],
+//! [`Neighbor`], [`UploadRequest`] and [`DownloadResponse`] — appear in public
+//! signatures and are re-exported at the crate root for that reason; depend on
+//! the re-exports: the `pb` module itself is private. Everything else the API
+//! hands back is a type this crate owns, including the [`FileMetadata`] that
+//! [`stat_file`](RociaDbClient::stat_file) returns — which is what lets its
+//! timestamps be [`FileTimestamp`]s rather than the bare strings the wire
+//! carries.
 //!
 //! The same caveat covers the five types re-exported straight from another
 //! crate so that configuring this one needs no extra direct dependency:
@@ -281,16 +285,14 @@ pub use document::{
     DocumentQuerySortDirection, DocumentWriteOptions, NodeBinding,
 };
 pub use error::{Result, RociaDbError};
-pub use file::{FileStreamUploadOptions, FileUploadOptions};
+pub use file::{FileMetadata, FileStreamUploadOptions, FileTimestamp, FileUploadOptions};
 pub use graph::{Edge, EdgeInput, NeighborNode, NodeInput};
 /// Generated protobuf types that appear directly in a public method signature,
 /// re-exported here so callers can name them without depending on the crate's
 /// private `pb` module. The stability caveat in the crate documentation applies
 /// to them: a prost or tonic upgrade can reshape these types without the SDK's
 /// own API changing.
-pub use pb::upstream::v1::{
-    CollectionInfo, DownloadResponse, Neighbor, StatResponse, UploadRequest,
-};
+pub use pb::upstream::v1::{CollectionInfo, DownloadResponse, Neighbor, UploadRequest};
 pub use retry::RetryPolicy;
 /// Re-exported so callers can hold the OAuth2 client secret, and read the
 /// tokens this crate hands back, in a type that redacts itself in `Debug`
