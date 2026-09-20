@@ -113,6 +113,11 @@ const MAX_UPLOAD_CHUNK: usize = 1024 * 1024;
 /// against a server that echoed 1 MiB and fail in production.
 const DOWNLOAD_CHUNK: usize = 64 * 1024 + 7;
 
+/// Largest message the fake server will decode, well above tonic's own 4 MiB
+/// default so that the harness never becomes the ceiling a test trips over —
+/// see where the services are registered for why that matters.
+const HARNESS_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Length of the SHA-256 digest the upload RPC requires — and, like the real
 /// server, the only thing it checks about it.
 const CHECKSUM_LEN: usize = 32;
@@ -288,11 +293,29 @@ impl FakeServer {
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let mut builder = Server::builder();
+        // The server decodes up to `HARNESS_MAX_MESSAGE_BYTES` rather than
+        // tonic's own 4 MiB default, so the harness is never the thing that caps
+        // a test. A test about the *client's* decode ceiling has to be able to
+        // put a message larger than that ceiling into the store first, and with
+        // the default here it could not: the server would refuse the write
+        // before the client's own limit ever came into play.
         let router = builder
-            .add_service(DocumentServiceServer::new(service.clone()))
-            .add_service(GraphServiceServer::new(service.clone()))
-            .add_service(FileServiceServer::new(service.clone()))
-            .add_service(TenantServiceServer::new(service));
+            .add_service(
+                DocumentServiceServer::new(service.clone())
+                    .max_decoding_message_size(HARNESS_MAX_MESSAGE_BYTES),
+            )
+            .add_service(
+                GraphServiceServer::new(service.clone())
+                    .max_decoding_message_size(HARNESS_MAX_MESSAGE_BYTES),
+            )
+            .add_service(
+                FileServiceServer::new(service.clone())
+                    .max_decoding_message_size(HARNESS_MAX_MESSAGE_BYTES),
+            )
+            .add_service(
+                TenantServiceServer::new(service)
+                    .max_decoding_message_size(HARNESS_MAX_MESSAGE_BYTES),
+            );
         let task = tokio::spawn(async move {
             let _ = router
                 .serve_with_incoming_shutdown(incoming, async {
@@ -471,8 +494,13 @@ impl FakeServer {
         self.lock().non_rfc3339_timestamps = true;
     }
 
-    /// Hand over `chunks` chunks of a `Download` and then fail the stream with
-    /// `code`.
+    /// Make **the next** `Download` hand over `chunks` chunks and then fail the
+    /// stream with `code`.
+    ///
+    /// One-shot, like [`FakeServer::fail_upload_before_reading`] and unlike
+    /// [`FakeServer::fail_next`], which takes a count: the script is consumed by
+    /// the first `Download` that reaches it, so a test wanting two torn
+    /// transfers has to arm it twice.
     ///
     /// The one failure shape `fail_next` cannot script: it rejects a call
     /// before it starts, which for a server-streaming RPC means the opening

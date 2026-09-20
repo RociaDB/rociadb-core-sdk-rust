@@ -13,8 +13,82 @@ use rociadb_sdk::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use support::FakeServer;
+use tonic::Code;
 
 const TENANT: &str = "tenant-1";
+
+/// A document whose encoded response clears tonic's 4 MiB receive default with
+/// room to spare, for the two tests of `max_decoding_message_size`.
+const OVERSIZED_DOCUMENT_BYTES: usize = 5 * 1024 * 1024;
+
+/// Left unset, tonic caps a decoded message at 4 MiB — a ceiling this SDK does
+/// not choose and, until `max_decoding_message_size` existed, could not lift.
+/// One document over that size was simply unreadable, with no recourse.
+///
+/// The harness raises the *server's* limit, so the only ceiling in play here is
+/// the client's own.
+#[tokio::test]
+async fn a_document_over_four_mebibytes_is_unreadable_at_the_default_decode_limit() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let document = json!({ "blob": "x".repeat(OVERSIZED_DOCUMENT_BYTES) });
+    client
+        .put_document(
+            TENANT,
+            "blobs",
+            "big",
+            &document,
+            DocumentWriteOptions::new(),
+        )
+        .await
+        .expect("writing it is fine: the send side has no such ceiling");
+
+    let error = client
+        .get_document::<Value>(TENANT, "blobs", "big")
+        .await
+        .expect_err("the response exceeds the default 4 MiB decode ceiling");
+
+    assert_eq!(
+        error.code(),
+        Some(Code::OutOfRange),
+        "tonic reports an over-long message as OUT_OF_RANGE, got: {error}"
+    );
+}
+
+/// The other half, and the one that proves the setter reaches the generated
+/// clients rather than merely being stored on the builder: the same read, on a
+/// client whose ceiling was raised, returns the document whole.
+///
+/// Built with `build_with_channel`, which is also the claim in the setter's own
+/// documentation — the limit lives on the generated clients, not on the
+/// `Channel`, so supplying a channel neither sets it nor overrides it.
+#[tokio::test]
+async fn raising_the_decode_limit_makes_the_same_document_readable() {
+    let server = FakeServer::start().await;
+    let client = server
+        .builder()
+        .max_decoding_message_size(16 * 1024 * 1024)
+        .build_with_channel(server.channel())
+        .await
+        .expect("building a client with a raised decode ceiling must succeed");
+    let document = json!({ "blob": "x".repeat(OVERSIZED_DOCUMENT_BYTES) });
+    client
+        .put_document(
+            TENANT,
+            "blobs",
+            "big",
+            &document,
+            DocumentWriteOptions::new(),
+        )
+        .await
+        .expect("the write must succeed");
+
+    let read: Value = client
+        .get_document(TENANT, "blobs", "big")
+        .await
+        .expect("a raised ceiling must let the oversized document through");
+    assert_eq!(read, document, "the document must round-trip byte for byte");
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Product {

@@ -1634,6 +1634,14 @@ const INLINE_CHECKSUM_LIMIT: usize = DEFAULT_CHUNK_SIZE;
 /// has no way to panic — and hashing inline is a better answer to that than a
 /// new error variant for something the caller cannot act on: the work is pure,
 /// short-lived and idempotent, so repeating it costs only the time it takes.
+///
+/// One consequence worth knowing: a blocking task cannot be cancelled. Dropping
+/// the [`RociaDbClient::upload_file`] future mid-hash — a `tokio::time::timeout`
+/// firing, say — leaves the digest running to completion on a pool thread,
+/// holding its `Arc` on the buffer until it finishes. Not a regression, since
+/// the inline version ran to completion inside a single poll and could not be
+/// cancelled either; the difference is only that the thread is now someone
+/// else's to wait for.
 async fn resolve_checksum_offloaded(checksum: Option<[u8; 32]>, bytes: &Arc<Vec<u8>>) -> [u8; 32] {
     if let Some(checksum) = checksum {
         return checksum;

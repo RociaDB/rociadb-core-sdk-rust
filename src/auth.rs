@@ -515,6 +515,12 @@ impl TokenManager {
     /// (as [`crate::RociaDbClient`]'s streaming calls do) may ignore the
     /// error.
     ///
+    /// That includes a failure this caller did not itself run into: coalescing
+    /// shares the outcome of the contemporaneous attempt, error included, so
+    /// this can return `Auth` without having made a request. See
+    /// [`TokenManager::refresh_now`] for why inheriting the error beats both
+    /// repeating the request and reporting a success that did not happen.
+    ///
     /// `margin` only has to cover the moment the call *starts*: a gRPC server
     /// validates the bearer token once, when it accepts the call, so a stream
     /// that outlives its token keeps running. A few seconds is therefore

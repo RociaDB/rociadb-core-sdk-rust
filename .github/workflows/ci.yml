@@ -1,18 +1,32 @@
 name: CI
 
+# Scoping `push` to `main` is what actually stops every pull-request push from
+# running the whole matrix twice. An unscoped `push` alongside `pull_request`
+# fires both, and `concurrency` cannot merge them: its group key includes
+# `github.ref`, which is `refs/heads/<branch>` for the push and
+# `refs/pull/<n>/merge` for the pull request, so the two land in different groups
+# and neither cancels the other. The trade is that a branch with no pull request
+# open gets no CI — acceptable here, because AGENTS.md already makes running the
+# six commands locally the gate before submitting, and the first thing opening a
+# pull request does is run them all.
+#
+# The tag pushed at release step 5 needs no trigger of its own: it names the
+# merge commit on `main`, which this already covers.
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
-# A PR push fires both `push` and `pull_request`, and a second push supersedes
-# the first. Without this, six jobs became twelve per push and every obsolete
-# run kept its slot.
+# Cancel superseded runs on a pull request, where only the newest commit matters
+# — but never on `main`. Release step 5 tags a merge commit, and a run cancelled
+# by the next push is not a run that passed, so the one commit whose green CI is
+# load-bearing is the one commit that must never lose it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
