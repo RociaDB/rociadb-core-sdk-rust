@@ -39,7 +39,17 @@ no `npm` commands apply to this repo.
 
 Run all six before submitting changes; `.github/workflows/ci.yml` runs the same
 set plus an MSRV check (`cargo check --lib --all-features --locked` on Rust
-1.88, which must match `rust-version` in `Cargo.toml`).
+1.88, which must match `rust-version` in `Cargo.toml`) and a package-contents
+check that asserts release step 4 below without waiting for a release.
+
+Every job runs on a GitHub-hosted runner. This repository is public and accepts
+forks, so `pull_request` builds a fork's own workflow code, and both `build.rs`
+and `cargo test` execute repository code by design — on a persistent
+self-hosted runner that is arbitrary code execution on the organisation's
+hardware, with a filesystem and a build cache that outlive the job. Nothing in
+this crate needs a self-hosted runner: `protox` makes a bare Rust toolchain the
+whole requirement. Do not move CI back onto one without making the runners
+ephemeral and requiring approval for every outside contributor.
 
 **No system dependency is needed to build.** `build.rs` compiles
 `proto/upstream/v1/upstream.proto` with `protox`, a pure-Rust protobuf

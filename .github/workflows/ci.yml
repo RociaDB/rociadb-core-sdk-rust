@@ -7,6 +7,13 @@ on:
 permissions:
   contents: read
 
+# A PR push fires both `push` and `pull_request`, and a second push supersedes
+# the first. Without this, six jobs became twelve per push and every obsolete
+# run kept its slot.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -14,14 +21,27 @@ env:
 # script compiles the `.proto` with `protox`, a pure-Rust compiler, so a bare
 # Rust toolchain is all any job needs.
 #
-# Every job runs on the organisation's self-hosted runner carrying the `rust`
-# label. That runner ships a rustup-managed Rust toolchain, which is what
-# `dtolnay/rust-toolchain` relies on to select or install the exact toolchain
-# each job asks for.
+# That is also why every job runs on a GitHub-hosted runner rather than the
+# organisation's self-hosted one. This repository is public and accepts forks,
+# so `pull_request` runs a fork's own workflow code — and `build.rs` and
+# `cargo test` execute repository code by design. On a persistent self-hosted
+# runner that is arbitrary code execution on the organisation's hardware, with a
+# filesystem and a `rust-cache` that outlive the job and can be poisoned for the
+# runs that follow, including the `msrv` job that validates `Cargo.lock`.
+# GitHub's own guidance is to use self-hosted runners only with private
+# repositories, for exactly this reason. Nothing here needs that runner: a bare
+# toolchain is the whole requirement, so the ephemeral hosted ones cost nothing
+# and close the hole. Do not move these jobs back without either making the
+# runners ephemeral or requiring approval for every outside contributor.
+#
+# `timeout-minutes` on every job because a hung job otherwise holds its slot for
+# GitHub's six-hour default. The values are generous multiples of the real
+# runtimes, so they catch a hang without failing a slow cache miss.
 jobs:
   fmt:
     name: Format
-    runs-on: [self-hosted, rust]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -31,7 +51,8 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: [self-hosted, rust]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,7 +63,8 @@ jobs:
 
   test:
     name: Test
-    runs-on: [self-hosted, rust]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -51,7 +73,8 @@ jobs:
 
   docs:
     name: Docs
-    runs-on: [self-hosted, rust]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -62,7 +85,8 @@ jobs:
 
   msrv:
     name: MSRV 1.88
-    runs-on: [self-hosted, rust]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       # Must match `rust-version` in Cargo.toml. `--locked` is what makes this
@@ -74,9 +98,62 @@ jobs:
 
   deny:
     name: cargo-deny
-    runs-on: [self-hosted, rust]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  package:
+    name: Package contents
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Step 4 of the release checklist in AGENTS.md, which nothing verified
+      # until a release was already under way — the worst moment to discover
+      # that `exclude` in Cargo.toml has drifted. It is a deny-list, so a new
+      # top-level file ships by default, and `docs/` going missing would break
+      # `cargo test` on an unpacked `.crate`, since `src/lib.rs` `include_str!`s
+      # those guides as doctests.
+      - name: Check the published file list
+        run: |
+          set -euo pipefail
+          packaged="$RUNNER_TEMP/packaged.txt"
+          cargo package --list --allow-dirty > "$packaged"
+          for required in \
+            Cargo.toml \
+            README.md \
+            CHANGELOG.md \
+            LICENSE \
+            build.rs \
+            proto/upstream/v1/upstream.proto \
+            docs/authentication.md \
+            docs/documents.md \
+            docs/errors-and-retries.md \
+            docs/files.md \
+            docs/graph.md \
+            docs/pagination.md \
+            docs/tenancy.md \
+            docs/transport.md \
+            docs/typescript-parity.md
+          do
+            grep -qxF "$required" "$packaged" \
+              || { echo "missing from the package: $required"; exit 1; }
+          done
+          for excluded in AGENTS.md deny.toml mise.toml; do
+            if grep -qxF "$excluded" "$packaged"; then
+              echo "must not be published: $excluded"
+              exit 1
+            fi
+          done
+          if grep -q '^\.github/' "$packaged"; then
+            echo "must not be published: .github/"
+            exit 1
+          fi
+          echo "package contents look right:"
+          cat "$packaged"
