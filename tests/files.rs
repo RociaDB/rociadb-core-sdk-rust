@@ -552,6 +552,50 @@ async fn upload_file_chunked_surfaces_a_server_that_refuses_before_reading() {
     );
 }
 
+/// The `request_id` contract on the upload path, which is the one that carries
+/// real weight: `upload_file` replays its own request under the *same* key after
+/// an `UNAUTHENTICATED`, and `RetryPolicy`'s documentation tells callers to reuse
+/// the key on a retried write for exactly this reason. An upload is also the
+/// write where re-applying would cost the most — publishing replaces whatever
+/// that `file_id` held.
+///
+/// Absorbed rather than overwritten: the replay carries different bytes, so the
+/// first upload's content surviving is what proves the second never ran.
+#[tokio::test]
+async fn a_replayed_upload_request_id_is_absorbed_rather_than_republished() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let first = payload(2048);
+    let second = payload(4096);
+
+    for bytes in [&first, &second] {
+        client
+            .upload_file(
+                TENANT,
+                BUCKET,
+                "written-once.bin",
+                bytes.clone(),
+                FileUploadOptions::new().with_request_id("upload-once"),
+            )
+            .await
+            .expect("a replay is absorbed and answered Ok, not rejected");
+    }
+
+    assert_eq!(
+        server
+            .stored_file(TENANT, BUCKET, "written-once.bin")
+            .expect("the file must exist")
+            .bytes,
+        first,
+        "the absorbed replay must not have replaced the published file"
+    );
+    assert_eq!(
+        server.call_count("Upload"),
+        2,
+        "both uploads reach the server — absorption happens there"
+    );
+}
+
 /// An over-declared upload must publish nothing, and the size class where that
 /// used to fail is the one an exact chunk multiple produces: the chunk that
 /// completed `size_bytes` was legal on its own, went out, and gave the server a

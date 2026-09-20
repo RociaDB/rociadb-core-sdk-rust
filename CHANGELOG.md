@@ -531,8 +531,10 @@ the 1.0 names are gone, and the table below maps every one of them.
   since publishing replaces whatever that `file_id` held; and on a server that
   deduplicates by `request_id` as the wire contract describes, a corrected retry
   reusing that key would be absorbed rather than replacing it. That second part
-  is reasoning about the real server — the test harness models no deduplication,
-  so nothing here verifies it. The check now covers buffered and pending bytes too, and the chunk
+  is reasoning about the real server: the test harness models that contract, so
+  the SDK's behaviour under a deduplicating server is covered, but whether a
+  given deployment matches the contract is that deployment's claim, not something
+  this crate can verify. The check now covers buffered and pending bytes too, and the chunk
   that completes the total waits until the source confirms it has nothing more.
 - **The "source failed after its last byte" exception now holds at every size,
   except for a zero-byte upload.** A `size_bytes` of zero satisfies "every

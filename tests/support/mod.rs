@@ -20,10 +20,24 @@
 //! listings, the `(from, label, to)` edge uniqueness rule, idempotent
 //! deletes, the 1 MiB upload chunk cap, a 32-byte checksum length check that
 //! never looks at the bytes, `created_at` / `updated_at` as RFC 3339 instants
-//! that a replacement upload moves forward, and the `reason` trailing metadata
-//! the real server attaches to every error. It is not a RocksDB or a TiKV: no
+//! that a replacement upload moves forward, the `reason` trailing metadata
+//! the real server attaches to every error, and `request_id` deduplication
+//! across all seven write RPCs. It is not a RocksDB or a TiKV: no
 //! transactions, no indexes, no garbage collection, and nothing here proves
 //! anything about the real server's behaviour — only about the client's.
+//!
+//! Deduplication is keyed on `(request_id, operation, target)`, exactly as the
+//! proto and `UploadRequest.request_id`'s generated documentation state it —
+//! keying on the id alone would make this fake absorb writes a real server
+//! applies, which is the more dangerous direction to be wrong in: a test would
+//! pass while the SDK shipped a bug. The marker is written *after* the store
+//! write, so a call the server rejected burns no key and a corrected retry under
+//! it is applied. Two limits: the markers never expire, where the real server
+//! drops them after `gc.request_ttl_secs` (24 hours by default), and only a
+//! *sequential* replay is modelled, which is all the contract describes — two
+//! concurrent calls carrying one key race for the store under the same `Mutex`
+//! and neither is absorbed, since the marker lands only once the first
+//! completes.
 //!
 //! The clock is where it is deliberately *less* real than it could be: a fixed
 //! base plus one second per write, so a timestamp does not depend on when the
@@ -213,6 +227,46 @@ pub struct StoredFile {
     pub updated_at: String,
 }
 
+/// One applied write's idempotency marker, keyed exactly as the wire contract
+/// describes: the `request_id`, the operation, **and** the target.
+///
+/// All three, because the scope includes the target — the proto and
+/// `UploadRequest.request_id`'s generated documentation both say reusing one key
+/// across two documents, edges or files performs both writes. Keying on the id
+/// alone would make the harness absorb writes a real server applies, which is
+/// the more dangerous direction for a fake to be wrong in: a test would pass
+/// while the SDK shipped a bug.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RequestMarker {
+    request_id: String,
+    operation: &'static str,
+    target: (String, String, String),
+}
+
+/// The marker for one write, or `None` when the call carried no `request_id`.
+///
+/// An empty key is not a key: the field is `optional` on the wire and a caller
+/// using `upload_file_stream` builds its own `UploadRequest`, so it can leave it
+/// unset. Those calls are never deduplicated.
+fn request_marker(
+    request_id: &str,
+    operation: &'static str,
+    target: (&str, &str, &str),
+) -> Option<RequestMarker> {
+    if request_id.is_empty() {
+        return None;
+    }
+    Some(RequestMarker {
+        request_id: request_id.to_string(),
+        operation,
+        target: (
+            target.0.to_string(),
+            target.1.to_string(),
+            target.2.to_string(),
+        ),
+    })
+}
+
 #[derive(Debug, Default)]
 struct State {
     /// `(tenant, collection) -> id -> json`.
@@ -225,6 +279,14 @@ struct State {
     files: BTreeMap<(String, String), BTreeMap<String, StoredFile>>,
     /// Registered by every write, like the real server's tenant registry.
     tenants: BTreeSet<String>,
+    /// Idempotency markers for the writes that have actually landed, so a
+    /// sequential replay of one is absorbed instead of applied twice.
+    ///
+    /// Written *after* the store write, never before, because the contract puts
+    /// registration after it too: a call rejected before storage is reached — a
+    /// scripted failure, an `AddEdge` to a missing node — leaves no marker, so a
+    /// corrected retry with the same key is applied rather than absorbed.
+    applied_requests: BTreeSet<RequestMarker>,
     /// Scripted failures, oldest first, per RPC.
     failures: HashMap<String, VecDeque<Code>>,
     /// Bearer tokens the server accepts, or `None` for "any, including none at
@@ -727,6 +789,22 @@ impl FakeService {
 }
 
 impl State {
+    /// `true` when this exact `(request_id, operation, target)` has already been
+    /// applied, so the server absorbs the call and answers `Ok` without
+    /// touching the store.
+    fn absorbs_replay(&self, marker: &Option<RequestMarker>) -> bool {
+        marker
+            .as_ref()
+            .is_some_and(|marker| self.applied_requests.contains(marker))
+    }
+
+    /// Record that a write landed, so a later replay of it is absorbed.
+    fn mark_applied(&mut self, marker: Option<RequestMarker>) {
+        if let Some(marker) = marker {
+            self.applied_requests.insert(marker);
+        }
+    }
+
     /// Register a tenant, the way every write on the real server does.
     fn register(&mut self, tenant_id: &str) {
         self.tenants.insert(tenant_id.to_string());
@@ -904,13 +982,22 @@ impl DocumentService for FakeService {
     async fn put_doc(&self, request: Request<pb::PutDocRequest>) -> Result<Response<()>, Status> {
         self.enter_unary("PutDoc", &request).await?;
         let request = request.into_inner();
+        let marker = request_marker(
+            &request.request_id,
+            "PutDoc",
+            (&request.tenant_id, &request.collection, &request.id),
+        );
         let mut state = self.lock();
+        if state.absorbs_replay(&marker) {
+            return Ok(Response::new(()));
+        }
         state.register(&request.tenant_id);
         state
             .documents
             .entry((request.tenant_id, request.collection))
             .or_default()
             .insert(request.id, request.json);
+        state.mark_applied(marker);
         Ok(Response::new(()))
     }
 
@@ -936,7 +1023,15 @@ impl DocumentService for FakeService {
     ) -> Result<Response<()>, Status> {
         self.enter_unary("DeleteDoc", &request).await?;
         let request = request.into_inner();
+        let marker = request_marker(
+            &request.request_id,
+            "DeleteDoc",
+            (&request.tenant_id, &request.collection, &request.id),
+        );
         let mut state = self.lock();
+        if state.absorbs_replay(&marker) {
+            return Ok(Response::new(()));
+        }
         state.register(&request.tenant_id);
         // Idempotent: deleting something absent is not an error.
         if let Some(collection) = state
@@ -945,6 +1040,7 @@ impl DocumentService for FakeService {
         {
             collection.remove(&request.id);
         }
+        state.mark_applied(marker);
         Ok(Response::new(()))
     }
 
@@ -1100,13 +1196,22 @@ impl GraphService for FakeService {
     async fn put_node(&self, request: Request<pb::PutNodeRequest>) -> Result<Response<()>, Status> {
         self.enter_unary("PutNode", &request).await?;
         let request = request.into_inner();
+        let marker = request_marker(
+            &request.request_id,
+            "PutNode",
+            (&request.tenant_id, &request.graph, &request.node_id),
+        );
         let mut state = self.lock();
+        if state.absorbs_replay(&marker) {
+            return Ok(Response::new(()));
+        }
         state.register(&request.tenant_id);
         state
             .nodes
             .entry((request.tenant_id, request.graph))
             .or_default()
             .insert(request.node_id, request.json);
+        state.mark_applied(marker);
         Ok(Response::new(()))
     }
 
@@ -1129,10 +1234,19 @@ impl GraphService for FakeService {
     async fn add_edge(&self, request: Request<pb::AddEdgeRequest>) -> Result<Response<()>, Status> {
         self.enter_unary("AddEdge", &request).await?;
         let request = request.into_inner();
+        let marker = request_marker(
+            &request.request_id,
+            "AddEdge",
+            (&request.tenant_id, &request.graph, &request.edge_id),
+        );
         let mut state = self.lock();
+        if state.absorbs_replay(&marker) {
+            return Ok(Response::new(()));
+        }
         let key = (request.tenant_id.clone(), request.graph.clone());
 
-        // Both endpoints must already exist as nodes.
+        // Both endpoints must already exist as nodes. A rejection here leaves no
+        // marker, so a retry that first creates the node is applied.
         let nodes = state.nodes.get(&key);
         for endpoint in [&request.from, &request.to] {
             if !nodes.is_some_and(|nodes| nodes.contains_key(endpoint)) {
@@ -1167,6 +1281,7 @@ impl GraphService for FakeService {
                 json: request.json,
             },
         );
+        state.mark_applied(marker);
         Ok(Response::new(()))
     }
 
@@ -1197,12 +1312,21 @@ impl GraphService for FakeService {
     ) -> Result<Response<()>, Status> {
         self.enter_unary("DeleteEdge", &request).await?;
         let request = request.into_inner();
+        let marker = request_marker(
+            &request.request_id,
+            "DeleteEdge",
+            (&request.tenant_id, &request.graph, &request.edge_id),
+        );
         let mut state = self.lock();
+        if state.absorbs_replay(&marker) {
+            return Ok(Response::new(()));
+        }
         state.register(&request.tenant_id);
         // Idempotent, like every delete on this API.
         if let Some(graph) = state.edges.get_mut(&(request.tenant_id, request.graph)) {
             graph.remove(&request.edge_id);
         }
+        state.mark_applied(marker);
         Ok(Response::new(()))
     }
 
@@ -1344,6 +1468,21 @@ impl FileService for FakeService {
         recorded["chunk_sizes"] = json!(chunk_sizes);
         self.enter("Upload", &metadata, recorded).await?;
 
+        // Before the checksum and size checks, and before `tick()`: an absorbed
+        // replay performs no write, so it must not advance the store's clock or
+        // be judged on the bytes it re-sent. The stream has already been drained
+        // by then — this handler reads it all before consulting anything — where
+        // a real server is free to answer off the first message. That is a
+        // fidelity limit of the harness, not of the contract.
+        let marker = request_marker(
+            &head.request_id,
+            "Upload",
+            (&head.tenant_id, &head.bucket, &head.file_id),
+        );
+        if self.lock().absorbs_replay(&marker) {
+            return Ok(Response::new(()));
+        }
+
         // The server checks the checksum's *length* and never the digest —
         // the asymmetry `download_file_verified` exists to work around.
         if head.checksum.len() != CHECKSUM_LEN {
@@ -1382,6 +1521,7 @@ impl FileService for FakeService {
                 updated_at: now,
             },
         );
+        state.mark_applied(marker);
         Ok(Response::new(()))
     }
 
@@ -1449,12 +1589,21 @@ impl FileService for FakeService {
     async fn delete(&self, request: Request<pb::DeleteRequest>) -> Result<Response<()>, Status> {
         self.enter_unary("Delete", &request).await?;
         let request = request.into_inner();
+        let marker = request_marker(
+            &request.request_id,
+            "Delete",
+            (&request.tenant_id, &request.bucket, &request.file_id),
+        );
         let mut state = self.lock();
+        if state.absorbs_replay(&marker) {
+            return Ok(Response::new(()));
+        }
         state.register(&request.tenant_id);
         // Idempotent.
         if let Some(bucket) = state.files.get_mut(&(request.tenant_id, request.bucket)) {
             bucket.remove(&request.file_id);
         }
+        state.mark_applied(marker);
         Ok(Response::new(()))
     }
 
