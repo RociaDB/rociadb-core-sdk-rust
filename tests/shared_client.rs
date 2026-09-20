@@ -9,6 +9,9 @@
 //!
 //! Nothing here runs a request — the functions are never called. They only
 //! have to compile.
+//!
+//! One real test exists so this target does not report "0 passed" in CI output,
+//! which reads like a broken target to anyone who has not opened the file.
 
 use futures::stream;
 use rociadb_sdk::{
@@ -23,6 +26,12 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWrite;
+
+/// Everything else in this file is checked by the compiler and never run. This
+/// exists only so the target reports a pass rather than "0 passed": if it ran,
+/// the build already proved every signature below still composes.
+#[test]
+fn the_public_api_still_composes() {}
 
 /// A caller's own document type, to pin down that the generic reads decode
 /// into something other than `serde_json::Value`.

@@ -521,6 +521,24 @@ the 1.0 names are gone, and the table below maps every one of them.
 
 ### Fixed
 
+- **An over-declared `upload_file_chunked` no longer publishes a truncated
+  file.** The overshoot was measured against the single chunk about to go out
+  rather than against every declared byte in hand, so when `size_bytes` was an
+  exact multiple of 1 MiB the chunk that *completed* the declared total was legal
+  on its own, went out, and gave the server a whole stream to commit — the excess
+  was noticed only on the next iteration. The caller got a `Validation` error for
+  a file stored under their own `file_id`, truncated, which a retry reusing the
+  same `request_id` would have been absorbed as a duplicate of rather than
+  replacing. The check now covers buffered and pending bytes too, and the chunk
+  that completes the total waits until the source confirms it has nothing more.
+- **The "source failed after its last byte" exception now holds at every size.**
+  It was measured against bytes already *sent*, so it applied only at an exact
+  1 MiB multiple: at any other size the whole tail was still buffered, nothing
+  had been emitted, and the identical failure came back as `Io`.
+  `docs/errors-and-retries.md` stated the rule without that caveat, so the code
+  now matches the guide rather than the other way round. A zero-byte file whose
+  source fails follows from the same rule instead of needing an exception: every
+  byte it declared is in hand before the source is read at all.
 - **`upload_file_chunked` no longer reports a committed upload as a failure.**
   The rechunker reads one item past the declared `size_bytes`, since that is how
   it catches a source sending more than it promised — so a source that yielded

@@ -37,8 +37,10 @@ no `npm` commands apply to this repo.
 - `cargo deny check` runs the advisory, licence, ban, and source policy in
   `deny.toml`.
 
-Run all six before submitting changes; `.github/workflows/ci.yml` runs the same
-set plus an MSRV check (`cargo check --lib --all-features --locked` on Rust
+Run all six before submitting changes. `.github/workflows/ci.yml` runs five of
+them as jobs of their own — `cargo build` has none, because
+`clippy --all-targets` and `cargo test` both compile everything it would — plus
+an MSRV check (`cargo check --lib --all-features --locked` on Rust
 1.88, which must match `rust-version` in `Cargo.toml`) and a package-contents
 check that asserts release step 4 below without waiting for a release.
 

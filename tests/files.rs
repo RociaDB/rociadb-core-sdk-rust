@@ -552,6 +552,82 @@ async fn upload_file_chunked_surfaces_a_server_that_refuses_before_reading() {
     );
 }
 
+/// An over-declared upload must publish nothing, and the size class where that
+/// used to fail is the one an exact chunk multiple produces: the chunk that
+/// completed `size_bytes` was legal on its own, went out, and gave the server a
+/// whole stream to commit — so the caller got a `Validation` error for a
+/// truncated file stored under their own `file_id`. Worse than a wrong error,
+/// because a retry reusing the same `request_id` would be absorbed as a
+/// duplicate and never replace it.
+#[tokio::test]
+async fn an_over_declared_upload_at_a_chunk_multiple_stores_nothing() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    // Declares one chunk, hands over two.
+    let bytes = payload(2 * ONE_MIB);
+
+    let error = client
+        .upload_file_chunked(
+            TENANT,
+            BUCKET,
+            "over-declared.bin",
+            futures::stream::iter(vec![chunk(bytes.clone())]),
+            FileStreamUploadOptions::new(ONE_MIB as u64, sha256(&bytes[..ONE_MIB])),
+        )
+        .await
+        .expect_err("more data than declared must fail the upload");
+
+    match &error {
+        RociaDbError::Validation(message) => assert!(
+            message.contains("more data than size_bytes"),
+            "got: {message}"
+        ),
+        other => panic!("expected a Validation error, got: {other}"),
+    }
+    assert!(
+        server
+            .stored_file(TENANT, BUCKET, "over-declared.bin")
+            .is_none(),
+        "an upload the client refused must never leave a file behind"
+    );
+}
+
+/// The forgiveness of a source that fails after its last byte has to hold at
+/// every size, not only at an exact chunk multiple — a file smaller than one
+/// chunk has its whole content buffered and nothing emitted yet, and measuring
+/// against bytes already sent made the same failure fatal there.
+#[tokio::test]
+async fn a_sub_chunk_source_failing_after_its_last_byte_still_succeeds() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let bytes = payload(1500);
+
+    client
+        .upload_file_chunked(
+            TENANT,
+            BUCKET,
+            "small-then-reset.bin",
+            futures::stream::iter(vec![
+                chunk(bytes.clone()),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "the socket reset after its last data frame",
+                )),
+            ]),
+            FileStreamUploadOptions::new(bytes.len() as u64, sha256(&bytes)),
+        )
+        .await
+        .expect("every declared byte was read, so the server's Ok is the answer");
+
+    assert_eq!(
+        server
+            .stored_file(TENANT, BUCKET, "small-then-reset.bin")
+            .expect("the file must be stored")
+            .bytes,
+        bytes
+    );
+}
+
 /// The mirror image of the test above, and the case that used to be reported
 /// wrongly: a source that fails *after* its last declared byte. Every declared
 /// byte is already inside a request tonic has taken, so the server sees a

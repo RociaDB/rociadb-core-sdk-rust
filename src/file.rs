@@ -1910,6 +1910,21 @@ impl RechunkState {
         *guard = Some(error);
     }
 
+    /// Declared bytes this state is holding but has not emitted yet: whatever
+    /// is buffered toward the next chunk, plus the undrained tail of an
+    /// oversized source item.
+    ///
+    /// `buffer` alone is not that figure — it is capped at
+    /// [`DEFAULT_CHUNK_SIZE`], and anything beyond waits in `pending` — which
+    /// is exactly why an overshoot has to be measured against both. A single
+    /// source item carrying twice the declared size puts one chunk in `buffer`
+    /// and the rest in `pending`, and the chunk on its own looks perfectly
+    /// legal.
+    fn unsent_len(&self) -> u64 {
+        let pending_left = self.pending.len().saturating_sub(self.pending_offset);
+        (self.buffer.len() + pending_left) as u64
+    }
+
     /// Record the "would exceed / falls short of `size_bytes`" validation
     /// error into `error_slot`, so [`RociaDbClient::upload_file_chunked`]
     /// can surface it after the stream this state drives has ended.
@@ -2076,18 +2091,37 @@ where
 
     stream::unfold(state, |mut state| async move {
         loop {
-            if state.buffer.len() >= DEFAULT_CHUNK_SIZE {
-                let piece_len = DEFAULT_CHUNK_SIZE as u64;
-                if state.total_written + piece_len > state.size_bytes {
-                    state.record_size_error(format!(
-                        "upload_file_chunked received more data than size_bytes \
-                         ({} bytes) declared",
-                        state.size_bytes
-                    ));
-                    return None;
-                }
+            // The one overshoot check, against every declared byte this state
+            // has seen — sent, buffered, or still pending — rather than against
+            // the single chunk about to go out. Measured here, before anything
+            // is emitted, because the alternative has a failure mode: a chunk
+            // that is legal on its own can be the chunk that completes
+            // `size_bytes`, and once it is on the wire the server has a valid
+            // stream and commits it. Reporting a `Validation` error afterwards
+            // then tells the caller the upload failed about a file that is
+            // published under their `file_id` — truncated.
+            if state.total_written + state.unsent_len() > state.size_bytes {
+                state.record_size_error(format!(
+                    "upload_file_chunked received more data than size_bytes \
+                     ({} bytes) declared",
+                    state.size_bytes
+                ));
+                return None;
+            }
+
+            // A full chunk goes out as soon as one is buffered — unless it is
+            // the chunk that *completes* the declared total, which waits until
+            // the source has confirmed it has nothing more. That confirmation
+            // is the whole point: while more data could still arrive, emitting
+            // the completing chunk is what would hand the server a stream it
+            // considers whole.
+            let completes_the_file =
+                state.total_written + DEFAULT_CHUNK_SIZE as u64 == state.size_bytes;
+            if state.buffer.len() >= DEFAULT_CHUNK_SIZE
+                && (!completes_the_file || state.source_exhausted)
+            {
                 let piece: Vec<u8> = state.buffer.drain(..DEFAULT_CHUNK_SIZE).collect();
-                state.total_written += piece_len;
+                state.total_written += DEFAULT_CHUNK_SIZE as u64;
                 state.wrote_any = true;
                 let request = state.next_request(piece);
                 return Some((request, state));
@@ -2116,39 +2150,48 @@ where
                         // is still buffered.
                         //
                         // Whether that failure is the caller's answer depends
-                        // on how much had already gone out. Short of
-                        // `size_bytes`, sending the bytes read so far would
-                        // only produce a truncated upload the server would
-                        // reject for a reason unrelated to what went wrong, so
-                        // the recorded error wins over that rejection in
-                        // `upload_file_chunked`.
+                        // on whether every declared byte is already in hand —
+                        // sent *or* buffered. Short of `size_bytes`, sending
+                        // what was read would only produce a truncated upload
+                        // the server would reject for a reason unrelated to
+                        // what went wrong, so the recorded error wins over that
+                        // rejection in `upload_file_chunked`.
                         //
-                        // At exactly `size_bytes`, nothing is missing: every
-                        // declared byte is already inside a request tonic has
-                        // taken, so the server sees a complete, valid stream
-                        // and commits it. Recording an error here would tell
-                        // the caller the upload failed about a file that is
-                        // stored and correct — and a caller who reads that as
-                        // "nothing was written" then deletes or re-queues it.
-                        // The source is deliberately read one item past the
+                        // With all of them in hand, nothing is missing: the
+                        // source failed after the last byte this upload needed,
+                        // so finish it and let the server judge. Recording an
+                        // error instead would report a failure for a file that
+                        // ends up stored and correct, and a caller reading that
+                        // as "nothing was written" deletes or re-queues it. The
+                        // source is deliberately read one item past the
                         // declared total, since that is how an overshoot is
-                        // caught, so a source that ends with an error right
-                        // after its last byte is the ordinary shape of this,
-                        // not a corner case. `wrote_any` guards the
-                        // zero-byte file whose source fails before the single
-                        // metadata-carrying request has been emitted: there
-                        // the server sees an empty stream and the read error
-                        // is still the better answer.
-                        if state.wrote_any && state.total_written == state.size_bytes {
+                        // caught, so ending with an error right after the last
+                        // byte is the ordinary shape of this rather than a
+                        // corner case.
+                        //
+                        // Measured against `unsent_len` rather than
+                        // `total_written` alone so it holds at *any*
+                        // `size_bytes`: a file smaller than one chunk has its
+                        // whole content buffered and nothing emitted yet, and
+                        // an earlier version of this check compared only what
+                        // had been sent — so the same source failure was
+                        // forgiven at an exact 1 MiB multiple and reported at
+                        // every other size, which is not a distinction a caller
+                        // could have predicted.
+                        if state.total_written + state.unsent_len() == state.size_bytes {
                             warn!(
                                 error = %error,
                                 size_bytes = state.size_bytes,
                                 "the upload chunk stream failed after every declared byte had \
-                                 been sent; reporting the server's verdict instead"
+                                 been read; completing the upload and reporting the server's \
+                                 verdict instead"
                             );
-                        } else {
-                            state.record_io_error(error);
+                            // Nothing more will be pulled: the source is done,
+                            // however it ended. Fall through and flush.
+                            state.source_exhausted = true;
+                            continue;
                         }
+                        state.record_io_error(error);
                         return None;
                     }
                     None => {
@@ -2161,15 +2204,11 @@ where
             // Source exhausted, less than one full chunk buffered: flush
             // the remainder (possibly empty, for a zero-byte file).
             if !state.buffer.is_empty() || !state.wrote_any {
+                // No overshoot check here: the one at the top of the loop has
+                // already compared `total_written + unsent_len()` against
+                // `size_bytes`, and what is left in `buffer` is a subset of
+                // `unsent_len()`, so reaching this point means it fits.
                 let piece_len = state.buffer.len() as u64;
-                if state.total_written + piece_len > state.size_bytes {
-                    state.record_size_error(format!(
-                        "upload_file_chunked received more data than size_bytes \
-                         ({} bytes) declared",
-                        state.size_bytes
-                    ));
-                    return None;
-                }
                 state.total_written += piece_len;
                 state.wrote_any = true;
                 let piece = std::mem::take(&mut state.buffer);
@@ -3167,15 +3206,109 @@ mod tests {
     }
 
     #[test]
-    fn rechunk_still_reports_a_source_failure_on_a_zero_byte_file() {
-        // `wrote_any` guards this: nothing has been emitted yet, so the server
-        // would see an empty stream with no metadata at all, and the read
-        // error is the better answer even though `total_written` already
-        // equals `size_bytes`.
+    fn rechunk_sends_nothing_when_the_overshoot_is_a_whole_extra_chunk() {
+        // The regression this pair of tests exists for. A `size_bytes` that is
+        // an exact multiple of the chunk size used to be the one case where the
+        // overshoot was noticed too late: the chunk completing the declared
+        // total was legal on its own, went out, gave the server a whole stream
+        // to commit — and only the *next* iteration saw the excess. The caller
+        // got a `Validation` error for a truncated file published under their
+        // own `file_id`.
+        let (requests, error, _pulled) = collect_rechunked_source(
+            DEFAULT_CHUNK_SIZE as u64,
+            vec![chunk(vec![1u8; DEFAULT_CHUNK_SIZE * 2])],
+        );
+        assert!(
+            requests.is_empty(),
+            "not one byte may go out when the data in hand already exceeds size_bytes, got {} \
+             requests",
+            requests.len()
+        );
+        assert!(
+            error
+                .as_ref()
+                .is_some_and(|error| error.to_string().contains("more data than size_bytes")),
+            "the overshoot must be reported, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn rechunk_sends_nothing_when_the_overshoot_arrives_in_a_later_item() {
+        // The same hazard reached the other way: each item is legal as it
+        // arrives, and the second one completes the declared total exactly. Only
+        // holding that completing chunk back until the source confirms it is
+        // finished keeps the third item from being discovered too late.
+        let (requests, error, _pulled) = collect_rechunked_source(
+            (DEFAULT_CHUNK_SIZE * 2) as u64,
+            vec![
+                chunk(vec![1u8; DEFAULT_CHUNK_SIZE]),
+                chunk(vec![2u8; DEFAULT_CHUNK_SIZE]),
+                chunk(vec![3u8; DEFAULT_CHUNK_SIZE]),
+            ],
+        );
+        let sent: usize = requests.iter().map(|request| request.chunk.len()).sum();
+        assert!(
+            sent < DEFAULT_CHUNK_SIZE * 2,
+            "the declared total must never have been completed on the wire, got {sent} bytes"
+        );
+        assert!(
+            error
+                .as_ref()
+                .is_some_and(|error| error.to_string().contains("more data than size_bytes")),
+            "the overshoot must be reported, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn rechunk_forgives_a_source_failure_after_the_last_byte_at_a_non_multiple_size() {
+        // The other half of the same regression. This forgiveness used to be
+        // measured against bytes already *sent*, so it applied only when
+        // `size_bytes` was an exact chunk multiple — at any other size the whole
+        // tail was still buffered, nothing had been emitted, and the identical
+        // source failure was reported as `Io`. `docs/errors-and-retries.md`
+        // states the rule without that caveat, and now the code matches it.
+        let (requests, error, pulled) =
+            collect_rechunked_source(1500, vec![chunk(vec![7u8; 1500]), read_failure()]);
+        assert!(
+            error.is_none(),
+            "every declared byte was read before the failure, got: {error:?}"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.chunk.len())
+                .sum::<usize>(),
+            1500,
+            "the complete file must still be sent"
+        );
+        assert_eq!(pulled, 2, "nothing may be pulled after the failing item");
+    }
+
+    #[test]
+    fn rechunk_completes_a_zero_byte_file_whose_source_fails() {
+        // The limiting case of the rule, and it falls out of it rather than
+        // needing an exception: a file declared as zero bytes has every byte it
+        // declared in hand before the source is ever read, so a source that
+        // then fails failed after the last byte this upload needed. The one
+        // metadata-carrying request goes out and the server decides.
+        //
+        // The alternative — special-casing "nothing emitted yet" to report the
+        // read error — is what the previous version did, and it is the same
+        // shape of distinction that made the non-zero cases inconsistent: it
+        // reads the caller's declaration as advisory. If they declared no
+        // bytes, there were none to fail on.
         let (requests, error, pulled) = collect_rechunked_source(0, vec![read_failure()]);
-        assert_is_the_source_read_failure(error);
-        assert!(requests.is_empty());
-        assert_eq!(pulled, 1);
+        assert!(
+            error.is_none(),
+            "every declared byte of a zero-byte file is in hand, got: {error:?}"
+        );
+        assert_eq!(
+            requests.len(),
+            1,
+            "the metadata-carrying request must still go out"
+        );
+        assert!(requests[0].chunk.is_empty());
+        assert_eq!(pulled, 1, "nothing may be pulled after the failing item");
     }
 
     // The other half of the failing-source contract — that the recorded
