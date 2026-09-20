@@ -70,10 +70,16 @@ says which:
   catches a source handing over more data than it promised. So a source that
   fails *immediately after* its last declared byte — a socket that resets after
   its final data frame, a file truncated concurrently — has already had every
-  byte sent, and the server has a complete, valid stream it commits. That call
-  returns `Ok(())`, not `Io`: the file is stored and correct, and reporting the
-  read failure would invite you to delete or re-queue it. The failure is
-  logged at `warn!` so it is not silent.
+  byte **read**, so the upload finishes and the server has a complete, valid
+  stream it commits. That call returns `Ok(())`, not `Io`: the file is stored and
+  correct, and reporting the read failure would invite you to delete or re-queue
+  it. The failure is logged at `warn!` so it is not silent.
+
+  Read, not sent: a file smaller than one chunk has its whole content buffered
+  and nothing emitted when the failure arrives, and it is forgiven just the same.
+  The one `size_bytes` this does not cover is zero, where nothing was read at
+  all — a source that fails there is always reported, because publishing an empty
+  file would replace whatever is stored under that `file_id`.
 - `"writing the downloaded file"` — `download_file_verified_to` writes into a
   `tokio::io::AsyncWrite` of yours, and a chunk it refuses (or a failing final
   flush) abandons the download there. Whatever was already written is yours to

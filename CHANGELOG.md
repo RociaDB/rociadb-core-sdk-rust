@@ -527,10 +527,22 @@ the 1.0 names are gone, and the table below maps every one of them.
   exact multiple of 1 MiB the chunk that *completed* the declared total was legal
   on its own, went out, and gave the server a whole stream to commit — the excess
   was noticed only on the next iteration. The caller got a `Validation` error for
-  a file stored under their own `file_id`, truncated, which a retry reusing the
-  same `request_id` would have been absorbed as a duplicate of rather than
-  replacing. The check now covers buffered and pending bytes too, and the chunk
+  a file stored under their own `file_id`, truncated. Worse than a wrong error,
+  since publishing replaces whatever that `file_id` held; and on a server that
+  deduplicates by `request_id` as the wire contract describes, a corrected retry
+  reusing that key would be absorbed rather than replacing it. That second part
+  is reasoning about the real server — the test harness models no deduplication,
+  so nothing here verifies it. The check now covers buffered and pending bytes too, and the chunk
   that completes the total waits until the source confirms it has nothing more.
+- **The "source failed after its last byte" exception now holds at every size,
+  except for a zero-byte upload.** A `size_bytes` of zero satisfies "every
+  declared byte is in hand" before the source is read at all, so forgiving a
+  failure there would publish an empty file — and publishing replaces whatever is
+  stored under that `file_id` in one atomic swap. A caller whose size computation
+  wrongly returned zero, and whose source then failed, would have destroyed the
+  stored file and been told `Ok`. A failing source on a zero-byte upload is
+  therefore always reported. A zero-byte upload whose source simply ends is
+  unaffected and still succeeds.
 - **The "source failed after its last byte" exception now holds at every size.**
   It was measured against bytes already *sent*, so it applied only at an exact
   1 MiB multiple: at any other size the whole tail was still buffered, nothing

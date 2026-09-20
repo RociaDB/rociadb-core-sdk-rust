@@ -121,7 +121,9 @@ to log it. `warn!` is reserved for the seven conditions that already use it:
 token response with no `expires_in`, a token refresh that failed after an
 `UNAUTHENTICATED` response, a failed pre-flight token refresh before a
 streaming RPC, and an `upload_file_chunked` chunk stream that failed after
-every declared byte had already been sent. Those last three share the rule
+every declared byte had already been *read* (sent or still buffered — the
+distinction matters, and a zero-byte upload is excluded because publishing one
+would replace a stored file). Those last three share the rule
 worth keeping: an error the SDK ran into on its own behalf, and then decided to
 carry on without, is a `warn!` — because the result the caller ends up seeing
 says nothing about it.

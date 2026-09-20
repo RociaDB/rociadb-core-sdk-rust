@@ -959,6 +959,22 @@ impl RociaDbClient {
     /// plain bytes would leave a failing source no way to say so — it could
     /// only end early, and the upload would be reported as a size mismatch,
     /// blaming the caller's `size_bytes` for a disk that could not be read.
+    ///
+    /// **"Partway through" is the condition, and it is exact.** A source that
+    /// fails once every one of the declared `size_bytes` has been *read* has
+    /// failed after the last byte this upload needed: the upload completes, the
+    /// call returns `Ok(())`, and the failure is logged at `warn!` rather than
+    /// returned. This is not an edge case to be surprised by — the source is
+    /// deliberately polled one item past the declared total, because that is how
+    /// an over-declared upload is caught, so a source that ends with an error
+    /// right after its last byte is the ordinary shape of it.
+    ///
+    /// One exception, for a `size_bytes` of zero: a source that fails there is
+    /// always reported, never forgiven. Nothing was read, so the failure says
+    /// nothing about the file's contents — but publishing *replaces* whatever is
+    /// already stored under `file_id`, so forgiving it would let a size
+    /// computation that wrongly returned zero destroy a stored file and report
+    /// success.
     /// Nothing is pulled from `chunks` after an `Err`, and the [`Bytes`] items
     /// are copied into the outgoing chunk buffer like any other bytes: the
     /// type is there for what it makes easy at the call site, not to make the
@@ -2178,7 +2194,26 @@ where
                         // forgiven at an exact 1 MiB multiple and reported at
                         // every other size, which is not a distinction a caller
                         // could have predicted.
-                        if state.total_written + state.unsent_len() == state.size_bytes {
+                        //
+                        // `size_bytes > 0` is the one carve-out, and it is
+                        // about consequences rather than symmetry. A zero-byte
+                        // declaration has every byte it declared in hand before
+                        // the source is read at all, so the rule above would
+                        // forgive a source that failed on its very first poll
+                        // and publish an empty file. Publishing is a
+                        // *replacement*: the server swaps the published version
+                        // for this `file_id` in one step, so a caller whose size
+                        // computation returned 0 by mistake — an empty read, a
+                        // stat that raced a writer — and whose source then
+                        // failed would silently destroy the file already stored
+                        // there and be told `Ok`. With no bytes to read, a read
+                        // failure says nothing about the file's contents, but it
+                        // does say the caller's source is broken; reporting that
+                        // costs a spurious error, and not reporting it costs
+                        // data.
+                        if state.size_bytes > 0
+                            && state.total_written + state.unsent_len() == state.size_bytes
+                        {
                             warn!(
                                 error = %error,
                                 size_bytes = state.size_bytes,
@@ -3285,30 +3320,36 @@ mod tests {
     }
 
     #[test]
-    fn rechunk_completes_a_zero_byte_file_whose_source_fails() {
-        // The limiting case of the rule, and it falls out of it rather than
-        // needing an exception: a file declared as zero bytes has every byte it
-        // declared in hand before the source is ever read, so a source that
-        // then fails failed after the last byte this upload needed. The one
-        // metadata-carrying request goes out and the server decides.
-        //
-        // The alternative — special-casing "nothing emitted yet" to report the
-        // read error — is what the previous version did, and it is the same
-        // shape of distinction that made the non-zero cases inconsistent: it
-        // reads the caller's declaration as advisory. If they declared no
-        // bytes, there were none to fail on.
+    fn rechunk_reports_a_source_failure_on_a_zero_byte_file_rather_than_publishing_an_empty_one() {
+        // The one case the "every declared byte is in hand" rule is *not*
+        // allowed to forgive, and the reason is data loss rather than symmetry.
+        // A zero-byte declaration satisfies that rule before the source is read
+        // at all, so forgiving here would publish an empty file — and
+        // publishing replaces whatever is stored under that `file_id` in one
+        // atomic swap. A caller whose size computation returned 0 by mistake
+        // and whose source then failed would destroy the stored file and be
+        // told the upload succeeded.
         let (requests, error, pulled) = collect_rechunked_source(0, vec![read_failure()]);
+        assert_is_the_source_read_failure(error);
+        assert!(
+            requests.is_empty(),
+            "nothing may be published for an upload that read nothing, got {} requests",
+            requests.len()
+        );
+        assert_eq!(pulled, 1, "nothing may be pulled after the failing item");
+    }
+
+    #[test]
+    fn rechunk_still_completes_a_zero_byte_file_whose_source_ends_cleanly() {
+        // The carve-out is about a *failing* source, not about zero-byte files:
+        // a legitimately empty upload still goes out.
+        let (requests, error) = collect_rechunked(0, vec![]);
         assert!(
             error.is_none(),
-            "every declared byte of a zero-byte file is in hand, got: {error:?}"
+            "an empty source is not a failure: {error:?}"
         );
-        assert_eq!(
-            requests.len(),
-            1,
-            "the metadata-carrying request must still go out"
-        );
+        assert_eq!(requests.len(), 1, "the metadata request must still go out");
         assert!(requests[0].chunk.is_empty());
-        assert_eq!(pulled, 1, "nothing may be pulled after the failing item");
     }
 
     // The other half of the failing-source contract — that the recorded
