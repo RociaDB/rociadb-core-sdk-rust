@@ -1151,6 +1151,30 @@ impl RociaDbClient {
     /// checked against the metadata the server recorded for them, or
     /// [`RociaDbClient::download_file_verified_to`] when they also must not be
     /// buffered.
+    ///
+    /// # Nothing bounds what this allocates
+    ///
+    /// The buffer grows for as long as the server keeps sending, and this
+    /// method never asks how big the file is: there is no
+    /// [`stat_file`](RociaDbClient::stat_file) first, no ceiling to configure,
+    /// and [`max_file_bytes`](crate::RociaDbBuilder::max_file_bytes) gates
+    /// uploads only. Calling it on a file whose size you do not control — or
+    /// against an endpoint you do not control — is handing that endpoint your
+    /// process's memory.
+    ///
+    /// The three alternatives are each bounded, and one of them is almost
+    /// always what you want for a file of unknown size:
+    ///
+    /// - [`download_file_verified`](RociaDbClient::download_file_verified)
+    ///   stats first and stops the moment the bytes received exceed the size
+    ///   the server reported, so a server sending more than it declared is cut
+    ///   off rather than buffered; its up-front reservation is capped
+    ///   independently of that figure.
+    /// - [`download_file_verified_to`](RociaDbClient::download_file_verified_to)
+    ///   holds one chunk at a time and writes the rest out to a writer of
+    ///   yours.
+    /// - [`download_file_stream`](RociaDbClient::download_file_stream) hands
+    ///   you the chunks and lets you decide.
     pub async fn download_file(
         &self,
         tenant_id: &str,

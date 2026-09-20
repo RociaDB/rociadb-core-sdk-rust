@@ -2207,6 +2207,34 @@ mod tests {
         );
     }
 
+    /// `RociaDbError::Connection` is documented as coming from the initial dial
+    /// and from nowhere else — so a transport failure on an *established*
+    /// client must arrive as a `Status`, with the `UNAVAILABLE` that
+    /// `RetryPolicy` retries on. Asserting it here keeps that doc claim from
+    /// drifting: a caller matching on `Connection` to decide whether to retry
+    /// is matching on a variant it will never see.
+    #[tokio::test]
+    async fn a_transport_failure_after_build_is_a_status_not_a_connection_error() {
+        // A lazily-connected client pointed at a port nothing listens on: the
+        // channel exists, so the failure happens at call time rather than at
+        // build time.
+        let client = crate::test_support::lazy_test_client();
+        let error = client
+            .list_tenants(None, None)
+            .await
+            .expect_err("nothing is listening on port 1");
+
+        assert!(
+            !matches!(error, RociaDbError::Connection { .. }),
+            "a failure on an established client must not be Connection, got: {error:?}"
+        );
+        assert_eq!(
+            error.code(),
+            Some(crate::Code::Unavailable),
+            "it must be the UNAVAILABLE that RetryPolicy retries on, got: {error:?}"
+        );
+    }
+
     #[test]
     fn max_decoding_message_size_is_unset_by_default_and_chains() {
         assert!(

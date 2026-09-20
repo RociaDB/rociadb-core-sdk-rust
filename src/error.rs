@@ -124,13 +124,25 @@ pub enum RociaDbError {
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
 
-    /// Failed to reach the upstream endpoint: DNS resolution, a refused or
-    /// reset connection, a connect timeout, or a TLS handshake failure.
+    /// Failed to reach the upstream endpoint: DNS resolution, a refused
+    /// connection, a connect timeout, or a TLS handshake failure.
     ///
     /// This is a genuine transport failure against a configuration that was
     /// itself accepted — a configuration mistake is
     /// [`RociaDbError::Config`] instead, and is reported without any dial
     /// being attempted.
+    ///
+    /// **Only the initial dial produces this variant.** It comes from
+    /// [`RociaDbBuilder::build`](crate::RociaDbBuilder::build) and from setting
+    /// up the token manager, and from nowhere else. Once a client exists, its
+    /// channel is established, so a connection that is *later* refused, reset
+    /// or lost — a server restart, a dropped link, a proxy closing an idle
+    /// connection — reaches you as a [`RociaDbError::Status`] carrying
+    /// [`UNAVAILABLE`](tonic::Code::Unavailable), not as this. That is also the
+    /// code [`RetryPolicy`](crate::RetryPolicy) retries on, so anything
+    /// matching on `Connection` to decide whether to retry a transport failure
+    /// is matching on the wrong variant: it will only ever see the one from
+    /// `build`.
     ///
     /// [`Display`](std::fmt::Display) folds in the underlying cause
     /// whenever one is present, so a bare `.to_string()` (or a `%err`

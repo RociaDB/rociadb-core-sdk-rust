@@ -572,6 +572,23 @@ the 1.0 names are gone, and the table below maps every one of them.
   the `tls_config` guide's example left the client with no trust anchors at all,
   and the crate's stability caveat omitted the `serde` and `serde_json` items in
   its public API.
+- `RociaDbError::Connection` no longer implies it can arrive from a reset
+  connection mid-call. It comes from the initial dial and from nowhere else:
+  once a client exists its channel is established, so a connection later
+  refused, reset or lost arrives as a `Status` carrying `UNAVAILABLE` — which is
+  also the code `RetryPolicy` retries on, so code matching on `Connection` to
+  decide whether to retry a transport failure was matching on a variant it would
+  never see. Now enforced by a test.
+- `download_file` documents that nothing bounds what it allocates. It never
+  stats the file, there is no ceiling to configure, and `max_file_bytes` gates
+  uploads only, so calling it on a file whose size you do not control hands that
+  endpoint your process's memory. The three bounded alternatives, and what
+  bounds each, are now named alongside it. No behaviour change.
+- `list_tenants` no longer suggests it may be access-controlled. It is not:
+  any authenticated data-plane token can call it, exactly as `docs/tenancy.md`
+  already said. Living on its own service is what would let a policy be added
+  later, not evidence that one exists — so the listing is not privileged
+  information.
 - Updated `h2` to 0.4.19 in `Cargo.lock` for RUSTSEC-2026-0258 (unbounded empty
   DATA frames, reachable through both `tonic` and `reqwest`).
 - Updated `rustls` to 0.23.45 (and `rustls-webpki` to 0.103.15) in `Cargo.lock`

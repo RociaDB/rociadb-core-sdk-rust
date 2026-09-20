@@ -7,8 +7,18 @@ use tracing::debug;
 impl RociaDbClient {
     /// Return one paginated page of tenant ids known to the deployment.
     ///
-    /// This RPC is not scoped to a tenant: it enumerates the whole deployment
-    /// and may be restricted by a dedicated server-side authorization policy.
+    /// This RPC is not scoped to a tenant: it enumerates the whole deployment.
+    ///
+    /// **It is not access-controlled today.** Any authenticated data-plane
+    /// token can call it — read-only and read-write alike — because no
+    /// tenant-scoped credential exists that would need excluding. Having it on
+    /// its own service is what would let a policy be applied to it later
+    /// without touching the three data services; it is not evidence that one
+    /// exists. A `PERMISSION_DENIED` here means an admin-scoped token was
+    /// presented against the data plane, the same cause as anywhere else, not
+    /// a narrower scope for this call. Do not treat the list as privileged
+    /// information, and see `docs/tenancy.md` for why `tenant_id` is a
+    /// business partition rather than a security boundary.
     ///
     /// **The registry this lists is a side effect of writes, not a set of
     /// tenants the server tracks directly.** A tenant id appears here only
