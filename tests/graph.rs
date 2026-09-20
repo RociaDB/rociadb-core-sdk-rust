@@ -10,6 +10,7 @@ use rociadb_sdk::{EdgeInput, NeighborNode, NodeInput, WriteOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use support::FakeServer;
+use tonic::Code;
 
 const TENANT: &str = "tenant-1";
 const GRAPH: &str = "catalog";
@@ -450,8 +451,12 @@ async fn add_edges_sends_every_item_and_keeps_duplicate_ids_in_order() {
     assert_eq!(edge.value, json!({"v": 3}));
 }
 
+/// Renamed from `add_edges_stops_at_the_first_failure`, which is not what a
+/// one-edge batch can show: with a single item there is no "first" to stop at,
+/// so the assertion held for a batch that had simply run to completion. This
+/// name says what it actually proves; the test below covers the stopping.
 #[tokio::test]
-async fn add_edges_stops_at_the_first_failure() {
+async fn add_edges_surfaces_a_missing_endpoint_as_not_found() {
     let server = FakeServer::start().await;
     let client = server.client().await;
     client
@@ -468,6 +473,53 @@ async fn add_edges_stops_at_the_first_failure() {
         .await
         .expect_err("an edge to a missing node must fail the batch");
     assert!(error.is_not_found(), "got: {error}");
+}
+
+/// The batch must abandon the rest of its work once one edge fails, rather
+/// than pressing on and reporting the failure at the end.
+///
+/// `add_edges` drives its groups through `try_for_each_concurrent`, so exactly
+/// which edges landed before the error surfaced is up to the scheduler — but
+/// the concurrency is bounded, so a batch far larger than that bound cannot
+/// have been run to completion. Sixty-four edges with the first `AddEdge`
+/// rejected is therefore a deterministic assertion, and one a single-edge
+/// batch could not make at all. Each edge gets its own label so that every one
+/// of them is a distinct `(from, label, to)` triple and none is refused by the
+/// uniqueness rule instead.
+#[tokio::test]
+async fn add_edges_abandons_the_rest_of_the_batch_after_a_failure() {
+    const EDGES: usize = 64;
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    client
+        .put_nodes(TENANT, GRAPH, vec![NodeInput::new("a", json!({}))])
+        .await
+        .expect("the endpoint exists");
+
+    let edges: Vec<EdgeInput> = (0..EDGES)
+        .map(|index| {
+            EdgeInput::new(
+                format!("e{index}"),
+                "a",
+                "a",
+                format!("knows{index}"),
+                json!({}),
+            )
+        })
+        .collect();
+    server.fail_next("AddEdge", 1, Code::Internal);
+
+    let error = client
+        .add_edges(TENANT, GRAPH, edges)
+        .await
+        .expect_err("a rejected edge must fail the whole batch");
+    assert_eq!(error.code(), Some(Code::Internal), "got: {error}");
+
+    let calls = server.call_count("AddEdge");
+    assert!(
+        calls < EDGES,
+        "the batch must stop launching work once an edge fails, but all {EDGES} were attempted"
+    );
 }
 
 #[tokio::test]

@@ -47,6 +47,14 @@
 //!   keeps the raw string when
 //!   [`FileTimestamp::system_time`](rociadb_sdk::FileTimestamp::system_time)
 //!   cannot read it.
+//! - [`FakeServer::fail_download_after_chunks`] fails a `Download` part-way
+//!   through, and [`FakeServer::fail_upload_before_reading`] rejects an
+//!   `Upload` without reading its request stream. Both exist because
+//!   [`FakeServer::fail_next`] can only reject a call *before* it starts: for
+//!   the two streaming RPCs that meant a transfer could be refused up front or
+//!   drained in full, but never torn mid-flight or answered early. Those were
+//!   exactly the interleavings two real client bugs lived in, so the gap is
+//!   worth keeping closed.
 //! - [`FakeServer::corrupt_stored_bytes`], [`FakeServer::corrupt_stored_checksum`]
 //!   and [`FakeServer::drop_stored_byte`] move a stored file and its metadata
 //!   apart, which is what the verified downloads are checked against.
@@ -226,6 +234,25 @@ struct State {
     /// deterministic instead of wall-clock: one second per write from
     /// [`TIMESTAMP_BASE_UNIX_SECONDS`].
     writes: u64,
+    /// Set by [`FakeServer::fail_download_after_chunks`]: how many chunks a
+    /// `Download` hands over before the stream fails, and with what code.
+    ///
+    /// Scripted here rather than through `failures` because that map only
+    /// rejects a call *before* it starts, which for a server-streaming RPC is
+    /// the opening call. Nothing could express a transfer that begins
+    /// successfully and then dies — and that is precisely the shape a caller
+    /// of `download_file_verified_to` has to survive, since it has already
+    /// written those chunks to the caller's writer by then.
+    download_chunk_failure: Option<(usize, Code)>,
+    /// Set by [`FakeServer::fail_upload_before_reading`]: reject `Upload`
+    /// without consuming its request stream at all.
+    ///
+    /// The ordinary `failures` path cannot do this either: the handler drains
+    /// the whole stream before it consults it, so every scripted upload failure
+    /// arrives only after the client has finished sending. A real server is
+    /// free to answer on the first message, which is what makes a client's
+    /// send-side error handling reachable.
+    upload_reject_before_reading: Option<Code>,
     /// Set by [`FakeServer::emit_non_rfc3339_timestamps`], after which
     /// [`State::tick`] formats every timestamp without its offset. Named for
     /// the departure rather than for the norm so that the default — a server
@@ -442,6 +469,32 @@ impl FakeServer {
     /// the timestamps stay deterministic and ordered either way.
     pub fn emit_non_rfc3339_timestamps(&self) {
         self.lock().non_rfc3339_timestamps = true;
+    }
+
+    /// Hand over `chunks` chunks of a `Download` and then fail the stream with
+    /// `code`.
+    ///
+    /// The one failure shape `fail_next` cannot script: it rejects a call
+    /// before it starts, which for a server-streaming RPC means the opening
+    /// call, so a transfer that begins successfully and then dies had no way to
+    /// be tested. That is the case the verifying downloads have to survive —
+    /// `download_file_verified_to` has already handed those chunks to the
+    /// caller's writer by the time the stream breaks.
+    ///
+    /// `chunks` of 0 fails before any chunk, which is still distinct from a
+    /// rejected opening call: the stream opened.
+    pub fn fail_download_after_chunks(&self, chunks: usize, code: Code) {
+        self.lock().download_chunk_failure = Some((chunks, code));
+    }
+
+    /// Reject the next `Upload` with `code` without reading its request stream.
+    ///
+    /// Every other scripted upload failure arrives only after the handler has
+    /// drained the whole stream, so a client's send side never sees a server
+    /// that answered early — which a real one is free to do from the first
+    /// message. This is what makes that path reachable.
+    pub fn fail_upload_before_reading(&self, code: Code) {
+        self.lock().upload_reject_before_reading = Some(code);
     }
 
     /// Read one stored file back, as the server holds it.
@@ -1220,6 +1273,17 @@ impl FileService for FakeService {
         request: Request<Streaming<pb::UploadRequest>>,
     ) -> Result<Response<()>, Status> {
         let metadata = request.metadata().clone();
+        // Before `into_inner`, and before a single message is read: a real
+        // server may answer off the first message rather than at the end, and
+        // the client's send side behaves differently when it does. Dropping
+        // `request` here closes the receive side, which is exactly what the
+        // client then observes.
+        if let Some(code) = self.lock().upload_reject_before_reading.take() {
+            return Err(Status::new(
+                code,
+                "upload rejected before reading the stream",
+            ));
+        }
         let mut stream = request.into_inner();
         let mut head: Option<pb::UploadRequest> = None;
         let mut bytes: Vec<u8> = Vec::new();
@@ -1310,7 +1374,7 @@ impl FileService for FakeService {
                 .cloned()
                 .ok_or_else(|| not_found(format!("file {} not found", request.file_id)))?
         };
-        let chunks: Vec<Result<pb::DownloadResponse, Status>> = file
+        let mut chunks: Vec<Result<pb::DownloadResponse, Status>> = file
             .bytes
             .chunks(DOWNLOAD_CHUNK)
             .map(|chunk| {
@@ -1319,6 +1383,17 @@ impl FileService for FakeService {
                 })
             })
             .collect();
+        // A stream that opened successfully and then dies part-way through.
+        // Truncating first is what makes the count mean "chunks the caller
+        // actually received": `chunks` beyond the file's own length simply
+        // means the whole file arrives and then the stream errors.
+        if let Some((deliver, code)) = self.lock().download_chunk_failure.take() {
+            chunks.truncate(deliver);
+            chunks.push(Err(Status::new(
+                code,
+                format!("download failed after {deliver} chunks"),
+            )));
+        }
         Ok(Response::new(futures::stream::iter(chunks).boxed()))
     }
 

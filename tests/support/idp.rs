@@ -26,9 +26,16 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// `tokio::time::Instant`, not `std::time::Instant`: `wait_for_requests` sleeps on
+// the tokio clock, so its deadline has to be measured on the same one. Under
+// `#[tokio::test(start_paused = true)]` the tokio clock is virtual and advances
+// instantly through a `sleep` while the std clock does not move at all, which
+// left the "bounded poll" unbounded in virtual time and made the `Duration` it
+// reports meaningless.
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::time::Instant;
 
 /// Token lifetime the provider advertises unless a test asks for another one.
 /// Long enough that the background refresh task never fires during a test

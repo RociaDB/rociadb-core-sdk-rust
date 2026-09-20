@@ -440,7 +440,30 @@ mod tests {
             seen.len()
         );
         // `Duration::MAX` must saturate rather than overflow the scaling.
-        assert!(full_jitter(Duration::MAX) <= Duration::MAX);
+        // `full_jitter(Duration::MAX) <= Duration::MAX` would say nothing —
+        // every `Duration` satisfies it — so assert the invariant across the
+        // caps where it can actually fail, the extremes included: the `+ 1` in
+        // the mapping makes a one-nanosecond cap the tightest case, and
+        // `Duration::MAX` is where `as_nanos()` exceeds `u64` and the clamp has
+        // to hold. Reaching the assertion at all is itself the overflow check:
+        // a wrapping multiply or an out-of-range `from_nanos` panics in debug.
+        for cap in [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_nanos(2),
+            Duration::from_secs(2),
+            Duration::MAX,
+        ] {
+            let drawn = full_jitter(cap);
+            assert!(
+                drawn <= cap,
+                "a jittered delay must never exceed its cap: {drawn:?} > {cap:?}"
+            );
+        }
+        assert!(
+            full_jitter(Duration::MAX) <= Duration::from_nanos(u64::MAX),
+            "the saturating clamp must cap the draw at the u64-nanosecond ceiling"
+        );
     }
 
     #[tokio::test(start_paused = true)]

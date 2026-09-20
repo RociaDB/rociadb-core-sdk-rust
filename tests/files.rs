@@ -15,6 +15,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use support::{FakeServer, nth_write_time, payload, sha256};
 use tokio::io::AsyncWrite;
+use tonic::Code;
 
 const TENANT: &str = "tenant-1";
 const BUCKET: &str = "assets";
@@ -466,6 +467,88 @@ async fn a_failing_chunk_source_surfaces_as_an_io_error_not_a_size_mismatch() {
             .stored_file(TENANT, BUCKET, "unreadable.bin")
             .is_none(),
         "an upload abandoned mid-stream must store nothing"
+    );
+}
+
+/// A download that opens and then dies part-way through. The documentation for
+/// `download_file_verified_to` warns that a failed verification has already
+/// written bytes, and this is the failure that gets there first — nothing could
+/// reach it before the harness could fail a stream mid-transfer, which is why
+/// the audit found this path documented but untested.
+#[tokio::test]
+async fn download_file_verified_to_surfaces_a_mid_stream_failure_over_partial_bytes() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let bytes = payload(4 * ONE_MIB);
+    client
+        .upload_file(
+            TENANT,
+            BUCKET,
+            "torn.bin",
+            bytes.clone(),
+            FileUploadOptions::new(),
+        )
+        .await
+        .expect("the file must upload");
+
+    server.fail_download_after_chunks(3, Code::Unavailable);
+    let mut sink: Vec<u8> = Vec::new();
+    let error = client
+        .download_file_verified_to(TENANT, BUCKET, "torn.bin", &mut sink)
+        .await
+        .expect_err("a stream that dies mid-transfer must fail the call");
+
+    // The server's status, not a checksum or size mismatch: verification never
+    // got the chance to run, and saying "the digest disagreed" would send the
+    // caller after the wrong problem.
+    assert_eq!(error.code(), Some(Code::Unavailable), "got: {error}");
+    assert!(
+        !sink.is_empty() && sink.len() < bytes.len(),
+        "the chunks delivered before the failure must already be written, and not all of \
+         them: got {} of {} bytes",
+        sink.len(),
+        bytes.len()
+    );
+    assert_eq!(
+        sink.as_slice(),
+        &bytes[..sink.len()],
+        "what did get written must be a prefix of the real file"
+    );
+}
+
+/// A server that answers before reading the request stream, which the harness
+/// could not express either: every other scripted upload failure arrives only
+/// once the whole stream has been drained, so the client's send side never saw
+/// an early refusal.
+#[tokio::test]
+async fn upload_file_chunked_surfaces_a_server_that_refuses_before_reading() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let bytes = payload(2 * ONE_MIB);
+    server.fail_upload_before_reading(Code::ResourceExhausted);
+
+    let error = client
+        .upload_file_chunked(
+            TENANT,
+            BUCKET,
+            "refused.bin",
+            futures::stream::iter(vec![
+                chunk(bytes[..ONE_MIB].to_vec()),
+                chunk(bytes[ONE_MIB..].to_vec()),
+            ]),
+            FileStreamUploadOptions::new((2 * ONE_MIB) as u64, sha256(&bytes)),
+        )
+        .await
+        .expect_err("a server that refuses up front must fail the call");
+
+    assert_eq!(
+        error.code(),
+        Some(Code::ResourceExhausted),
+        "the server's own refusal must be what surfaces, not a client-side size rule: {error}"
+    );
+    assert!(
+        server.stored_file(TENANT, BUCKET, "refused.bin").is_none(),
+        "a refused upload must store nothing"
     );
 }
 
