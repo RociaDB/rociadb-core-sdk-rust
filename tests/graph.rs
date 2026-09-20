@@ -451,6 +451,50 @@ async fn add_edges_sends_every_item_and_keeps_duplicate_ids_in_order() {
     assert_eq!(edge.value, json!({"v": 3}));
 }
 
+/// The idempotency marker is written after the store write, never before, so a
+/// write the server rejected *from inside its own handler* burns no key.
+///
+/// The documents suite covers the same rule through a scripted failure, but that
+/// path rejects in the harness's shared entry point, before the marker is even
+/// computed — so it asserts the outcome without exercising the ordering. An
+/// `AddEdge` to a missing endpoint is the case that does: the handler validates,
+/// rejects, and returns while the marker code sits below it. If the marker were
+/// recorded first, the retry here would be absorbed and the edge would never
+/// exist.
+#[tokio::test]
+async fn an_edge_rejected_inside_the_handler_burns_no_request_id() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    client
+        .put_nodes(TENANT, GRAPH, vec![NodeInput::new("a", json!({}))])
+        .await
+        .expect("one endpoint exists");
+    let edge =
+        || EdgeInput::new("e1", "a", "b", "knows", json!({"v": 1})).with_request_id("edge-once");
+
+    let error = client
+        .add_edge(TENANT, GRAPH, edge())
+        .await
+        .expect_err("an edge to a missing node must be rejected");
+    assert!(error.is_not_found(), "got: {error}");
+
+    // Create the missing endpoint and retry under the same key.
+    client
+        .put_nodes(TENANT, GRAPH, vec![NodeInput::new("b", json!({}))])
+        .await
+        .expect("the second endpoint must be created");
+    client
+        .add_edge(TENANT, GRAPH, edge())
+        .await
+        .expect("the retry must be applied, not absorbed as a duplicate");
+
+    let stored = client
+        .get_edge::<Value>(TENANT, GRAPH, "e1")
+        .await
+        .expect("the edge must exist after the retry");
+    assert_eq!(stored.value, json!({"v": 1}));
+}
+
 /// Renamed from `add_edges_stops_at_the_first_failure`, which is not what a
 /// one-edge batch can show: with a single item there is no "first" to stop at,
 /// so the assertion held for a batch that had simply run to completion. This

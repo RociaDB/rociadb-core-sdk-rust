@@ -975,6 +975,7 @@ impl RociaDbClient {
     /// already stored under `file_id`, so forgiving it would let a size
     /// computation that wrongly returned zero destroy a stored file and report
     /// success.
+    ///
     /// Nothing is pulled from `chunks` after an `Err`, and the [`Bytes`] items
     /// are copied into the outgoing chunk buffer like any other bytes: the
     /// type is there for what it makes easy at the call site, not to make the

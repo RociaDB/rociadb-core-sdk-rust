@@ -521,48 +521,45 @@ the 1.0 names are gone, and the table below maps every one of them.
 
 ### Fixed
 
-- **An over-declared `upload_file_chunked` no longer publishes a truncated
-  file.** The overshoot was measured against the single chunk about to go out
-  rather than against every declared byte in hand, so when `size_bytes` was an
-  exact multiple of 1 MiB the chunk that *completed* the declared total was legal
-  on its own, went out, and gave the server a whole stream to commit — the excess
-  was noticed only on the next iteration. The caller got a `Validation` error for
-  a file stored under their own `file_id`, truncated. Worse than a wrong error,
-  since publishing replaces whatever that `file_id` held; and on a server that
-  deduplicates by `request_id` as the wire contract describes, a corrected retry
-  reusing that key would be absorbed rather than replacing it. That second part
-  is reasoning about the real server: the test harness models that contract, so
-  the SDK's behaviour under a deduplicating server is covered, but whether a
-  given deployment matches the contract is that deployment's claim, not something
-  this crate can verify. The check now covers buffered and pending bytes too, and the chunk
-  that completes the total waits until the source confirms it has nothing more.
-- **The "source failed after its last byte" exception now holds at every size,
-  except for a zero-byte upload.** A `size_bytes` of zero satisfies "every
-  declared byte is in hand" before the source is read at all, so forgiving a
-  failure there would publish an empty file — and publishing replaces whatever is
-  stored under that `file_id` in one atomic swap. A caller whose size computation
+- **`upload_file_chunked` now agrees with the server about what happened.**
+  Three ways it did not, all of them in how the rechunker measured the declared
+  `size_bytes` against the bytes it actually had:
+
+  - *An over-declared upload could publish a truncated file.* The overshoot was
+    measured against the single chunk about to go out rather than against every
+    declared byte in hand, so when `size_bytes` was an exact multiple of 1 MiB
+    the chunk that *completed* the total was legal on its own, went out, and gave
+    the server a whole stream to commit — the excess was noticed one iteration
+    later. The caller got a `Validation` error for a file published under their
+    own `file_id`, truncated. The check now covers buffered and pending bytes,
+    and the chunk completing the total waits until the source confirms it has
+    nothing more, so nothing is published for an upload the client refuses.
+  - *A source failing after its last byte failed the upload.* Every declared byte
+    had already gone out, so the server committed a complete, valid file and the
+    call still returned `RociaDbError::Io` — which a caller reading as "nothing
+    was written" would delete or re-queue. That failure is now logged at `warn!`
+    and the server's verdict returned.
+  - *And that forgiveness was inconsistent.* Its condition was bytes already
+    *sent*, so it held only at an exact 1 MiB multiple: at any other size the
+    tail was still buffered and the identical failure came back as `Io`. It is
+    now measured against bytes *read*, which is what
+    `docs/errors-and-retries.md` always described.
+
+  **One deliberate exception:** a `size_bytes` of zero is never forgiven. It
+  satisfies "every declared byte is in hand" before the source is read at all, so
+  forgiving there would publish an empty file — and publishing replaces whatever
+  that `file_id` held, in one atomic swap. A caller whose size computation
   wrongly returned zero, and whose source then failed, would have destroyed the
-  stored file and been told `Ok`. A failing source on a zero-byte upload is
-  therefore always reported. A zero-byte upload whose source simply ends is
-  unaffected and still succeeds.
-- **The "source failed after its last byte" exception now holds at every size.**
-  It was measured against bytes already *sent*, so it applied only at an exact
-  1 MiB multiple: at any other size the whole tail was still buffered, nothing
-  had been emitted, and the identical failure came back as `Io`.
-  `docs/errors-and-retries.md` stated the rule without that caveat, so the code
-  now matches the guide rather than the other way round. A zero-byte file whose
-  source fails follows from the same rule instead of needing an exception: every
-  byte it declared is in hand before the source is read at all.
-- **`upload_file_chunked` no longer reports a committed upload as a failure.**
-  The rechunker reads one item past the declared `size_bytes`, since that is how
-  it catches a source sending more than it promised — so a source that yielded
-  exactly `size_bytes` and *then* failed had already had every byte sent. The
-  server saw a complete, valid stream and committed it, and the call still
-  returned `RociaDbError::Io`. A caller reading that as "nothing was written"
-  would delete or re-queue a file that was stored and correct. Reachable
-  whenever `size_bytes` is an exact multiple of 1 MiB. The source failure is now
-  logged at `warn!` and the server's verdict is returned; every other case keeps
-  the previous precedence.
+  stored file and been told `Ok`. A zero-byte upload whose source simply *ends*
+  is unaffected and still succeeds.
+
+  If you were relying on the idempotency key to recover from the first of these:
+  on a server that deduplicates by `request_id` as the wire contract describes, a
+  corrected retry reusing the key of the call that published the truncated file
+  would have been absorbed rather than replacing it. The test harness models that
+  contract, so the SDK's behaviour under a deduplicating server is covered;
+  whether a given deployment matches it is that deployment's claim, not something
+  this crate can verify.
 - **Concurrent token refreshes now coalesce when the refresh fails, not only
   when it succeeds.** The generation counter advanced only after a token was
   installed, so a failing identity provider left every caller queued on the

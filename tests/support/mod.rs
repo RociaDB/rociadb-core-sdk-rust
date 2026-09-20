@@ -32,12 +32,28 @@
 //! applies, which is the more dangerous direction to be wrong in: a test would
 //! pass while the SDK shipped a bug. The marker is written *after* the store
 //! write, so a call the server rejected burns no key and a corrected retry under
-//! it is applied. Two limits: the markers never expire, where the real server
-//! drops them after `gc.request_ttl_secs` (24 hours by default), and only a
-//! *sequential* replay is modelled, which is all the contract describes — two
-//! concurrent calls carrying one key race for the store under the same `Mutex`
-//! and neither is absorbed, since the marker lands only once the first
-//! completes.
+//! it is applied.
+//!
+//! **Only the sequential replay is modelled, and the rest is a divergence rather
+//! than a silence in the contract.** `docs/errors-and-retries.md` describes more
+//! than this implements, and describes it precisely:
+//!
+//! - A genuinely concurrent duplicate — a second call sharing a `request_id`
+//!   with one still in flight — gets **`ABORTED`, not `Ok`**, because the
+//!   original has not finished and the server cannot claim success on its
+//!   behalf. Here, two such calls simply race for the store under the same
+//!   `Mutex` and *both* are applied, since the marker only lands once the first
+//!   completes. That is not "unspecified"; it is the opposite of what a real
+//!   server does, so nothing a test asserts about concurrent duplicates here
+//!   transfers.
+//! - An in-flight call that is interrupted leaves a **reservation** held for
+//!   `gc.request_lease_secs` (300 seconds by default). Every replay before that
+//!   lease expires gets `ABORTED`, and the first one after it re-executes the
+//!   write. There are no reservations here at all: an interrupted call leaves no
+//!   trace and the next replay is simply applied.
+//! - Markers never expire here, where the real server drops them after
+//!   `gc.request_ttl_secs` (24 hours by default). Nothing in this suite runs long
+//!   enough for that one to show.
 //!
 //! The clock is where it is deliberately *less* real than it could be: a fixed
 //! base plus one second per write, so a timestamp does not depend on when the
@@ -245,9 +261,14 @@ struct RequestMarker {
 
 /// The marker for one write, or `None` when the call carried no `request_id`.
 ///
-/// An empty key is not a key: the field is `optional` on the wire and a caller
-/// using `upload_file_stream` builds its own `UploadRequest`, so it can leave it
-/// unset. Those calls are never deduplicated.
+/// An empty key is not a key, and the reason is the *absence* of field presence
+/// rather than its presence: `request_id` is a plain `string` on all seven write
+/// messages — the only `optional` field in the whole schema is
+/// `PageRequest.limit`, made so deliberately to regain presence — so `""` and
+/// "unset" are indistinguishable on the wire and nothing could tell them apart
+/// here either. A caller building its own `UploadRequest` for
+/// `upload_file_stream` therefore opts out of deduplication simply by leaving the
+/// field alone.
 fn request_marker(
     request_id: &str,
     operation: &'static str,
@@ -1468,20 +1489,11 @@ impl FileService for FakeService {
         recorded["chunk_sizes"] = json!(chunk_sizes);
         self.enter("Upload", &metadata, recorded).await?;
 
-        // Before the checksum and size checks, and before `tick()`: an absorbed
-        // replay performs no write, so it must not advance the store's clock or
-        // be judged on the bytes it re-sent. The stream has already been drained
-        // by then — this handler reads it all before consulting anything — where
-        // a real server is free to answer off the first message. That is a
-        // fidelity limit of the harness, not of the contract.
         let marker = request_marker(
             &head.request_id,
             "Upload",
             (&head.tenant_id, &head.bucket, &head.file_id),
         );
-        if self.lock().absorbs_replay(&marker) {
-            return Ok(Response::new(()));
-        }
 
         // The server checks the checksum's *length* and never the digest —
         // the asymmetry `download_file_verified` exists to work around.
@@ -1499,7 +1511,22 @@ impl FileService for FakeService {
             )));
         }
 
+        // Absorbed *after* the checksum and size checks, and before `tick()`.
+        //
+        // After, so that a replay whose metadata disagrees with its bytes is
+        // rejected rather than waved through: `upload_file` rebuilds and re-sends
+        // its whole request to replay an `UNAUTHENTICATED`, so a bug that
+        // corrupted the rebuilt metadata would be invisible if this answered `Ok`
+        // on the key alone. The contract says a matching replay is absorbed; it
+        // does not say validation is skipped, and catching client bugs is what
+        // this fake is for.
+        //
+        // Before `tick()`, because an absorbed replay performs no write and must
+        // not advance the store's clock.
         let mut state = self.lock();
+        if state.absorbs_replay(&marker) {
+            return Ok(Response::new(()));
+        }
         let now = state.tick();
         state.register(&head.tenant_id);
         let files = state
