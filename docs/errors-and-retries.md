@@ -96,8 +96,8 @@ mismatch leaves bytes behind for you to discard.
 
 ## Reading a status
 
-For `Status`, three accessors return `Some`; for every other variant they
-return `None`.
+For `Status`, `code()` and `status()` return `Some`; for every other variant
+all three return `None`.
 
 - `code()` — the `tonic::Code`.
 - `status()` — the raw `tonic::Status`, for anything the other two do not
@@ -116,7 +116,10 @@ predict; the naming carries no extra meaning.
 
 `DEADLINE_EXCEEDED` is the one code the SDK itself can produce without the
 server saying anything: it is what a
-[`request_timeout`](transport.md#request-timeout) expiring looks like.
+[`request_timeout`](transport.md#request-timeout) expiring looks like. It is
+therefore the one `Status` whose `reason()` is `None` — there was no server
+trailer to read it from. Anything branching on `reason()` has to handle that,
+which is the second reason to prefer `code()` for control flow.
 
 ## Predicates
 

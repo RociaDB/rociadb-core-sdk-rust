@@ -229,10 +229,17 @@ pub enum RociaDbError {
     /// [`std::io::Error`], which is also available as the
     /// [`source`](std::error::Error::source) for a caller that needs its
     /// [`kind`](std::io::Error::kind).
-    #[error("failed to read {context}: {source}")]
+    #[error("{context} failed: {source}")]
     Io {
-        /// Name of what was being read (for example
-        /// `"the upload chunk stream"`).
+        /// Name of what failed, as a phrase this variant's `Display` reads on
+        /// from — `"the upload chunk stream"` gives "the upload chunk stream
+        /// failed: ..." and `"writing the downloaded file"` gives "writing the
+        /// downloaded file failed: ...".
+        ///
+        /// The message used to be "failed to read {context}", which read as
+        /// nonsense for the download half ("failed to read writing the
+        /// downloaded file") and named the wrong direction: that case is a
+        /// write to the caller's own writer, not a read.
         context: &'static str,
         /// The I/O error the source reported.
         #[source]

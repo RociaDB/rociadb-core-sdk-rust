@@ -208,17 +208,28 @@
 //! timestamps be [`FileTimestamp`]s rather than the bare strings the wire
 //! carries.
 //!
-//! The same caveat covers the five types re-exported straight from another
-//! crate so that configuring this one needs no extra direct dependency:
-//! [`Streaming`], [`Channel`] and [`ClientTlsConfig`] from `tonic`,
-//! [`SecretString`] (with [`ExposeSecret`]) from `secrecy`, and [`Bytes`]
-//! from `bytes`. A major upgrade of any of those crates can reshape them
-//! without this SDK's own API changing. Two foreign *traits* appear in public
-//! bounds without being re-exported, on the same terms: `futures::Stream` (the
-//! source of the two streaming uploads) and `tokio::io::AsyncWrite` (the
-//! destination of
-//! [`download_file_verified_to`](RociaDbClient::download_file_verified_to)).
-//! Neither has to be named to call the method it appears on.
+//! The same caveat covers the types re-exported straight from another crate so
+//! that configuring this one needs no extra direct dependency: [`Code`],
+//! [`Status`], [`Streaming`], [`Channel`] and [`ClientTlsConfig`] from `tonic`,
+//! [`SecretString`] (with [`ExposeSecret`]) from `secrecy`, and [`Bytes`] from
+//! `bytes`. A major upgrade of any of those crates can reshape them without this
+//! SDK's own API changing.
+//!
+//! Foreign items also appear in the public API *without* being re-exported, on
+//! exactly the same terms, and the list is longer than the re-exports:
+//!
+//! - `futures::Stream`, the source of the two streaming uploads, and
+//!   `tokio::io::AsyncWrite`, the destination of
+//!   [`download_file_verified_to`](RociaDbClient::download_file_verified_to).
+//!   Neither has to be named to call the method it appears on.
+//! - `serde::Serialize` and `serde::Deserialize`, which every generic read and
+//!   write is bound by, and `serde_json::Value`, which
+//!   [`DocumentQueryFilter`] carries. A `serde` 2.0 would be a breaking change
+//!   for this crate's signatures even if not a line here changed.
+//! - `std::io::Error`, the item type of an
+//!   [`upload_file_chunked`](RociaDbClient::upload_file_chunked) chunk stream
+//!   and the `source` of [`RociaDbError::Io`]. Part of `std`, so the caveat is
+//!   theoretical for this one.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

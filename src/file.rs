@@ -869,7 +869,7 @@ impl RociaDbClient {
             size_bytes = size_bytes,
             "uploading file"
         );
-        let checksum = resolve_checksum(options.checksum, &bytes);
+        let checksum = resolve_checksum_offloaded(options.checksum, &bytes).await;
         let request_id = options
             .request_id
             .unwrap_or_else(default_upload_file_request_id);
@@ -1585,6 +1585,44 @@ fn resolve_checksum(checksum: Option<[u8; 32]>, bytes: &[u8]) -> [u8; 32] {
     checksum.unwrap_or_else(|| Sha256::digest(bytes).into())
 }
 
+/// Buffer size above which [`resolve_checksum_offloaded`] hashes on the
+/// blocking pool instead of inline.
+///
+/// One chunk — the unit the upload already works in, so this introduces no new
+/// number to reason about. Below it the digest is a matter of microseconds and a
+/// thread-pool hop would cost more than it saves.
+const INLINE_CHECKSUM_LIMIT: usize = DEFAULT_CHUNK_SIZE;
+
+/// [`resolve_checksum`], moved off the runtime thread when the buffer is large
+/// enough for that to matter.
+///
+/// SHA-256 runs at a few hundred MiB/s, so hashing inline costs a
+/// multi-gigabyte [`RociaDbClient::upload_file`] whole seconds inside
+/// `Sha256::digest` with no await point in them. That starves every other task
+/// on the worker — on a current-thread runtime, every task the program has — and
+/// [`RociaDbBuilder::max_file_bytes`](crate::RociaDbBuilder::max_file_bytes)
+/// defaults to 5 GiB, so this is a size the SDK invites.
+///
+/// A caller-supplied digest and a small buffer both stay on the current thread,
+/// which is every case where the hop would be the more expensive half.
+///
+/// A `JoinError` can only mean the runtime is shutting down — the digest itself
+/// has no way to panic — and hashing inline is a better answer to that than a
+/// new error variant for something the caller cannot act on: the work is pure,
+/// short-lived and idempotent, so repeating it costs only the time it takes.
+async fn resolve_checksum_offloaded(checksum: Option<[u8; 32]>, bytes: &Arc<Vec<u8>>) -> [u8; 32] {
+    if let Some(checksum) = checksum {
+        return checksum;
+    }
+    if bytes.len() <= INLINE_CHECKSUM_LIMIT {
+        return resolve_checksum(None, bytes);
+    }
+    let owned = Arc::clone(bytes);
+    tokio::task::spawn_blocking(move || resolve_checksum(None, &owned))
+        .await
+        .unwrap_or_else(|_| resolve_checksum(None, bytes))
+}
+
 /// Validate that `size_bytes` does not exceed `max_file_bytes`, before any
 /// network call. Shared by [`RociaDbClient::upload_file`] and
 /// [`RociaDbClient::upload_file_chunked`] so both reject an oversized file
@@ -2123,11 +2161,11 @@ mod tests {
     use super::{
         AsyncWrite, AsyncWriteExt, DEFAULT_CHUNK_SIZE, DEFAULT_MAX_FILE_BYTES,
         DOWNLOAD_WRITE_CONTEXT, FILE_TIMESTAMP_CONTEXT, FileMetadata, FileStreamUploadOptions,
-        FileTimestamp, FileUploadOptions, MAX_PREALLOCATED_DOWNLOAD_BYTES,
+        FileTimestamp, FileUploadOptions, INLINE_CHECKSUM_LIMIT, MAX_PREALLOCATED_DOWNLOAD_BYTES,
         MAX_QUOTED_TIMESTAMP_CHARS, RechunkState, VerifiedDownload, chunk_upload_requests,
         days_from_civil, default_upload_file_request_id, is_leap_year, parse_rfc3339,
         preallocated_download_capacity, rechunk_upload_requests, resolve_checksum,
-        validate_file_size,
+        resolve_checksum_offloaded, validate_file_size,
     };
     use crate::pb::upstream::v1::{StatResponse, UploadRequest};
     use crate::test_support::{lazy_test_client, lazy_test_client_with_max_file_bytes};
@@ -2402,6 +2440,28 @@ mod tests {
         assert_ne!(
             first, different,
             "different bytes must yield a different checksum"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_checksum_offloaded_agrees_with_the_inline_digest() {
+        // Either side of the threshold, so both branches are covered, and the
+        // caller-supplied case that must skip hashing entirely.
+        for len in [0usize, 1, INLINE_CHECKSUM_LIMIT, INLINE_CHECKSUM_LIMIT + 1] {
+            let bytes: Arc<Vec<u8>> = Arc::new((0..len).map(|index| index as u8).collect());
+            assert_eq!(
+                resolve_checksum_offloaded(None, &bytes).await,
+                resolve_checksum(None, &bytes),
+                "offloading must not change the digest, len={len}"
+            );
+        }
+
+        let supplied = [3u8; CHECKSUM_LEN];
+        let bytes: Arc<Vec<u8>> = Arc::new(vec![9u8; INLINE_CHECKSUM_LIMIT * 2]);
+        assert_eq!(
+            resolve_checksum_offloaded(Some(supplied), &bytes).await,
+            supplied,
+            "a caller-supplied digest must never be recomputed, offloaded or not"
         );
     }
 

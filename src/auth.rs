@@ -705,11 +705,32 @@ impl TokenManager {
     /// backoff governs the timer, and a requested refresh is selected on in
     /// parallel with it, so a caller that has just seen an
     /// `UNAUTHENTICATED` never has to wait out the remaining backoff.
+    /// The period [`TokenManager::spawn_refresh`] actually ticks on, which is
+    /// `interval` with a one-second floor.
+    ///
+    /// `tokio::time::interval` panics on a zero period, and `spawn_refresh` is
+    /// public on a public type, so a caller could reach that panic — from
+    /// *inside the spawned task*, where it would not reach them at all. It
+    /// would abort the refresh task and leave the client with no background
+    /// refresh and nothing said about it, which is a good deal worse than a
+    /// visible crash.
+    ///
+    /// One second rather than [`MIN_REFRESH_INTERVAL`] because
+    /// [`TokenManager::refresh_interval`] legitimately returns one second for a
+    /// token that lives two, and flooring at five would schedule a refresh
+    /// three seconds after such a token had already expired. This matches the
+    /// `.max(1)` that method applies for the same reason, so it is a no-op for
+    /// every interval the SDK itself passes.
+    fn refresh_tick_period(interval: Duration) -> Duration {
+        interval.max(Duration::from_secs(1))
+    }
+
     pub fn spawn_refresh(&self, interval: Duration) -> TokenRefreshGuard {
         let manager = self.clone();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let period = Self::refresh_tick_period(interval);
         let task = tokio::spawn(async move {
-            let mut ticker = time::interval(interval);
+            let mut ticker = time::interval(period);
             ticker.tick().await;
             // Consecutive failed refreshes, reset by the first success.
             // Drives `retry_backoff`, so it is also the retry index.
@@ -1226,6 +1247,28 @@ mod tests {
     }
 
     #[test]
+    fn refresh_tick_period_never_returns_zero() {
+        // `tokio::time::interval` panics on a zero period, and it would do so
+        // inside the spawned task where nobody would hear it.
+        assert_eq!(
+            TokenManager::refresh_tick_period(Duration::ZERO),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            TokenManager::refresh_tick_period(Duration::from_millis(1)),
+            Duration::from_secs(1)
+        );
+        // A no-op for everything the SDK itself passes, including the
+        // one-second cadence `refresh_interval` gives a two-second token.
+        for secs in [1u64, 2, 5, 400] {
+            assert_eq!(
+                TokenManager::refresh_tick_period(Duration::from_secs(secs)),
+                Duration::from_secs(secs)
+            );
+        }
+    }
+
+    #[test]
     fn refresh_interval_applies_the_documented_margin_floor_and_ceiling() {
         // (expires_in reported by the IdP, expected refresh_interval)
         let cases = [
@@ -1246,6 +1289,16 @@ mod tests {
             // refresh at 5s, a full 2s after this 3s token has already
             // expired. The clamp must cap the result at expires_in - 1.
             (3, 2),
+            // The bottom of the range, where `expires_in - 1` would be zero
+            // or underflow. `.max(1)` holds the cadence at one second: the
+            // fastest this schedules is one refresh per second, never a spin,
+            // and for a token this short there is nothing better to do. An
+            // `expires_in` of 0 is already-expired and only reachable from an
+            // identity provider that reports it, since a *missing* one becomes
+            // ASSUMED_EXPIRES_IN_SECS instead.
+            (2, 1),
+            (1, 1),
+            (0, 1),
         ];
 
         for (expires_in, expected_secs) in cases {
