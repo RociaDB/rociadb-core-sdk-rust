@@ -104,19 +104,26 @@ prefixes. Do not edit generated output.
 This is a library. `tracing` at `debug!` for "what is about to happen" — one
 line per RPC with its identifying fields — and **never** `info!` or `error!`
 for routine success or failure: the caller receives the error and decides how
-to log it. `warn!` is reserved for the six conditions that already use it:
+to log it. `warn!` is reserved for the seven conditions that already use it:
 `disable_auth()`, a non-`https` token URL, a failed background token refresh, a
 token response with no `expires_in`, a token refresh that failed after an
-`UNAUTHENTICATED` response, and a failed pre-flight token refresh before a
-streaming RPC. The last two share a rule worth keeping: a refresh the SDK
-attempted on its own behalf, and then decided to carry on without, is a `warn!`
-— because the error the caller ends up seeing says nothing about it.
+`UNAUTHENTICATED` response, a failed pre-flight token refresh before a
+streaming RPC, and an `upload_file_chunked` chunk stream that failed after
+every declared byte had already been sent. Those last three share the rule
+worth keeping: an error the SDK ran into on its own behalf, and then decided to
+carry on without, is a `warn!` — because the result the caller ends up seeing
+says nothing about it.
 
 **Never log a secret.** No tokens, no `client_secret`, no `client_id`, no
 `token_url`, no document, node, edge or file payloads. Secrets are held as
 `secrecy::SecretString` so a formatter cannot leak them by accident; keep it
-that way, and keep `RociaDbClient`'s manual `Debug` impl limited to the host
-and whether auth is enabled.
+that way, and keep the two hand-written `Debug` impls that exist for this
+reason as they are: `RociaDbClient`'s, limited to the host and whether auth is
+enabled, and `BuilderAuthConfig`'s, which reports whether each credential field
+is set and never its value. `SecretString` alone is not enough — `token_url` and
+`client_id` are not secrets to `secrecy`, and `reqwest`'s own error `Display`
+appends the request URL, which is why `auth.rs` strips it before wrapping a
+failed token fetch.
 
 ## Documentation
 

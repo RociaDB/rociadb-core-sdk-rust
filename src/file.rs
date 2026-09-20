@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tonic::codec::Streaming;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Size of every upload message the SDK emits, except the last one. Not
@@ -1030,12 +1030,17 @@ impl RociaDbClient {
             .unwrap_or_else(default_upload_file_request_id);
 
         // Set by `rechunk_upload_requests` when the source failed with an I/O
-        // error or produced a total byte count that does not match
-        // `size_bytes`, since the outgoing `Stream<Item = UploadRequest>`
-        // itself has no channel to carry an error — it can only end early.
-        // Checked below regardless of whether the RPC itself succeeded or
-        // failed, so this client-side error takes precedence over whatever the
-        // server made of a stream that ended up short or truncated.
+        // error before the declared total had been sent, or produced a total
+        // byte count that does not match `size_bytes`, since the outgoing
+        // `Stream<Item = UploadRequest>` itself has no channel to carry an
+        // error — it can only end early. Checked below regardless of whether
+        // the RPC itself succeeded or failed, so this client-side error takes
+        // precedence over whatever the server made of a stream that ended up
+        // short or truncated.
+        //
+        // A source that fails *after* its last declared byte records nothing:
+        // the server has a complete stream and its verdict is the honest
+        // answer. See the `Some(Err(..))` arm of `rechunk_upload_requests`.
         let error_slot: Arc<Mutex<Option<RociaDbError>>> = Arc::new(Mutex::new(None));
         let requests = rechunk_upload_requests(
             tenant_id.to_string(),
@@ -2038,12 +2043,42 @@ where
                         // The caller's source failed. Stop pulling from it —
                         // returning `None` here drops the state, and with it
                         // the source — and end the outgoing stream, whatever
-                        // is still buffered: sending the bytes read so far
-                        // would only produce a truncated upload the server
-                        // would then reject for a reason that has nothing to
-                        // do with what went wrong. The recorded error wins
-                        // over that rejection in `upload_file_chunked`.
-                        state.record_io_error(error);
+                        // is still buffered.
+                        //
+                        // Whether that failure is the caller's answer depends
+                        // on how much had already gone out. Short of
+                        // `size_bytes`, sending the bytes read so far would
+                        // only produce a truncated upload the server would
+                        // reject for a reason unrelated to what went wrong, so
+                        // the recorded error wins over that rejection in
+                        // `upload_file_chunked`.
+                        //
+                        // At exactly `size_bytes`, nothing is missing: every
+                        // declared byte is already inside a request tonic has
+                        // taken, so the server sees a complete, valid stream
+                        // and commits it. Recording an error here would tell
+                        // the caller the upload failed about a file that is
+                        // stored and correct — and a caller who reads that as
+                        // "nothing was written" then deletes or re-queues it.
+                        // The source is deliberately read one item past the
+                        // declared total, since that is how an overshoot is
+                        // caught, so a source that ends with an error right
+                        // after its last byte is the ordinary shape of this,
+                        // not a corner case. `wrote_any` guards the
+                        // zero-byte file whose source fails before the single
+                        // metadata-carrying request has been emitted: there
+                        // the server sees an empty stream and the read error
+                        // is still the better answer.
+                        if state.wrote_any && state.total_written == state.size_bytes {
+                            warn!(
+                                error = %error,
+                                size_bytes = state.size_bytes,
+                                "the upload chunk stream failed after every declared byte had \
+                                 been sent; reporting the server's verdict instead"
+                            );
+                        } else {
+                            state.record_io_error(error);
+                        }
                         return None;
                     }
                     None => {
@@ -3002,6 +3037,53 @@ mod tests {
             pulled, 4,
             "the source must be polled exactly up to and including the failing item"
         );
+    }
+
+    #[test]
+    fn rechunk_ignores_a_source_failure_that_lands_after_the_declared_total() {
+        // Every declared byte has already gone out as a full message, so the
+        // server has a complete stream and will commit it. Recording the read
+        // failure here would report an error for a file that is stored and
+        // valid.
+        let total = DEFAULT_CHUNK_SIZE * 2;
+        let (requests, error, pulled) = collect_rechunked_source(
+            total as u64,
+            vec![
+                chunk(vec![1u8; DEFAULT_CHUNK_SIZE]),
+                chunk(vec![2u8; DEFAULT_CHUNK_SIZE]),
+                read_failure(),
+            ],
+        );
+        assert!(
+            error.is_none(),
+            "a failure after the last declared byte must not be recorded, got: {error:?}"
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.chunk.len())
+                .sum::<usize>(),
+            total,
+            "every declared byte must still have been sent"
+        );
+        assert_eq!(
+            pulled, 3,
+            "the overshoot check reads one item past the declared total, which is exactly \
+             how this failure is reached"
+        );
+    }
+
+    #[test]
+    fn rechunk_still_reports_a_source_failure_on_a_zero_byte_file() {
+        // `wrote_any` guards this: nothing has been emitted yet, so the server
+        // would see an empty stream with no metadata at all, and the read
+        // error is the better answer even though `total_written` already
+        // equals `size_bytes`.
+        let (requests, error, pulled) = collect_rechunked_source(0, vec![read_failure()]);
+        assert_is_the_source_read_failure(error);
+        assert!(requests.is_empty());
+        assert_eq!(pulled, 1);
     }
 
     // The other half of the failing-source contract — that the recorded

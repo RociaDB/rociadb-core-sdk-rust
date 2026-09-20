@@ -64,6 +64,16 @@ says which:
   returned for the stream that then stopped early. Nothing is pulled from the
   stream after the error, and nothing is stored: the server only publishes a
   file once it has received and validated the whole stream.
+
+  **With one exception, and it is a success rather than an error.** The SDK
+  reads one item past your declared `size_bytes`, because that is how it
+  catches a source handing over more data than it promised. So a source that
+  fails *immediately after* its last declared byte — a socket that resets after
+  its final data frame, a file truncated concurrently — has already had every
+  byte sent, and the server has a complete, valid stream it commits. That call
+  returns `Ok(())`, not `Io`: the file is stored and correct, and reporting the
+  read failure would invite you to delete or re-queue it. The failure is
+  logged at `warn!` so it is not silent.
 - `"writing the downloaded file"` — `download_file_verified_to` writes into a
   `tokio::io::AsyncWrite` of yours, and a chunk it refuses (or a failing final
   flush) abandons the download there. Whatever was already written is yours to

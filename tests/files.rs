@@ -469,6 +469,42 @@ async fn a_failing_chunk_source_surfaces_as_an_io_error_not_a_size_mismatch() {
     );
 }
 
+/// The mirror image of the test above, and the case that used to be reported
+/// wrongly: a source that fails *after* its last declared byte. Every declared
+/// byte is already inside a request tonic has taken, so the server sees a
+/// complete stream and commits it — and a caller who read the failure as
+/// "nothing was written" would delete or re-queue a file that is there and
+/// correct.
+#[tokio::test]
+async fn a_source_failing_after_its_last_declared_byte_reports_the_servers_verdict() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let bytes = payload(2 * ONE_MIB);
+
+    client
+        .upload_file_chunked(
+            TENANT,
+            BUCKET,
+            "reset-after-last-byte.bin",
+            futures::stream::iter(vec![
+                chunk(bytes[..ONE_MIB].to_vec()),
+                chunk(bytes[ONE_MIB..].to_vec()),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "the socket reset after its last data frame",
+                )),
+            ]),
+            FileStreamUploadOptions::new((2 * ONE_MIB) as u64, sha256(&bytes)),
+        )
+        .await
+        .expect("every declared byte was sent, so the server's Ok is the honest answer");
+
+    let stored = server
+        .stored_file(TENANT, BUCKET, "reset-after-last-byte.bin")
+        .expect("the file must be stored");
+    assert_eq!(stored.bytes, bytes, "the file must be stored whole");
+}
+
 #[tokio::test]
 async fn download_file_verified_returns_the_bytes_when_everything_agrees() {
     let server = FakeServer::start().await;
