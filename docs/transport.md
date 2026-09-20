@@ -118,11 +118,16 @@ like both timeouts. It applies identically to a client built with
 
 ## Custom TLS
 
-`tls_config` replaces the default `ClientTlsConfig::new().with_native_roots()`
-— the operating system's trust store, which is also what the OAuth2 HTTP
-client trusts. Supply your own to add a private CA (`ca_certificate`), to
-present a client certificate for mTLS (`identity`), or to override the name
-the server's certificate is verified against (`domain_name`):
+`tls_config` **replaces** the default
+`ClientTlsConfig::new().with_native_roots()` — the operating system's trust
+store, which is also what the OAuth2 HTTP client trusts. Replaces, not
+extends: a fresh `ClientTlsConfig` carries an *empty* trust store, and nothing
+re-adds the OS roots on your behalf. A config built with only `domain_name`,
+or only `ca_certificate`, therefore trusts nothing else — every certificate
+signed by a public CA fails to verify, and the channel cannot connect at all.
+
+Call `with_native_roots()` yourself unless trusting *only* your own CA is
+exactly what you want:
 
 ```rust,no_run
 use rociadb_sdk::{ClientTlsConfig, RociaDbBuilder};
@@ -131,13 +136,30 @@ use rociadb_sdk::{ClientTlsConfig, RociaDbBuilder};
 # async fn main() -> rociadb_sdk::Result<()> {
 let client = RociaDbBuilder::new()
     .host("https://rociadb.internal:443")
-    .tls_config(ClientTlsConfig::new().domain_name("rociadb.internal"))
+    .tls_config(
+        ClientTlsConfig::new()
+            .with_native_roots()
+            .domain_name("rociadb.internal"),
+    )
     .build()
     .await?;
 # let _ = client;
 # Ok(())
 # }
 ```
+
+Add a private CA with `ca_certificate`, present a client certificate for mTLS
+with `identity`, and override the name the server's certificate is verified
+against with `domain_name`.
+
+**A private CA has to be installed in two places.** `tls_config` governs the
+gRPC channel only; the OAuth2 token client keeps reading the OS trust store
+(`reqwest` is built with `rustls-tls-native-roots` for precisely that reason).
+Narrowing the channel to a private CA while the token endpoint presents a
+publicly-signed certificate — or the reverse — leaves you with a channel that
+connects and a token fetch that fails TLS verification, which `build()` then
+surfaces as a confusing auth error. Install the CA at the OS level as well and
+keep `with_native_roots()` on the channel, so the two agree.
 
 `ClientTlsConfig` and `Channel` are re-exported at the crate root so that
 configuring the SDK needs no extra direct dependency. Building a
