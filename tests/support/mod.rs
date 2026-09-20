@@ -20,10 +20,49 @@
 //! listings, the `(from, label, to)` edge uniqueness rule, idempotent
 //! deletes, the 1 MiB upload chunk cap, a 32-byte checksum length check that
 //! never looks at the bytes, `created_at` / `updated_at` as RFC 3339 instants
-//! that a replacement upload moves forward, and the `reason` trailing metadata
-//! the real server attaches to every error. It is not a RocksDB or a TiKV: no
+//! that a replacement upload moves forward, the `reason` trailing metadata
+//! the real server attaches to every error, and `request_id` deduplication
+//! across all seven write RPCs. It is not a RocksDB or a TiKV: no
 //! transactions, no indexes, no garbage collection, and nothing here proves
 //! anything about the real server's behaviour — only about the client's.
+//!
+//! Deduplication is keyed on `(request_id, operation, target)`, exactly as the
+//! proto and `UploadRequest.request_id`'s generated documentation state it —
+//! keying on the id alone would make this fake absorb writes a real server
+//! applies, which is the more dangerous direction to be wrong in: a test would
+//! pass while the SDK shipped a bug. The marker is written *after* the store
+//! write, so a call the server rejected burns no key and a corrected retry under
+//! it is applied.
+//!
+//! **Only the sequential replay is modelled, and the rest is a divergence rather
+//! than a silence in the contract.** `docs/errors-and-retries.md` describes more
+//! than this implements, and describes it precisely:
+//!
+//! - A genuinely concurrent duplicate — a second call sharing a `request_id`
+//!   with one still in flight — gets **`ABORTED`, not `Ok`**, because the
+//!   original has not finished and the server cannot claim success on its
+//!   behalf. Here it is **absorbed and answered `Ok`**: every write handler runs
+//!   `absorbs_replay` → write → `mark_applied` under one `MutexGuard` with no
+//!   `.await` inside it, so the marker is published before the guard is released
+//!   and the second caller never sees a gap to race through. Measured, not
+//!   assumed: two concurrent `upload_file` calls sharing a key both return `Ok`,
+//!   both reach the server, and the store clock ticks once — the second payload
+//!   is discarded.
+//!
+//!   This is the divergence to be most careful of, because it runs the dangerous
+//!   way round: the harness reports success for a write that never happened,
+//!   where the real server refuses to. A test asserting that the SDK copes with
+//!   a concurrent duplicate would pass here and prove nothing about a real
+//!   deployment — the `ABORTED` such a caller must actually handle, and which
+//!   `RociaDbClient::retry` exists to replay, is never produced.
+//! - An in-flight call that is interrupted leaves a **reservation** held for
+//!   `gc.request_lease_secs` (300 seconds by default). Every replay before that
+//!   lease expires gets `ABORTED`, and the first one after it re-executes the
+//!   write. There are no reservations here at all: an interrupted call leaves no
+//!   trace and the next replay is simply applied.
+//! - Markers never expire here, where the real server drops them after
+//!   `gc.request_ttl_secs` (24 hours by default). Nothing in this suite runs long
+//!   enough for that one to show.
 //!
 //! The clock is where it is deliberately *less* real than it could be: a fixed
 //! base plus one second per write, so a timestamp does not depend on when the
@@ -47,6 +86,14 @@
 //!   keeps the raw string when
 //!   [`FileTimestamp::system_time`](rociadb_sdk::FileTimestamp::system_time)
 //!   cannot read it.
+//! - [`FakeServer::fail_download_after_chunks`] fails a `Download` part-way
+//!   through, and [`FakeServer::fail_upload_before_reading`] rejects an
+//!   `Upload` without reading its request stream. Both exist because
+//!   [`FakeServer::fail_next`] can only reject a call *before* it starts: for
+//!   the two streaming RPCs that meant a transfer could be refused up front or
+//!   drained in full, but never torn mid-flight or answered early. Those were
+//!   exactly the interleavings two real client bugs lived in, so the gap is
+//!   worth keeping closed.
 //! - [`FakeServer::corrupt_stored_bytes`], [`FakeServer::corrupt_stored_checksum`]
 //!   and [`FakeServer::drop_stored_byte`] move a stored file and its metadata
 //!   apart, which is what the verified downloads are checked against.
@@ -104,6 +151,11 @@ const MAX_UPLOAD_CHUNK: usize = 1024 * 1024;
 /// that quietly assumed the upload chunk size came back unchanged would pass
 /// against a server that echoed 1 MiB and fail in production.
 const DOWNLOAD_CHUNK: usize = 64 * 1024 + 7;
+
+/// Largest message the fake server will decode, well above tonic's own 4 MiB
+/// default so that the harness never becomes the ceiling a test trips over —
+/// see where the services are registered for why that matters.
+const HARNESS_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Length of the SHA-256 digest the upload RPC requires — and, like the real
 /// server, the only thing it checks about it.
@@ -200,6 +252,51 @@ pub struct StoredFile {
     pub updated_at: String,
 }
 
+/// One applied write's idempotency marker, keyed exactly as the wire contract
+/// describes: the `request_id`, the operation, **and** the target.
+///
+/// All three, because the scope includes the target — the proto and
+/// `UploadRequest.request_id`'s generated documentation both say reusing one key
+/// across two documents, edges or files performs both writes. Keying on the id
+/// alone would make the harness absorb writes a real server applies, which is
+/// the more dangerous direction for a fake to be wrong in: a test would pass
+/// while the SDK shipped a bug.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RequestMarker {
+    request_id: String,
+    operation: &'static str,
+    target: (String, String, String),
+}
+
+/// The marker for one write, or `None` when the call carried no `request_id`.
+///
+/// An empty key is not a key, and the reason is the *absence* of field presence
+/// rather than its presence: `request_id` is a plain `string` on all seven write
+/// messages — the only `optional` field in the whole schema is
+/// `PageRequest.limit`, made so deliberately to regain presence — so `""` and
+/// "unset" are indistinguishable on the wire and nothing could tell them apart
+/// here either. A caller building its own `UploadRequest` for
+/// `upload_file_stream` therefore opts out of deduplication simply by leaving the
+/// field alone.
+fn request_marker(
+    request_id: &str,
+    operation: &'static str,
+    target: (&str, &str, &str),
+) -> Option<RequestMarker> {
+    if request_id.is_empty() {
+        return None;
+    }
+    Some(RequestMarker {
+        request_id: request_id.to_string(),
+        operation,
+        target: (
+            target.0.to_string(),
+            target.1.to_string(),
+            target.2.to_string(),
+        ),
+    })
+}
+
 #[derive(Debug, Default)]
 struct State {
     /// `(tenant, collection) -> id -> json`.
@@ -212,6 +309,14 @@ struct State {
     files: BTreeMap<(String, String), BTreeMap<String, StoredFile>>,
     /// Registered by every write, like the real server's tenant registry.
     tenants: BTreeSet<String>,
+    /// Idempotency markers for the writes that have actually landed, so a
+    /// sequential replay of one is absorbed instead of applied twice.
+    ///
+    /// Written *after* the store write, never before, because the contract puts
+    /// registration after it too: a call rejected before storage is reached — a
+    /// scripted failure, an `AddEdge` to a missing node — leaves no marker, so a
+    /// corrected retry with the same key is applied rather than absorbed.
+    applied_requests: BTreeSet<RequestMarker>,
     /// Scripted failures, oldest first, per RPC.
     failures: HashMap<String, VecDeque<Code>>,
     /// Bearer tokens the server accepts, or `None` for "any, including none at
@@ -226,6 +331,25 @@ struct State {
     /// deterministic instead of wall-clock: one second per write from
     /// [`TIMESTAMP_BASE_UNIX_SECONDS`].
     writes: u64,
+    /// Set by [`FakeServer::fail_download_after_chunks`]: how many chunks a
+    /// `Download` hands over before the stream fails, and with what code.
+    ///
+    /// Scripted here rather than through `failures` because that map only
+    /// rejects a call *before* it starts, which for a server-streaming RPC is
+    /// the opening call. Nothing could express a transfer that begins
+    /// successfully and then dies — and that is precisely the shape a caller
+    /// of `download_file_verified_to` has to survive, since it has already
+    /// written those chunks to the caller's writer by then.
+    download_chunk_failure: Option<(usize, Code)>,
+    /// Set by [`FakeServer::fail_upload_before_reading`]: reject `Upload`
+    /// without consuming its request stream at all.
+    ///
+    /// The ordinary `failures` path cannot do this either: the handler drains
+    /// the whole stream before it consults it, so every scripted upload failure
+    /// arrives only after the client has finished sending. A real server is
+    /// free to answer on the first message, which is what makes a client's
+    /// send-side error handling reachable.
+    upload_reject_before_reading: Option<Code>,
     /// Set by [`FakeServer::emit_non_rfc3339_timestamps`], after which
     /// [`State::tick`] formats every timestamp without its offset. Named for
     /// the departure rather than for the norm so that the default — a server
@@ -261,11 +385,29 @@ impl FakeServer {
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let mut builder = Server::builder();
+        // The server decodes up to `HARNESS_MAX_MESSAGE_BYTES` rather than
+        // tonic's own 4 MiB default, so the harness is never the thing that caps
+        // a test. A test about the *client's* decode ceiling has to be able to
+        // put a message larger than that ceiling into the store first, and with
+        // the default here it could not: the server would refuse the write
+        // before the client's own limit ever came into play.
         let router = builder
-            .add_service(DocumentServiceServer::new(service.clone()))
-            .add_service(GraphServiceServer::new(service.clone()))
-            .add_service(FileServiceServer::new(service.clone()))
-            .add_service(TenantServiceServer::new(service));
+            .add_service(
+                DocumentServiceServer::new(service.clone())
+                    .max_decoding_message_size(HARNESS_MAX_MESSAGE_BYTES),
+            )
+            .add_service(
+                GraphServiceServer::new(service.clone())
+                    .max_decoding_message_size(HARNESS_MAX_MESSAGE_BYTES),
+            )
+            .add_service(
+                FileServiceServer::new(service.clone())
+                    .max_decoding_message_size(HARNESS_MAX_MESSAGE_BYTES),
+            )
+            .add_service(
+                TenantServiceServer::new(service)
+                    .max_decoding_message_size(HARNESS_MAX_MESSAGE_BYTES),
+            );
         let task = tokio::spawn(async move {
             let _ = router
                 .serve_with_incoming_shutdown(incoming, async {
@@ -442,6 +584,37 @@ impl FakeServer {
     /// the timestamps stay deterministic and ordered either way.
     pub fn emit_non_rfc3339_timestamps(&self) {
         self.lock().non_rfc3339_timestamps = true;
+    }
+
+    /// Make **the next** `Download` hand over `chunks` chunks and then fail the
+    /// stream with `code`.
+    ///
+    /// One-shot, like [`FakeServer::fail_upload_before_reading`] and unlike
+    /// [`FakeServer::fail_next`], which takes a count: the script is consumed by
+    /// the first `Download` that reaches it, so a test wanting two torn
+    /// transfers has to arm it twice.
+    ///
+    /// The one failure shape `fail_next` cannot script: it rejects a call
+    /// before it starts, which for a server-streaming RPC means the opening
+    /// call, so a transfer that begins successfully and then dies had no way to
+    /// be tested. That is the case the verifying downloads have to survive —
+    /// `download_file_verified_to` has already handed those chunks to the
+    /// caller's writer by the time the stream breaks.
+    ///
+    /// `chunks` of 0 fails before any chunk, which is still distinct from a
+    /// rejected opening call: the stream opened.
+    pub fn fail_download_after_chunks(&self, chunks: usize, code: Code) {
+        self.lock().download_chunk_failure = Some((chunks, code));
+    }
+
+    /// Reject the next `Upload` with `code` without reading its request stream.
+    ///
+    /// Every other scripted upload failure arrives only after the handler has
+    /// drained the whole stream, so a client's send side never sees a server
+    /// that answered early — which a real one is free to do from the first
+    /// message. This is what makes that path reachable.
+    pub fn fail_upload_before_reading(&self, code: Code) {
+        self.lock().upload_reject_before_reading = Some(code);
     }
 
     /// Read one stored file back, as the server holds it.
@@ -646,6 +819,22 @@ impl FakeService {
 }
 
 impl State {
+    /// `true` when this exact `(request_id, operation, target)` has already been
+    /// applied, so the server absorbs the call and answers `Ok` without
+    /// touching the store.
+    fn absorbs_replay(&self, marker: &Option<RequestMarker>) -> bool {
+        marker
+            .as_ref()
+            .is_some_and(|marker| self.applied_requests.contains(marker))
+    }
+
+    /// Record that a write landed, so a later replay of it is absorbed.
+    fn mark_applied(&mut self, marker: Option<RequestMarker>) {
+        if let Some(marker) = marker {
+            self.applied_requests.insert(marker);
+        }
+    }
+
     /// Register a tenant, the way every write on the real server does.
     fn register(&mut self, tenant_id: &str) {
         self.tenants.insert(tenant_id.to_string());
@@ -823,13 +1012,22 @@ impl DocumentService for FakeService {
     async fn put_doc(&self, request: Request<pb::PutDocRequest>) -> Result<Response<()>, Status> {
         self.enter_unary("PutDoc", &request).await?;
         let request = request.into_inner();
+        let marker = request_marker(
+            &request.request_id,
+            "PutDoc",
+            (&request.tenant_id, &request.collection, &request.id),
+        );
         let mut state = self.lock();
+        if state.absorbs_replay(&marker) {
+            return Ok(Response::new(()));
+        }
         state.register(&request.tenant_id);
         state
             .documents
             .entry((request.tenant_id, request.collection))
             .or_default()
             .insert(request.id, request.json);
+        state.mark_applied(marker);
         Ok(Response::new(()))
     }
 
@@ -855,7 +1053,15 @@ impl DocumentService for FakeService {
     ) -> Result<Response<()>, Status> {
         self.enter_unary("DeleteDoc", &request).await?;
         let request = request.into_inner();
+        let marker = request_marker(
+            &request.request_id,
+            "DeleteDoc",
+            (&request.tenant_id, &request.collection, &request.id),
+        );
         let mut state = self.lock();
+        if state.absorbs_replay(&marker) {
+            return Ok(Response::new(()));
+        }
         state.register(&request.tenant_id);
         // Idempotent: deleting something absent is not an error.
         if let Some(collection) = state
@@ -864,6 +1070,7 @@ impl DocumentService for FakeService {
         {
             collection.remove(&request.id);
         }
+        state.mark_applied(marker);
         Ok(Response::new(()))
     }
 
@@ -1019,13 +1226,22 @@ impl GraphService for FakeService {
     async fn put_node(&self, request: Request<pb::PutNodeRequest>) -> Result<Response<()>, Status> {
         self.enter_unary("PutNode", &request).await?;
         let request = request.into_inner();
+        let marker = request_marker(
+            &request.request_id,
+            "PutNode",
+            (&request.tenant_id, &request.graph, &request.node_id),
+        );
         let mut state = self.lock();
+        if state.absorbs_replay(&marker) {
+            return Ok(Response::new(()));
+        }
         state.register(&request.tenant_id);
         state
             .nodes
             .entry((request.tenant_id, request.graph))
             .or_default()
             .insert(request.node_id, request.json);
+        state.mark_applied(marker);
         Ok(Response::new(()))
     }
 
@@ -1048,10 +1264,19 @@ impl GraphService for FakeService {
     async fn add_edge(&self, request: Request<pb::AddEdgeRequest>) -> Result<Response<()>, Status> {
         self.enter_unary("AddEdge", &request).await?;
         let request = request.into_inner();
+        let marker = request_marker(
+            &request.request_id,
+            "AddEdge",
+            (&request.tenant_id, &request.graph, &request.edge_id),
+        );
         let mut state = self.lock();
+        if state.absorbs_replay(&marker) {
+            return Ok(Response::new(()));
+        }
         let key = (request.tenant_id.clone(), request.graph.clone());
 
-        // Both endpoints must already exist as nodes.
+        // Both endpoints must already exist as nodes. A rejection here leaves no
+        // marker, so a retry that first creates the node is applied.
         let nodes = state.nodes.get(&key);
         for endpoint in [&request.from, &request.to] {
             if !nodes.is_some_and(|nodes| nodes.contains_key(endpoint)) {
@@ -1086,6 +1311,7 @@ impl GraphService for FakeService {
                 json: request.json,
             },
         );
+        state.mark_applied(marker);
         Ok(Response::new(()))
     }
 
@@ -1116,12 +1342,21 @@ impl GraphService for FakeService {
     ) -> Result<Response<()>, Status> {
         self.enter_unary("DeleteEdge", &request).await?;
         let request = request.into_inner();
+        let marker = request_marker(
+            &request.request_id,
+            "DeleteEdge",
+            (&request.tenant_id, &request.graph, &request.edge_id),
+        );
         let mut state = self.lock();
+        if state.absorbs_replay(&marker) {
+            return Ok(Response::new(()));
+        }
         state.register(&request.tenant_id);
         // Idempotent, like every delete on this API.
         if let Some(graph) = state.edges.get_mut(&(request.tenant_id, request.graph)) {
             graph.remove(&request.edge_id);
         }
+        state.mark_applied(marker);
         Ok(Response::new(()))
     }
 
@@ -1220,6 +1455,17 @@ impl FileService for FakeService {
         request: Request<Streaming<pb::UploadRequest>>,
     ) -> Result<Response<()>, Status> {
         let metadata = request.metadata().clone();
+        // Before `into_inner`, and before a single message is read: a real
+        // server may answer off the first message rather than at the end, and
+        // the client's send side behaves differently when it does. Dropping
+        // `request` here closes the receive side, which is exactly what the
+        // client then observes.
+        if let Some(code) = self.lock().upload_reject_before_reading.take() {
+            return Err(Status::new(
+                code,
+                "upload rejected before reading the stream",
+            ));
+        }
         let mut stream = request.into_inner();
         let mut head: Option<pb::UploadRequest> = None;
         let mut bytes: Vec<u8> = Vec::new();
@@ -1252,6 +1498,12 @@ impl FileService for FakeService {
         recorded["chunk_sizes"] = json!(chunk_sizes);
         self.enter("Upload", &metadata, recorded).await?;
 
+        let marker = request_marker(
+            &head.request_id,
+            "Upload",
+            (&head.tenant_id, &head.bucket, &head.file_id),
+        );
+
         // The server checks the checksum's *length* and never the digest —
         // the asymmetry `download_file_verified` exists to work around.
         if head.checksum.len() != CHECKSUM_LEN {
@@ -1268,7 +1520,22 @@ impl FileService for FakeService {
             )));
         }
 
+        // Absorbed *after* the checksum and size checks, and before `tick()`.
+        //
+        // After, so that a replay whose metadata disagrees with its bytes is
+        // rejected rather than waved through: `upload_file` rebuilds and re-sends
+        // its whole request to replay an `UNAUTHENTICATED`, so a bug that
+        // corrupted the rebuilt metadata would be invisible if this answered `Ok`
+        // on the key alone. The contract says a matching replay is absorbed; it
+        // does not say validation is skipped, and catching client bugs is what
+        // this fake is for.
+        //
+        // Before `tick()`, because an absorbed replay performs no write and must
+        // not advance the store's clock.
         let mut state = self.lock();
+        if state.absorbs_replay(&marker) {
+            return Ok(Response::new(()));
+        }
         let now = state.tick();
         state.register(&head.tenant_id);
         let files = state
@@ -1290,6 +1557,7 @@ impl FileService for FakeService {
                 updated_at: now,
             },
         );
+        state.mark_applied(marker);
         Ok(Response::new(()))
     }
 
@@ -1310,7 +1578,7 @@ impl FileService for FakeService {
                 .cloned()
                 .ok_or_else(|| not_found(format!("file {} not found", request.file_id)))?
         };
-        let chunks: Vec<Result<pb::DownloadResponse, Status>> = file
+        let mut chunks: Vec<Result<pb::DownloadResponse, Status>> = file
             .bytes
             .chunks(DOWNLOAD_CHUNK)
             .map(|chunk| {
@@ -1319,6 +1587,17 @@ impl FileService for FakeService {
                 })
             })
             .collect();
+        // A stream that opened successfully and then dies part-way through.
+        // Truncating first is what makes the count mean "chunks the caller
+        // actually received": `chunks` beyond the file's own length simply
+        // means the whole file arrives and then the stream errors.
+        if let Some((deliver, code)) = self.lock().download_chunk_failure.take() {
+            chunks.truncate(deliver);
+            chunks.push(Err(Status::new(
+                code,
+                format!("download failed after {deliver} chunks"),
+            )));
+        }
         Ok(Response::new(futures::stream::iter(chunks).boxed()))
     }
 
@@ -1346,12 +1625,21 @@ impl FileService for FakeService {
     async fn delete(&self, request: Request<pb::DeleteRequest>) -> Result<Response<()>, Status> {
         self.enter_unary("Delete", &request).await?;
         let request = request.into_inner();
+        let marker = request_marker(
+            &request.request_id,
+            "Delete",
+            (&request.tenant_id, &request.bucket, &request.file_id),
+        );
         let mut state = self.lock();
+        if state.absorbs_replay(&marker) {
+            return Ok(Response::new(()));
+        }
         state.register(&request.tenant_id);
         // Idempotent.
         if let Some(bucket) = state.files.get_mut(&(request.tenant_id, request.bucket)) {
             bucket.remove(&request.file_id);
         }
+        state.mark_applied(marker);
         Ok(Response::new(()))
     }
 

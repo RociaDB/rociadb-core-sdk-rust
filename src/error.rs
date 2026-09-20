@@ -34,20 +34,26 @@ pub type Result<T> = std::result::Result<T, RociaDbError>;
 /// [`request_timeout`](crate::RociaDbBuilder::request_timeout) expiring looks
 /// like.
 ///
-/// Three of the variants carry no gRPC status because nothing ever reached
-/// the server, and the boundary between them is the one worth knowing:
+/// Three of the variants carry no gRPC status, and the boundary between them
+/// is the one worth knowing:
 /// [`RociaDbError::Config`] is a *configuration* mistake, raised by
-/// [`crate::RociaDbBuilder`] before any connection is attempted (a missing
-/// host, a host URL carrying a path, a missing `AUTH_*` value, a zero
-/// timeout, a zero
+/// [`crate::RociaDbBuilder`] (a missing host, a host URL carrying a path, a
+/// missing `AUTH_*` value, a zero timeout, a zero
 /// [`max_file_bytes`](crate::RociaDbBuilder::max_file_bytes), a TLS config the
-/// endpoint rejects);
+/// endpoint rejects). Most are caught before anything is dialed, but not all:
+/// [`build`](crate::RociaDbBuilder::build) connects *before* it reads the
+/// `AUTH_*` environment variables or validates
+/// [`request_timeout`](crate::RociaDbBuilder::request_timeout), so those two
+/// surface after a connection has been opened and dropped — a `Config` error
+/// is not a promise that no socket was touched;
 /// [`RociaDbError::Connection`] is a genuine dial or transport failure
 /// (DNS, a refused connection, a TLS handshake);
 /// [`RociaDbError::Validation`] is a client-side *data* rule checked on a
 /// per-call argument (a zero page limit, a file over
 /// [`max_file_bytes`](crate::RociaDbBuilder::max_file_bytes), a chunk stream
-/// whose length disagrees with the declared size). A `Config` error is
+/// whose length disagrees with the declared size — the one `Validation` case
+/// raised *after* bytes have gone out, since the mismatch can only be seen by
+/// consuming the stream). A `Config` error is
 /// fixed by changing how the client is built, a `Connection` error by
 /// fixing the network or the server, a `Validation` error by changing the
 /// arguments of one call.
@@ -118,13 +124,25 @@ pub enum RociaDbError {
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
 
-    /// Failed to reach the upstream endpoint: DNS resolution, a refused or
-    /// reset connection, a connect timeout, or a TLS handshake failure.
+    /// Failed to reach the upstream endpoint: DNS resolution, a refused
+    /// connection, a connect timeout, or a TLS handshake failure.
     ///
     /// This is a genuine transport failure against a configuration that was
     /// itself accepted — a configuration mistake is
     /// [`RociaDbError::Config`] instead, and is reported without any dial
     /// being attempted.
+    ///
+    /// **Only the initial dial produces this variant.** It comes from
+    /// [`RociaDbBuilder::build`](crate::RociaDbBuilder::build) and from setting
+    /// up the token manager, and from nowhere else. Once a client exists, its
+    /// channel is established, so a connection that is *later* refused, reset
+    /// or lost — a server restart, a dropped link, a proxy closing an idle
+    /// connection — reaches you as a [`RociaDbError::Status`] carrying
+    /// [`UNAVAILABLE`](tonic::Code::Unavailable), not as this. That is also the
+    /// code [`RetryPolicy`](crate::RetryPolicy) retries on, so anything
+    /// matching on `Connection` to decide whether to retry a transport failure
+    /// is matching on the wrong variant: it will only ever see the one from
+    /// `build`.
     ///
     /// [`Display`](std::fmt::Display) folds in the underlying cause
     /// whenever one is present, so a bare `.to_string()` (or a `%err`
@@ -223,20 +241,36 @@ pub enum RociaDbError {
     /// [`std::io::Error`], which is also available as the
     /// [`source`](std::error::Error::source) for a caller that needs its
     /// [`kind`](std::io::Error::kind).
-    #[error("failed to read {context}: {source}")]
+    #[error("{context} failed: {source}")]
     Io {
-        /// Name of what was being read (for example
-        /// `"the upload chunk stream"`).
+        /// Name of what failed, as a phrase this variant's `Display` reads on
+        /// from — `"the upload chunk stream"` gives "the upload chunk stream
+        /// failed: ..." and `"writing the downloaded file"` gives "writing the
+        /// downloaded file failed: ...".
+        ///
+        /// The message used to be "failed to read {context}", which read as
+        /// nonsense for the download half ("failed to read writing the
+        /// downloaded file") and named the wrong direction: that case is a
+        /// write to the caller's own writer, not a read.
         context: &'static str,
         /// The I/O error the source reported.
         #[source]
         source: std::io::Error,
     },
 
-    /// A client-side rule about the *data* of one call was violated before
-    /// any network call was made: a zero page limit, a file over the client's
+    /// A client-side rule about the *data* of one call was violated: a zero
+    /// page limit, a file over the client's
     /// [`max_file_bytes`](crate::RociaDbBuilder::max_file_bytes), or a chunk
     /// stream whose total byte count does not match the declared `size_bytes`.
+    ///
+    /// **The first two are raised before any network call; the chunk-stream
+    /// mismatch is not.** A stream's total is only knowable by consuming it,
+    /// so that variant can arrive after some — or all — of the file has
+    /// already been sent, and the server may well have committed it. Do not
+    /// read a `Validation` error as "nothing was written": for
+    /// [`upload_file_chunked`](crate::RociaDbClient::upload_file_chunked),
+    /// confirm with [`stat_file`](crate::RociaDbClient::stat_file) before
+    /// concluding anything about the stored file.
     ///
     /// This is about the arguments of a single call, not about how the
     /// client was built — a builder or environment mistake is
@@ -380,8 +414,18 @@ impl RociaDbError {
     /// [`crate::RociaDbClient::refresh_auth_token`]). Seeing it therefore
     /// means the refreshed credential was rejected too — the client id or
     /// secret is wrong, revoked, or not entitled to this deployment — so the
-    /// fix is in the configuration, not in another retry. The exception is a
-    /// streaming upload or download, which is not retried automatically.
+    /// fix is in the configuration, not in another retry.
+    ///
+    /// The streaming RPCs are covered too, but only where a replay is
+    /// possible: [`upload_file`](crate::RociaDbClient::upload_file) owns its
+    /// buffer and re-sends it under the same idempotency key, and the call
+    /// that *opens* a download stream is replayed like any unary one. What is
+    /// not retried is a stream that has already begun handing bytes over —
+    /// [`upload_file_stream`](crate::RociaDbClient::upload_file_stream),
+    /// [`upload_file_chunked`](crate::RociaDbClient::upload_file_chunked) and
+    /// a [`download_file_stream`](crate::RociaDbClient::download_file_stream)
+    /// that fails mid-transfer — since the SDK cannot rebuild a caller's
+    /// stream. Those get the pre-flight refresh instead.
     pub fn is_unauthenticated(&self) -> bool {
         self.code() == Some(tonic::Code::Unauthenticated)
     }

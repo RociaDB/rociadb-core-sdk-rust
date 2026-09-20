@@ -186,7 +186,16 @@ client was built with `disable_auth()`.
 identity provider and returns only once a fresh token is in hand, or
 propagates the fetch error. Concurrent callers are coalesced into a single
 in-flight fetch, so a fleet of tasks all recovering at once produces one
-POST rather than one per task. Reach for it right before retrying a call
+POST rather than one per task — **including when that POST fails.** A
+coalesced caller is handed the concurrent attempt's error rather than
+repeating the request, because the refresh lock is held across the round trip:
+N callers each retrying a dead identity provider would serialize behind it at
+up to 30 seconds apiece, and the last in the queue would wait for the sum of
+all of them however short its own `request_timeout` is. What a coalesced
+caller never gets is a bare `Ok(())` for a refresh that did not happen. A
+caller arriving *after* an attempt has settled makes its own, so one bad
+minute at the identity provider does not wedge the client. Reach for it right
+before retrying a call
 that just failed, for a token you know has been revoked, for a credential
 rotation to pick up immediately, or after an `UNAUTHENTICATED` on an
 `upload_file_chunked` / `upload_file_stream` — the two calls nothing retries for

@@ -184,6 +184,19 @@ the 1.0 names are gone, and the table below maps every one of them.
 
 ### Added
 
+- **`RociaDbBuilder::max_decoding_message_size`**, which lifts tonic's 4 MiB
+  ceiling on a single decoded message. That ceiling was previously unreachable
+  from the public API — `build_with_channel` does not help, because the limit
+  lives on the generated clients rather than on the `Channel` — so one document
+  over 4 MiB, or a page of twenty averaging 210 KB, failed to decode with no
+  recourse, and the wire contract explicitly promises nothing about download
+  chunk sizes. Applies to all four services or to none. Leave it unset and
+  tonic's default stands.
+- **`Code` and `Status` are now re-exported at the crate root.** Both were
+  already public API — `RociaDbError::Status` carries a `Status` in a public
+  field and `RociaDbError::code` returns a `Code` — so branching on a gRPC code,
+  the most common thing a caller does with an error, required taking `tonic` as
+  a direct dependency. The same stability caveat as the other re-exports applies.
 - `WriteOptions` (`request_id`) and `DocumentWriteOptions` (`request_id`,
   `node_binding`): the per-call options every write now takes. Both are
   `#[non_exhaustive]`, `Debug + Clone + Default + PartialEq + Eq`, with
@@ -508,6 +521,103 @@ the 1.0 names are gone, and the table below maps every one of them.
 
 ### Fixed
 
+- **`upload_file_chunked` now agrees with the server about what happened.**
+  Three ways it did not, all of them in how the rechunker measured the declared
+  `size_bytes` against the bytes it actually had:
+
+  - *An over-declared upload could publish a truncated file.* The overshoot was
+    measured against the single chunk about to go out rather than against every
+    declared byte in hand, so when `size_bytes` was an exact multiple of 1 MiB
+    the chunk that *completed* the total was legal on its own, went out, and gave
+    the server a whole stream to commit — the excess was noticed one iteration
+    later. The caller got a `Validation` error for a file published under their
+    own `file_id`, truncated. The check now covers buffered and pending bytes,
+    and the chunk completing the total waits until the source confirms it has
+    nothing more, so nothing is published for an upload the client refuses.
+  - *A source failing after its last byte failed the upload.* Every declared byte
+    had already gone out, so the server committed a complete, valid file and the
+    call still returned `RociaDbError::Io` — which a caller reading as "nothing
+    was written" would delete or re-queue. That failure is now logged at `warn!`
+    and the server's verdict returned.
+  - *And that forgiveness was inconsistent.* Its condition was bytes already
+    *sent*, so it held only at an exact 1 MiB multiple: at any other size the
+    tail was still buffered and the identical failure came back as `Io`. It is
+    now measured against bytes *read*, which is what
+    `docs/errors-and-retries.md` always described.
+
+  **One deliberate exception:** a `size_bytes` of zero is never forgiven. It
+  satisfies "every declared byte is in hand" before the source is read at all, so
+  forgiving there would publish an empty file — and publishing replaces whatever
+  that `file_id` held, in one atomic swap. A caller whose size computation
+  wrongly returned zero, and whose source then failed, would have destroyed the
+  stored file and been told `Ok`. A zero-byte upload whose source simply *ends*
+  is unaffected and still succeeds.
+
+  If you were relying on the idempotency key to recover from the first of these:
+  on a server that deduplicates by `request_id` as the wire contract describes, a
+  corrected retry reusing the key of the call that published the truncated file
+  would have been absorbed rather than replacing it. The test harness models that
+  contract, so the SDK's behaviour under a deduplicating server is covered;
+  whether a given deployment matches it is that deployment's claim, not something
+  this crate can verify.
+- **Concurrent token refreshes now coalesce when the refresh fails, not only
+  when it succeeds.** The generation counter advanced only after a token was
+  installed, so a failing identity provider left every caller queued on the
+  refresh lock convinced its own snapshot was current — and the lock is held
+  across the HTTP round trip, so N callers waited behind one another at up to 30
+  seconds each. Fifty tasks recovering from one expired token meant the fiftieth
+  blocked for the sum of the other forty-nine, however short its
+  `request_timeout`. A coalesced caller now inherits the concurrent attempt's
+  outcome, including its error; one arriving after an attempt has settled still
+  makes its own, so a failure cannot wedge the client.
+- **`token_url` and `client_id` no longer reach any log line, error message or
+  `Debug` output.** Three paths leaked them, none through a secret-carrying
+  field, so `SecretString` could not help: the non-https warning logged the URL
+  outright; `reqwest`'s `Display` appends `" for url (..)"`, carrying the whole
+  endpoint into the error a *caller* sees and into the SDK's own warning on a
+  failed background refresh; and `RociaDbBuilder` derived `Debug`, printing both
+  values in cleartext. The builder's `Debug` now reports whether each credential
+  field is set, and nothing more.
+- **`upload_file` no longer blocks a runtime worker while hashing.** SHA-256 over
+  a multi-gigabyte buffer ran inline with no await point in it, starving every
+  other task on that worker. Buffers over 1 MiB are now hashed on the blocking
+  pool; a caller-supplied checksum and smaller buffers are unchanged.
+- **`TokenManager::spawn_refresh` no longer panics on a zero interval.**
+  `tokio::time::interval` rejects a zero period, and it did so inside the spawned
+  task, where the panic reached nobody: it aborted the refresh task and left the
+  client with no background refresh and no error. The period is now floored at
+  one second.
+- `RociaDbError::Io`'s message no longer calls every failure a read. The
+  download case rendered "failed to read writing the downloaded file", which is
+  both nonsense and the wrong direction — it writes to the caller's writer. It
+  now reads "writing the downloaded file failed: ...".
+- Documentation corrections where the text described a safer contract than the
+  code delivers: `Validation` is not always raised before a network call (a
+  chunk-stream size mismatch cannot be), `Config` is not always raised before a
+  connection is attempted (`build` dials before reading the `AUTH_*` variables
+  or validating `request_timeout`), `is_unauthenticated` does not mean streaming
+  calls were never retried (`upload_file` and the call that opens a download
+  are), `reason()` is `None` for the SDK's own client-side `DEADLINE_EXCEEDED`,
+  the `tls_config` guide's example left the client with no trust anchors at all,
+  and the crate's stability caveat omitted the `serde` and `serde_json` items in
+  its public API.
+- `RociaDbError::Connection` no longer implies it can arrive from a reset
+  connection mid-call. It comes from the initial dial and from nowhere else:
+  once a client exists its channel is established, so a connection later
+  refused, reset or lost arrives as a `Status` carrying `UNAVAILABLE` — which is
+  also the code `RetryPolicy` retries on, so code matching on `Connection` to
+  decide whether to retry a transport failure was matching on a variant it would
+  never see. Now enforced by a test.
+- `download_file` documents that nothing bounds what it allocates. It never
+  stats the file, there is no ceiling to configure, and `max_file_bytes` gates
+  uploads only, so calling it on a file whose size you do not control hands that
+  endpoint your process's memory. The three bounded alternatives, and what
+  bounds each, are now named alongside it. No behaviour change.
+- `list_tenants` no longer suggests it may be access-controlled. It is not:
+  any authenticated data-plane token can call it, exactly as `docs/tenancy.md`
+  already said. Living on its own service is what would let a policy be added
+  later, not evidence that one exists — so the listing is not privileged
+  information.
 - Updated `h2` to 0.4.19 in `Cargo.lock` for RUSTSEC-2026-0258 (unbounded empty
   DATA frames, reachable through both `tonic` and `reqwest`).
 - Updated `rustls` to 0.23.45 (and `rustls-webpki` to 0.103.15) in `Cargo.lock`

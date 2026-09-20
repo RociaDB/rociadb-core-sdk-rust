@@ -90,10 +90,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Emitting any rerun-if-changed line switches Cargo off its default
     // "watch the whole package" heuristic, so every path the build depends on
-    // has to be listed explicitly from here on. There are only two: the single
-    // `.proto` (its lone import is supplied by `protox` itself, not from the
-    // tree) and this script.
-    println!("cargo:rerun-if-changed=proto/upstream/v1/upstream.proto");
+    // has to be listed explicitly from here on.
+    //
+    // The whole `proto/` directory rather than the one file compiled above,
+    // because that directory is `protox`'s include path: the moment
+    // `upstream.proto` imports a sibling from the tree, that sibling is an
+    // input to this build too. Naming only `upstream.proto` would leave edits
+    // to it unnoticed, and the symptom — a silently stale generated module on
+    // an incremental build — is about the worst one to debug. Watching the
+    // directory costs nothing and survives the import being added.
+    println!("cargo:rerun-if-changed=proto");
     println!("cargo:rerun-if-changed=build.rs");
     Ok(())
 }

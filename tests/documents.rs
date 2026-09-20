@@ -13,8 +13,217 @@ use rociadb_sdk::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use support::FakeServer;
+use tonic::Code;
 
 const TENANT: &str = "tenant-1";
+
+/// A document whose encoded response clears tonic's 4 MiB receive default with
+/// room to spare, for the two tests of `max_decoding_message_size`.
+const OVERSIZED_DOCUMENT_BYTES: usize = 5 * 1024 * 1024;
+
+/// Left unset, tonic caps a decoded message at 4 MiB — a ceiling this SDK does
+/// not choose and, until `max_decoding_message_size` existed, could not lift.
+/// One document over that size was simply unreadable, with no recourse.
+///
+/// The harness raises the *server's* limit, so the only ceiling in play here is
+/// the client's own.
+#[tokio::test]
+async fn a_document_over_four_mebibytes_is_unreadable_at_the_default_decode_limit() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let document = json!({ "blob": "x".repeat(OVERSIZED_DOCUMENT_BYTES) });
+    client
+        .put_document(
+            TENANT,
+            "blobs",
+            "big",
+            &document,
+            DocumentWriteOptions::new(),
+        )
+        .await
+        .expect("writing it is fine: the send side has no such ceiling");
+
+    let error = client
+        .get_document::<Value>(TENANT, "blobs", "big")
+        .await
+        .expect_err("the response exceeds the default 4 MiB decode ceiling");
+
+    assert_eq!(
+        error.code(),
+        Some(Code::OutOfRange),
+        "tonic reports an over-long message as OUT_OF_RANGE, got: {error}"
+    );
+}
+
+/// The other half, and the one that proves the setter reaches the generated
+/// clients rather than merely being stored on the builder: the same read, on a
+/// client whose ceiling was raised, returns the document whole.
+///
+/// Built with `build_with_channel`, which is also the claim in the setter's own
+/// documentation — the limit lives on the generated clients, not on the
+/// `Channel`, so supplying a channel neither sets it nor overrides it.
+#[tokio::test]
+async fn raising_the_decode_limit_makes_the_same_document_readable() {
+    let server = FakeServer::start().await;
+    let client = server
+        .builder()
+        .max_decoding_message_size(16 * 1024 * 1024)
+        .build_with_channel(server.channel())
+        .await
+        .expect("building a client with a raised decode ceiling must succeed");
+    let document = json!({ "blob": "x".repeat(OVERSIZED_DOCUMENT_BYTES) });
+    client
+        .put_document(
+            TENANT,
+            "blobs",
+            "big",
+            &document,
+            DocumentWriteOptions::new(),
+        )
+        .await
+        .expect("the write must succeed");
+
+    let read: Value = client
+        .get_document(TENANT, "blobs", "big")
+        .await
+        .expect("a raised ceiling must let the oversized document through");
+    assert_eq!(read, document, "the document must round-trip byte for byte");
+}
+
+/// The `request_id` contract, which a large part of this SDK's safety story
+/// rests on — `upload_file`'s replay, `RetryPolicy`'s guidance that a retried
+/// write must carry the same key — and which the harness models as the wire
+/// contract states it: a sequential replay of the same key, operation *and*
+/// target is absorbed and answered `Ok` without touching the store.
+///
+/// Absorbed rather than merely idempotent: the replay here carries *different*
+/// content, so a server that simply re-applied the write would leave the second
+/// payload behind. The first one surviving is what proves the write did not run.
+#[tokio::test]
+async fn a_replayed_request_id_on_the_same_target_is_absorbed() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let options = || DocumentWriteOptions::new().with_request_id("write-once");
+
+    client
+        .put_document(TENANT, "products", "sku-1", &json!({"v": 1}), options())
+        .await
+        .expect("the first write must land");
+    client
+        .put_document(TENANT, "products", "sku-1", &json!({"v": 2}), options())
+        .await
+        .expect("a replay is absorbed and answered Ok, not rejected");
+
+    assert_eq!(
+        client
+            .get_document::<Value>(TENANT, "products", "sku-1")
+            .await
+            .expect("the document must exist"),
+        json!({"v": 1}),
+        "the absorbed replay must not have overwritten the first write"
+    );
+    assert_eq!(
+        server.call_count("PutDoc"),
+        2,
+        "both calls reach the server — absorption happens there, not in the client"
+    );
+}
+
+/// The other half of the contract, and the half a fake is most likely to get
+/// wrong: the key's scope *includes the target*, so one key reused across two
+/// documents performs both writes. A harness keyed on the id alone would absorb
+/// the second — and a test resting on that would pass while the SDK shipped a
+/// bug.
+#[tokio::test]
+async fn one_request_id_reused_across_two_targets_performs_both_writes() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let options = || DocumentWriteOptions::new().with_request_id("shared-key");
+
+    for id in ["sku-1", "sku-2"] {
+        client
+            .put_document(TENANT, "products", id, &json!({"id": id}), options())
+            .await
+            .expect("a different target is a different write");
+    }
+
+    for id in ["sku-1", "sku-2"] {
+        assert_eq!(
+            client
+                .get_document::<Value>(TENANT, "products", id)
+                .await
+                .expect("both documents must exist"),
+            json!({"id": id})
+        );
+    }
+}
+
+/// The operation is part of the key too, so the same key on a different
+/// operation against the same target still runs. Without that, the delete below
+/// would be absorbed and the document would survive it.
+#[tokio::test]
+async fn one_request_id_reused_across_two_operations_performs_both() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+
+    client
+        .put_document(
+            TENANT,
+            "products",
+            "sku-1",
+            &json!({"v": 1}),
+            DocumentWriteOptions::new().with_request_id("same-key"),
+        )
+        .await
+        .expect("the write must land");
+    client
+        .delete_document(
+            TENANT,
+            "products",
+            "sku-1",
+            WriteOptions::new().with_request_id("same-key"),
+        )
+        .await
+        .expect("a delete is a different operation, so it is not absorbed");
+
+    assert!(
+        client
+            .get_document::<Value>(TENANT, "products", "sku-1")
+            .await
+            .is_err(),
+        "the delete must have been applied"
+    );
+}
+
+/// A marker is recorded after the write, never before, so a call the server
+/// rejected leaves none — which is what makes a corrected retry under the same
+/// key work at all. `RetryPolicy`'s documentation tells callers to reuse the key
+/// precisely so a replay is recognised; it would be a trap if a failed attempt
+/// had already burnt it.
+#[tokio::test]
+async fn a_rejected_write_burns_no_request_id() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    server.fail_next("PutDoc", 1, Code::Unavailable);
+
+    let options = || DocumentWriteOptions::new().with_request_id("retry-me");
+    client
+        .put_document(TENANT, "products", "sku-1", &json!({"v": 1}), options())
+        .await
+        .expect_err("the scripted failure must reach the caller");
+    client
+        .put_document(TENANT, "products", "sku-1", &json!({"v": 1}), options())
+        .await
+        .expect("the retry must be applied, not absorbed as a duplicate");
+
+    assert_eq!(
+        client
+            .get_document::<Value>(TENANT, "products", "sku-1")
+            .await
+            .expect("the retry must have stored the document"),
+        json!({"v": 1})
+    );
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Product {

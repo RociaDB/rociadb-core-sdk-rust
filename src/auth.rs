@@ -16,6 +16,7 @@
 //! formatter and both are zeroized when the last owner is dropped.
 
 use crate::Result;
+use crate::RociaDbError;
 use crate::error::AuthResultExt;
 use crate::retry::full_jitter;
 use secrecy::{ExposeSecret, SecretString};
@@ -207,6 +208,25 @@ impl<'de> Deserialize<'de> for TokenResponse {
 /// line through a formatter, and neither is left behind in freed memory for
 /// a core dump or an attached debugger to recover.
 ///
+/// Drop the request URL from a `reqwest` error before it is wrapped into a
+/// [`RociaDbError::Auth`].
+///
+/// `reqwest`'s own `Display` appends `" for url (..)"` to every transport
+/// error, so a token-fetch failure carries the full `token_url` in its message
+/// — which then reaches any log line, `Debug` output or error report that
+/// renders the error, the SDK's own `warn!` on a failed background refresh
+/// included. AGENTS.md puts `token_url` on the never-log list, and the
+/// `SecretString` discipline around the credentials cannot help here because
+/// the leak rides the error chain rather than a secret-carrying field. Fixing
+/// it at the point of conversion covers every consumer, including the caller's
+/// own logging, rather than one `warn!` at a time.
+///
+/// Nothing diagnostic is lost that the caller does not already have: they
+/// configured the URL, and the error's kind, status and source all survive.
+fn redact_token_url(error: reqwest::Error) -> reqwest::Error {
+    error.without_url()
+}
+
 /// `http` is used as given. **A caller-supplied [`reqwest::Client`] should
 /// carry its own timeouts** (`Client::builder().connect_timeout(..).timeout(..)`):
 /// `reqwest::Client::new()` has none at all, so an IdP that accepts the TCP
@@ -233,8 +253,11 @@ pub async fn fetch_token(
         // the caller should still be told that `client_id`/`client_secret`
         // and the bearer token this returns are about to cross the wire
         // unencrypted.
+        // The URL itself is deliberately not a field here: the logging policy
+        // in AGENTS.md puts `token_url` on the same never-log list as the
+        // credentials, and the caller configured it, so naming it back at them
+        // buys nothing a log scraper could not also collect.
         warn!(
-            token_url = %token_url,
             "fetching an OAuth2 token over a non-https token_url; client credentials and the \
              access token will be sent in cleartext"
         );
@@ -251,12 +274,15 @@ pub async fn fetch_token(
         ])
         .send()
         .await
+        .map_err(redact_token_url)
         .auth_context("token request failed")?
         .error_for_status()
+        .map_err(redact_token_url)
         .auth_context("token endpoint returned error")?;
 
     res.json::<TokenResponse>()
         .await
+        .map_err(redact_token_url)
         .auth_context("failed to parse token response")
 }
 
@@ -338,15 +364,43 @@ struct TokenManagerInner {
     /// it was waiting (see `refresh_generation` below) and, if so, skip its
     /// own redundant fetch instead of hitting the IdP again.
     refresh_lock: Mutex<()>,
-    /// Bumped by [`TokenManager::refresh_now`] immediately after installing
-    /// a newly fetched token into `header_value`, while still holding
-    /// `refresh_lock`. Because every write to `header_value` happens while
-    /// holding that lock, fetches are fully serialized: there is no window
-    /// in which a slower concurrent fetch could land after (and overwrite)
-    /// a faster one. `Relaxed` is enough — this only decides whether a
-    /// waiting caller can skip redundant work, not memory visibility of the
-    /// token itself, which the `header_value` lock already guarantees.
+    /// Bumped by [`TokenManager::refresh_now`] once an attempt has
+    /// *completed*, while still holding `refresh_lock` — after installing a
+    /// newly fetched token into `header_value` on success, and equally after
+    /// recording the error on failure.
+    ///
+    /// Counting attempts rather than successes is what makes the coalescing
+    /// hold in the failure mode it was written for. It used to be bumped only
+    /// on success, so a failing IdP left it untouched and every caller queued
+    /// on `refresh_lock` saw its own snapshot still current and ran its own
+    /// full round trip — serialized behind the lock, each bounded only by
+    /// `OAUTH_HTTP_REQUEST_TIMEOUT`. Fifty tasks recovering from one expired
+    /// token against an unresponsive IdP therefore took fifty times that,
+    /// and the fiftieth caller's single RPC blocked for the sum of all of
+    /// them however short its own `request_timeout` was.
+    ///
+    /// Because every write to `header_value` happens while holding
+    /// `refresh_lock`, fetches are fully serialized: there is no window in
+    /// which a slower concurrent fetch could land after (and overwrite) a
+    /// faster one. `Relaxed` is enough — this only decides whether a waiting
+    /// caller can skip redundant work, and the `refresh_lock` handoff is what
+    /// publishes both this counter and `last_attempt_failure` to the waiter
+    /// that acquires the lock next.
     refresh_generation: AtomicU64,
+    /// What the attempt counted by the current `refresh_generation` came to:
+    /// `None` if it installed a token, `Some(message)` if it failed.
+    ///
+    /// Read only by a caller that finds the generation has moved while it
+    /// waited for `refresh_lock` — that is, a caller whose own request was
+    /// contemporaneous with that attempt, so that attempt's answer is
+    /// legitimately its answer too. A caller arriving *after* an attempt has
+    /// completed snapshots the already-bumped generation, finds it unchanged
+    /// under the lock, and fetches for itself, so a stale failure here can
+    /// never wedge the manager and needs no expiry of its own.
+    ///
+    /// A message rather than the [`RociaDbError`], which is not `Clone`: the
+    /// source chain stays with the caller that actually made the request.
+    last_attempt_failure: RwLock<Option<String>>,
     /// Wakes the background task spawned by [`TokenManager::spawn_refresh`]
     /// as soon as possible, without the caller waiting for the network
     /// round trip. See [`TokenManager::request_refresh`]. A `notify_one()`
@@ -388,6 +442,7 @@ impl TokenManager {
                 fetch_attempts: AtomicU64::new(0),
                 refresh_lock: Mutex::new(()),
                 refresh_generation: AtomicU64::new(0),
+                last_attempt_failure: RwLock::new(None),
                 refresh_notify: Notify::new(),
             }),
         })
@@ -460,6 +515,12 @@ impl TokenManager {
     /// (as [`crate::RociaDbClient`]'s streaming calls do) may ignore the
     /// error.
     ///
+    /// That includes a failure this caller did not itself run into: coalescing
+    /// shares the outcome of the contemporaneous attempt, error included, so
+    /// this can return `Auth` without having made a request. See
+    /// [`TokenManager::refresh_now`] for why inheriting the error beats both
+    /// repeating the request and reporting a success that did not happen.
+    ///
     /// `margin` only has to cover the moment the call *starts*: a gRPC server
     /// validates the bearer token once, when it accepts the call, so a stream
     /// that outlives its token keeps running. A few seconds is therefore
@@ -481,31 +542,91 @@ impl TokenManager {
     /// would fire one POST per failing task straight at the IdP (risking a
     /// 429) and, since completions can land out of order, a slower fetch
     /// could overwrite a token a faster concurrent one had already cached.
-    /// Instead, a caller records the current refresh generation, then
-    /// either wins the race to fetch or — if another caller already
-    /// refreshed by the time it gets the lock — returns `Ok(())` without
-    /// making a redundant request of its own. Every write to the cached
-    /// header happens while holding that same lock, so fetches are fully
-    /// serialized and a slower one can never land after (and overwrite) a
-    /// faster one. A caller that arrives after an in-flight fetch has
-    /// already completed still performs its own fetch, as an explicit
-    /// refresh request should.
+    /// Instead, a caller records the current refresh generation, then either
+    /// wins the race to fetch or — if an attempt contemporaneous with its own
+    /// request completed by the time it gets the lock — takes *that attempt's
+    /// outcome* as its own, without making a redundant request. Every write to
+    /// the cached header happens while holding that same lock, so fetches are
+    /// fully serialized and a slower one can never land after (and overwrite)
+    /// a faster one. A caller that arrives after an attempt has already
+    /// completed still performs its own fetch, as an explicit refresh request
+    /// should.
     ///
-    /// The refresh lock is held across the HTTP round trip, which is why
-    /// the [`reqwest::Client`] handed to [`TokenManager::new`] must have a
-    /// request timeout: without one, a single unresponsive IdP connection
-    /// would block every other caller of this method indefinitely.
+    /// **The outcome that is shared includes a failure.** A coalesced caller
+    /// gets an [`RociaDbError::Auth`] naming the concurrent attempt's error
+    /// rather than repeating the request, because the alternative is worse
+    /// than a wasted round trip: the refresh lock is held across the HTTP
+    /// round trip, so N callers each retrying a failing IdP serialize behind
+    /// it at up to `OAUTH_HTTP_REQUEST_TIMEOUT` apiece, and the last one in
+    /// the queue waits for the sum of all of them however short its own
+    /// [`request_timeout`](crate::RociaDbBuilder::request_timeout) is. What a
+    /// coalesced caller does *not* get is a bare `Ok(())`: that would report a
+    /// refresh that did not happen and leave it using a token it believes is
+    /// fresh.
+    ///
+    /// That the lock is held across the round trip is also why the
+    /// [`reqwest::Client`] handed to [`TokenManager::new`] must have a request
+    /// timeout: without one, a single unresponsive IdP connection would block
+    /// every other caller of this method indefinitely.
     pub async fn refresh_now(&self) -> Result<()> {
         let observed_generation = self.inner.refresh_generation.load(Ordering::Relaxed);
         let _refresh_permit = self.inner.refresh_lock.lock().await;
         if self.inner.refresh_generation.load(Ordering::Relaxed) != observed_generation {
-            // Another caller already refreshed while we were waiting for
-            // the lock: the cached header is already newer than anything a
-            // redundant fetch here could produce.
-            return Ok(());
+            // An attempt contemporaneous with this request completed while we
+            // waited for the lock, so its answer is this caller's answer: the
+            // cached header is already newer than anything a redundant fetch
+            // could produce, or the IdP just refused and will refuse us too.
+            return match self.last_attempt_failure() {
+                None => Ok(()),
+                Some(message) => Err(RociaDbError::Auth {
+                    message: format!(
+                        "a concurrent token refresh failed, so this one did not repeat it: \
+                         {message}"
+                    ),
+                    source: None,
+                }),
+            };
         }
 
         self.inner.fetch_attempts.fetch_add(1, Ordering::Relaxed);
+        let outcome = self.fetch_and_install().await;
+        // Recorded *before* the generation is bumped, so a waiter that
+        // observes the bump also observes what it meant. Both are published to
+        // that waiter by the `refresh_lock` handoff.
+        {
+            let mut guard = self
+                .inner
+                .last_attempt_failure
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = outcome.as_ref().err().map(ToString::to_string);
+        }
+        self.inner
+            .refresh_generation
+            .fetch_add(1, Ordering::Relaxed);
+        outcome
+    }
+
+    /// The error message recorded for the attempt the current
+    /// `refresh_generation` counts, or `None` if that attempt succeeded.
+    fn last_attempt_failure(&self) -> Option<String> {
+        self.inner
+            .last_attempt_failure
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Fetch a token and install it, which is the half of
+    /// [`TokenManager::refresh_now`] that can fail.
+    ///
+    /// Factored out precisely so its `?` exits land back in `refresh_now`,
+    /// where the outcome is recorded and the generation bumped. Inlining it
+    /// is what produced the original bug: the early return skipped both, so a
+    /// failed attempt was invisible to every caller queued behind it.
+    ///
+    /// Must be called while holding `refresh_lock`.
+    async fn fetch_and_install(&self) -> Result<()> {
         let token = fetch_token(
             &self.inner.http,
             &self.inner.token_url,
@@ -530,11 +651,6 @@ impl TokenManager {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             *guard = header;
         }
-        // Bumped only after the new header is fully installed, so a caller
-        // that observes this can safely skip its own fetch.
-        self.inner
-            .refresh_generation
-            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -554,6 +670,26 @@ impl TokenManager {
     /// selected on in parallel with it.
     pub fn request_refresh(&self) {
         self.inner.refresh_notify.notify_one();
+    }
+
+    /// The period [`TokenManager::spawn_refresh`] actually ticks on, which is
+    /// `interval` with a one-second floor.
+    ///
+    /// `tokio::time::interval` panics on a zero period, and `spawn_refresh` is
+    /// public on a public type, so a caller could reach that panic — from
+    /// *inside the spawned task*, where it would not reach them at all. It
+    /// would abort the refresh task and leave the client with no background
+    /// refresh and nothing said about it, which is a good deal worse than a
+    /// visible crash.
+    ///
+    /// One second rather than [`MIN_REFRESH_INTERVAL`] because
+    /// [`TokenManager::refresh_interval`] legitimately returns one second for a
+    /// token that lives two, and flooring at five would schedule a refresh
+    /// three seconds after such a token had already expired. This matches the
+    /// `.max(1)` that method applies for the same reason, so it is a no-op for
+    /// every interval the SDK itself passes.
+    fn refresh_tick_period(interval: Duration) -> Duration {
+        interval.max(Duration::from_secs(1))
     }
 
     /// Spawn a background refresh task. Returns a [`TokenRefreshGuard`]
@@ -598,8 +734,9 @@ impl TokenManager {
     pub fn spawn_refresh(&self, interval: Duration) -> TokenRefreshGuard {
         let manager = self.clone();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let period = Self::refresh_tick_period(interval);
         let task = tokio::spawn(async move {
-            let mut ticker = time::interval(interval);
+            let mut ticker = time::interval(period);
             ticker.tick().await;
             // Consecutive failed refreshes, reset by the first success.
             // Drives `retry_backoff`, so it is also the retry index.
@@ -799,6 +936,7 @@ mod tests {
                 fetch_attempts: AtomicU64::new(0),
                 refresh_lock: Mutex::new(()),
                 refresh_generation: AtomicU64::new(0),
+                last_attempt_failure: RwLock::new(None),
                 refresh_notify: Notify::new(),
             }),
         }
@@ -905,6 +1043,106 @@ mod tests {
             manager.inner.fetch_attempts.load(Ordering::Relaxed),
             0,
             "a coalesced caller must not reach the IdP at all"
+        );
+    }
+
+    /// The failure half of the coalescing contract, and the regression this
+    /// pair of tests exists for: the generation used to be bumped only on
+    /// success, so a failing IdP left every queued caller convinced its own
+    /// snapshot was current and each ran a full round trip — serialized behind
+    /// the refresh lock, at up to `OAUTH_HTTP_REQUEST_TIMEOUT` apiece.
+    #[tokio::test]
+    async fn refresh_now_coalesces_into_a_concurrent_refresh_that_failed() {
+        let manager = offline_token_manager(sample_header("token"), 600);
+
+        let held = manager.inner.refresh_lock.lock().await;
+        let waiting = manager.clone();
+        let handle = tokio::spawn(async move { waiting.refresh_now().await });
+        tokio::task::yield_now().await;
+
+        // Stand in for an in-flight refresh that *failed*, recording its
+        // outcome and bumping the generation exactly as `refresh_now` does.
+        *manager
+            .inner
+            .last_attempt_failure
+            .write()
+            .expect("the outcome lock must not be poisoned") = Some("the idp said 503".to_string());
+        manager
+            .inner
+            .refresh_generation
+            .fetch_add(1, Ordering::Relaxed);
+        drop(held);
+
+        let error = handle
+            .await
+            .expect("the spawned refresh_now call must not panic")
+            .expect_err("a coalesced caller must inherit the concurrent failure, not Ok(())");
+        assert!(
+            error.to_string().contains("the idp said 503"),
+            "the inherited error must name what actually failed, got: {error}"
+        );
+        assert_eq!(
+            manager.inner.fetch_attempts.load(Ordering::Relaxed),
+            0,
+            "the whole point: a coalesced caller must not repeat the failing request"
+        );
+    }
+
+    /// The other side of that coin — a shared failure must not become sticky.
+    /// A caller arriving *after* an attempt has completed snapshots the
+    /// already-bumped generation, so it finds nothing to coalesce into and
+    /// fetches for itself. Without this, one bad minute at the IdP would wedge
+    /// the manager for good.
+    #[tokio::test]
+    async fn a_later_refresh_retries_rather_than_inheriting_a_settled_failure() {
+        let manager = offline_token_manager(sample_header("token"), 600);
+
+        manager
+            .refresh_now()
+            .await
+            .expect_err("the offline harness's malformed token_url always fails");
+        let after_first = manager.inner.fetch_attempts.load(Ordering::Relaxed);
+        assert_eq!(after_first, 1);
+        assert!(
+            manager.last_attempt_failure().is_some(),
+            "a failed attempt must record its outcome for a contemporaneous caller"
+        );
+        assert_eq!(
+            manager.inner.refresh_generation.load(Ordering::Relaxed),
+            1,
+            "a failed attempt still counts: that is what makes coalescing work"
+        );
+
+        manager
+            .refresh_now()
+            .await
+            .expect_err("still offline, so this fails too");
+        assert_eq!(
+            manager.inner.fetch_attempts.load(Ordering::Relaxed),
+            2,
+            "a caller arriving after the failure settled must make its own attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_refresh_clears_the_recorded_failure() {
+        let manager = offline_token_manager(sample_header("token"), 600);
+        manager
+            .refresh_now()
+            .await
+            .expect_err("the offline harness always fails");
+        assert!(manager.last_attempt_failure().is_some());
+
+        // Stand in for the next attempt succeeding, which is what
+        // `refresh_now` records on its success path.
+        *manager
+            .inner
+            .last_attempt_failure
+            .write()
+            .expect("the outcome lock must not be poisoned") = None;
+        assert!(
+            manager.last_attempt_failure().is_none(),
+            "a coalesced caller must see Ok(()) once an attempt has succeeded"
         );
     }
 
@@ -1015,6 +1253,28 @@ mod tests {
     }
 
     #[test]
+    fn refresh_tick_period_never_returns_zero() {
+        // `tokio::time::interval` panics on a zero period, and it would do so
+        // inside the spawned task where nobody would hear it.
+        assert_eq!(
+            TokenManager::refresh_tick_period(Duration::ZERO),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            TokenManager::refresh_tick_period(Duration::from_millis(1)),
+            Duration::from_secs(1)
+        );
+        // A no-op for everything the SDK itself passes, including the
+        // one-second cadence `refresh_interval` gives a two-second token.
+        for secs in [1u64, 2, 5, 400] {
+            assert_eq!(
+                TokenManager::refresh_tick_period(Duration::from_secs(secs)),
+                Duration::from_secs(secs)
+            );
+        }
+    }
+
+    #[test]
     fn refresh_interval_applies_the_documented_margin_floor_and_ceiling() {
         // (expires_in reported by the IdP, expected refresh_interval)
         let cases = [
@@ -1035,6 +1295,16 @@ mod tests {
             // refresh at 5s, a full 2s after this 3s token has already
             // expired. The clamp must cap the result at expires_in - 1.
             (3, 2),
+            // The bottom of the range, where `expires_in - 1` would be zero
+            // or underflow. `.max(1)` holds the cadence at one second: the
+            // fastest this schedules is one refresh per second, never a spin,
+            // and for a token this short there is nothing better to do. An
+            // `expires_in` of 0 is already-expired and only reachable from an
+            // identity provider that reports it, since a *missing* one becomes
+            // ASSUMED_EXPIRES_IN_SECS instead.
+            (2, 1),
+            (1, 1),
+            (0, 1),
         ];
 
         for (expires_in, expected_secs) in cases {

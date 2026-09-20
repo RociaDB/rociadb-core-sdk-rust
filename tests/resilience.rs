@@ -57,6 +57,18 @@ async fn a_request_timeout_fires_against_a_handler_that_sleeps_past_the_deadline
         error.to_string().contains("failed to list tenants"),
         "the operation must still be named, got: {error}"
     );
+    // The one `Status` with no `reason`: this deadline fired client-side, so
+    // there was never a server trailer to read it from. `docs/errors-and-retries.md`
+    // states this, and stating it is worth nothing unless something enforces it.
+    assert_eq!(
+        error.reason(),
+        None,
+        "a locally fired deadline has no server trailer, so reason() must be None"
+    );
+    assert!(
+        error.status().is_some(),
+        "it is still a Status error, so the raw status must be reachable"
+    );
 }
 
 #[tokio::test]

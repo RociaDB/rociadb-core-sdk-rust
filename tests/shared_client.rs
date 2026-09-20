@@ -9,20 +9,29 @@
 //!
 //! Nothing here runs a request — the functions are never called. They only
 //! have to compile.
+//!
+//! One real test exists so this target does not report "0 passed" in CI output,
+//! which reads like a broken target to anyone who has not opened the file.
 
 use futures::stream;
 use rociadb_sdk::{
-    Bytes, Channel, ClientTlsConfig, DocumentPage, DocumentQueryFilter, DocumentQueryOperator,
-    DocumentQuerySort, DocumentQuerySortDirection, DocumentWriteOptions, Edge, EdgeInput,
-    ExposeSecret, FileMetadata, FileStreamUploadOptions, FileTimestamp, FileUploadOptions,
-    Neighbor, NeighborNode, NodeBinding, NodeInput, Page, Result, RetryPolicy, RociaDbBuilder,
-    RociaDbClient, RociaDbError, SecretString, UploadRequest, WriteOptions,
+    Bytes, Channel, ClientTlsConfig, Code, DocumentPage, DocumentQueryFilter,
+    DocumentQueryOperator, DocumentQuerySort, DocumentQuerySortDirection, DocumentWriteOptions,
+    Edge, EdgeInput, ExposeSecret, FileMetadata, FileStreamUploadOptions, FileTimestamp,
+    FileUploadOptions, Neighbor, NeighborNode, NodeBinding, NodeInput, Page, Result, RetryPolicy,
+    RociaDbBuilder, RociaDbClient, RociaDbError, SecretString, Status, UploadRequest, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWrite;
+
+/// Everything else in this file is checked by the compiler and never run. This
+/// exists only so the target reports a pass rather than "0 passed": if it ran,
+/// the build already proved every signature below still composes.
+#[test]
+fn the_public_api_still_composes() {}
 
 /// A caller's own document type, to pin down that the generic reads decode
 /// into something other than `serde_json::Value`.
@@ -517,6 +526,11 @@ async fn the_builder_exposes_the_transport_hooks() -> Result<()> {
         // Not a transport setting: a client-side ceiling on the size of a file
         // the two ergonomic uploads will send, mirroring the server's own.
         .max_file_bytes(512 * 1024 * 1024)
+        // Lifts tonic's own 4 MiB ceiling on one decoded message. Unlike the
+        // endpoint settings above, this one also applies through
+        // `build_with_channel`, because it lives on the generated clients rather
+        // than on the `Channel`.
+        .max_decoding_message_size(16 * 1024 * 1024)
         .disable_auth()
         .build()
         .await?;
@@ -526,10 +540,44 @@ async fn the_builder_exposes_the_transport_hooks() -> Result<()> {
     let channel: Channel = Channel::from_static("http://127.0.0.1:50051").connect_lazy();
     let _on_a_channel = RociaDbBuilder::new()
         .request_timeout(Duration::from_secs(10))
+        .max_decoding_message_size(16 * 1024 * 1024)
         .disable_auth()
         .build_with_channel(channel)
         .await?;
     Ok(())
+}
+
+// `Code` and `Status` are re-exported because `RociaDbError` exposes both — a
+// `Status` in a public field and a `Code` from `code()` — so branching on a gRPC
+// code, which is the most common thing a caller does with an error, must not
+// require `tonic` as a direct dependency.
+#[allow(dead_code)]
+fn an_error_can_be_matched_on_its_grpc_code_without_naming_tonic(error: RociaDbError) -> bool {
+    // Every accessor the crate root has to make reachable for this to work.
+    let code: Option<Code> = error.code();
+    let status: Option<&Status> = error.status();
+    let reason: Option<&str> = error.reason();
+
+    if let Some(status) = status {
+        let _: Code = status.code();
+        let _: &str = status.message();
+    }
+    let _ = reason;
+
+    matches!(
+        code,
+        Some(Code::Unavailable | Code::DeadlineExceeded | Code::Aborted)
+    )
+}
+
+// The same through a `match` on the enum itself, since `Status` is a public
+// field of one of its variants.
+#[allow(dead_code)]
+fn an_error_can_be_destructured_to_its_status(error: &RociaDbError) -> Option<Code> {
+    match error {
+        RociaDbError::Status { status, .. } => Some(status.code()),
+        _ => None,
+    }
 }
 
 // `SecretString` is re-exported so a caller can keep the client secret in a

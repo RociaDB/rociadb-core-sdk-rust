@@ -37,9 +37,21 @@ no `npm` commands apply to this repo.
 - `cargo deny check` runs the advisory, licence, ban, and source policy in
   `deny.toml`.
 
-Run all six before submitting changes; `.github/workflows/ci.yml` runs the same
-set plus an MSRV check (`cargo check --lib --all-features --locked` on Rust
-1.88, which must match `rust-version` in `Cargo.toml`).
+Run all six before submitting changes. `.github/workflows/ci.yml` runs five of
+them as jobs of their own — `cargo build` has none, because
+`clippy --all-targets` and `cargo test` both compile everything it would — plus
+an MSRV check (`cargo check --lib --all-features --locked` on Rust
+1.88, which must match `rust-version` in `Cargo.toml`) and a package-contents
+check that asserts release step 4 below without waiting for a release.
+
+Every job runs on a GitHub-hosted runner. This repository is public and accepts
+forks, so `pull_request` builds a fork's own workflow code, and both `build.rs`
+and `cargo test` execute repository code by design — on a persistent
+self-hosted runner that is arbitrary code execution on the organisation's
+hardware, with a filesystem and a build cache that outlive the job. Nothing in
+this crate needs a self-hosted runner: `protox` makes a bare Rust toolchain the
+whole requirement. Do not move CI back onto one without making the runners
+ephemeral and requiring approval for every outside contributor.
 
 **No system dependency is needed to build.** `build.rs` compiles
 `proto/upstream/v1/upstream.proto` with `protox`, a pure-Rust protobuf
@@ -104,19 +116,28 @@ prefixes. Do not edit generated output.
 This is a library. `tracing` at `debug!` for "what is about to happen" — one
 line per RPC with its identifying fields — and **never** `info!` or `error!`
 for routine success or failure: the caller receives the error and decides how
-to log it. `warn!` is reserved for the six conditions that already use it:
+to log it. `warn!` is reserved for the seven conditions that already use it:
 `disable_auth()`, a non-`https` token URL, a failed background token refresh, a
 token response with no `expires_in`, a token refresh that failed after an
-`UNAUTHENTICATED` response, and a failed pre-flight token refresh before a
-streaming RPC. The last two share a rule worth keeping: a refresh the SDK
-attempted on its own behalf, and then decided to carry on without, is a `warn!`
-— because the error the caller ends up seeing says nothing about it.
+`UNAUTHENTICATED` response, a failed pre-flight token refresh before a
+streaming RPC, and an `upload_file_chunked` chunk stream that failed after
+every declared byte had already been *read* (sent or still buffered — the
+distinction matters, and a zero-byte upload is excluded because publishing one
+would replace a stored file). Those last three share the rule
+worth keeping: an error the SDK ran into on its own behalf, and then decided to
+carry on without, is a `warn!` — because the result the caller ends up seeing
+says nothing about it.
 
 **Never log a secret.** No tokens, no `client_secret`, no `client_id`, no
 `token_url`, no document, node, edge or file payloads. Secrets are held as
 `secrecy::SecretString` so a formatter cannot leak them by accident; keep it
-that way, and keep `RociaDbClient`'s manual `Debug` impl limited to the host
-and whether auth is enabled.
+that way, and keep the two hand-written `Debug` impls that exist for this
+reason as they are: `RociaDbClient`'s, limited to the host and whether auth is
+enabled, and `BuilderAuthConfig`'s, which reports whether each credential field
+is set and never its value. `SecretString` alone is not enough — `token_url` and
+`client_id` are not secrets to `secrecy`, and `reqwest`'s own error `Display`
+appends the request URL, which is why `auth.rs` strips it before wrapping a
+failed token fetch.
 
 ## Documentation
 

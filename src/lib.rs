@@ -76,7 +76,7 @@
 //! are held as [`SecretString`], so they are redacted by every formatter and
 //! zeroized when the client is dropped.
 //!
-//! Three things happen automatically, and none of them needs calling code:
+//! Four things happen automatically, and none of them needs calling code:
 //!
 //! - **Scheduled refresh.** A background task refreshes the token after
 //!   about two thirds of its lifetime (400 seconds for the 600-second tokens
@@ -208,17 +208,28 @@
 //! timestamps be [`FileTimestamp`]s rather than the bare strings the wire
 //! carries.
 //!
-//! The same caveat covers the five types re-exported straight from another
-//! crate so that configuring this one needs no extra direct dependency:
-//! [`Streaming`], [`Channel`] and [`ClientTlsConfig`] from `tonic`,
-//! [`SecretString`] (with [`ExposeSecret`]) from `secrecy`, and [`Bytes`]
-//! from `bytes`. A major upgrade of any of those crates can reshape them
-//! without this SDK's own API changing. Two foreign *traits* appear in public
-//! bounds without being re-exported, on the same terms: `futures::Stream` (the
-//! source of the two streaming uploads) and `tokio::io::AsyncWrite` (the
-//! destination of
-//! [`download_file_verified_to`](RociaDbClient::download_file_verified_to)).
-//! Neither has to be named to call the method it appears on.
+//! The same caveat covers the types re-exported straight from another crate so
+//! that configuring this one needs no extra direct dependency: [`Code`],
+//! [`Status`], [`Streaming`], [`Channel`] and [`ClientTlsConfig`] from `tonic`,
+//! [`SecretString`] (with [`ExposeSecret`]) from `secrecy`, and [`Bytes`] from
+//! `bytes`. A major upgrade of any of those crates can reshape them without this
+//! SDK's own API changing.
+//!
+//! Foreign items also appear in the public API *without* being re-exported, on
+//! exactly the same terms, and the list is longer than the re-exports:
+//!
+//! - `futures::Stream`, the source of the two streaming uploads, and
+//!   `tokio::io::AsyncWrite`, the destination of
+//!   [`download_file_verified_to`](RociaDbClient::download_file_verified_to).
+//!   Neither has to be named to call the method it appears on.
+//! - `serde::Serialize` and `serde::Deserialize`, which every generic read and
+//!   write is bound by, and `serde_json::Value`, which
+//!   [`DocumentQueryFilter`] carries. A `serde` 2.0 would be a breaking change
+//!   for this crate's signatures even if not a line here changed.
+//! - `std::io::Error`, the item type of an
+//!   [`upload_file_chunked`](RociaDbClient::upload_file_chunked) chunk stream
+//!   and the `source` of [`RociaDbError::Io`]. Part of `std`, so the caveat is
+//!   theoretical for this one.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -302,10 +313,6 @@ pub use retry::RetryPolicy;
 /// major `secrecy` upgrade can reshape these without the SDK's own API
 /// changing.
 pub use secrecy::{ExposeSecret, SecretString};
-/// Re-exported so callers do not need `tonic` as a direct dependency just to
-/// name the return type of [`RociaDbClient::download_file_stream`]. The same
-/// stability caveat applies: a major tonic upgrade can reshape this type
-/// without the SDK's own API changing.
 pub use tonic::codec::Streaming;
 /// Re-exported so callers do not need `tonic` as a direct dependency just to
 /// configure the builder: [`ClientTlsConfig`] for
@@ -314,6 +321,19 @@ pub use tonic::codec::Streaming;
 /// a major tonic upgrade can reshape these types without the SDK's own API
 /// changing.
 pub use tonic::transport::{Channel, ClientTlsConfig};
+/// Re-exported so callers do not need `tonic` as a direct dependency just to
+/// name the return type of [`RociaDbClient::download_file_stream`]. The same
+/// stability caveat applies: a major tonic upgrade can reshape this type
+/// without the SDK's own API changing.
+/// Re-exported because they are part of this crate's public API whether or
+/// not a caller names them: [`RociaDbError::Status`] carries a [`Status`] in a
+/// public field, and [`RociaDbError::code`] returns a [`Code`]. Branching on a
+/// gRPC code is the most common thing a caller does with an error, and without
+/// these it could not be done without taking `tonic` as a direct dependency —
+/// the very thing the other re-exports here exist to avoid. The same
+/// stability caveat applies: a major tonic upgrade can reshape these types
+/// without the SDK's own API changing.
+pub use tonic::{Code, Status};
 
 use crate::auth::{BearerInterceptor, TokenManager, TokenRefreshGuard};
 use crate::error::{AuthResultExt, ConfigResultExt, ConnectionResultExt, StatusResultExt};
@@ -374,20 +394,48 @@ const OAUTH_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// its lifetime, so this only ever fires when that task has been failing.
 const STREAMING_TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum BuilderAuthConfig {
     Enabled {
         token_url: Option<String>,
         client_id: Option<String>,
-        /// A [`SecretString`], so `#[derive(Debug)]` on this enum prints a
-        /// redaction rather than the secret, and the buffer is zeroized
-        /// when the builder (and the `TokenManagerInner` it is cloned into
-        /// at `build()`) is dropped — closing the window in which a core
-        /// dump, an attached debugger, or swapped-out memory could recover
-        /// it.
+        /// A [`SecretString`]. This enum's own `Debug` is hand-written and
+        /// prints presence only, but the type is what keeps the secret
+        /// redacted anywhere *else* a formatter reaches it, and what zeroizes
+        /// the buffer when the builder (and the `TokenManagerInner` it is
+        /// cloned into at `build()`) is dropped — closing the window in which
+        /// a core dump, an attached debugger, or swapped-out memory could
+        /// recover it.
         client_secret: Option<SecretString>,
     },
     Disabled,
+}
+
+/// Hand-written rather than derived, for the same reason
+/// [`RociaDbClient`]'s is: `token_url` and `client_id` are on AGENTS.md's
+/// never-log list alongside the secret, and a derived `Debug` would print
+/// both in cleartext for anyone who logs a builder. Only whether each value
+/// is set is reported — enough to debug a half-configured builder, and
+/// nothing a log scraper can use.
+impl std::fmt::Debug for BuilderAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn presence(set: bool) -> &'static str {
+            if set { "<set>" } else { "<unset>" }
+        }
+        match self {
+            Self::Enabled {
+                token_url,
+                client_id,
+                client_secret,
+            } => f
+                .debug_struct("Enabled")
+                .field("token_url", &presence(token_url.is_some()))
+                .field("client_id", &presence(client_id.is_some()))
+                .field("client_secret", &presence(client_secret.is_some()))
+                .finish(),
+            Self::Disabled => f.write_str("Disabled"),
+        }
+    }
 }
 
 /// Builder for [`RociaDbClient`].
@@ -412,6 +460,9 @@ pub struct RociaDbBuilder {
     /// `None` means [`DEFAULT_MAX_FILE_BYTES`] (5 GiB); see
     /// [`RociaDbBuilder::max_file_bytes`].
     max_file_bytes: Option<u64>,
+    /// `None` leaves tonic's own 4 MiB ceiling in place; see
+    /// [`RociaDbBuilder::max_decoding_message_size`].
+    max_decoding_message_size: Option<usize>,
 }
 
 /// gRPC client for document, graph, file, and tenant services.
@@ -736,6 +787,7 @@ impl Default for RociaDbBuilder {
             tls_config: None,
             http2_keep_alive: None,
             max_file_bytes: None,
+            max_decoding_message_size: None,
         }
     }
 }
@@ -917,6 +969,48 @@ impl RociaDbBuilder {
     /// channel as given.
     pub fn http2_keep_alive(mut self, interval: Duration, timeout: Duration) -> Self {
         self.http2_keep_alive = Some((interval, timeout));
+        self
+    }
+
+    /// Set the largest single protobuf message the client will decode, in
+    /// bytes, for every one of the four services.
+    ///
+    /// **Left unset, tonic's own default of 4 MiB applies** — a ceiling this
+    /// SDK does not choose and, before this setter existed, could not lift.
+    /// It is a limit on one decoded *message*, not on a call or a file: a
+    /// download is streamed as many `DownloadResponse` messages and only each
+    /// one has to fit, which is why multi-gigabyte
+    /// [`max_file_bytes`](Self::max_file_bytes) transfers work against the
+    /// 4 MiB default.
+    ///
+    /// Raise it when a single message can legitimately exceed 4 MiB:
+    ///
+    /// - one document larger than 4 MiB, from
+    ///   [`get_document`](RociaDbClient::get_document);
+    /// - a *page* of documents that adds up past it. A listing returns twenty
+    ///   items unless you pass a `limit`, so documents averaging 210 KB are
+    ///   already over the ceiling in a default-sized page;
+    /// - a server whose download chunks are larger than 4 MiB. The wire
+    ///   contract makes no promise about that slicing (see
+    ///   [`DownloadResponse`]), so a deployment is free to choose it.
+    ///
+    /// Exceeding the ceiling surfaces as a decode failure from tonic, not as a
+    /// [`RociaDbError::Validation`]: the client cannot know a message was too
+    /// big until it arrives.
+    ///
+    /// # This is a memory bound, so raising it costs something
+    ///
+    /// The ceiling is what stops a server — or anything able to answer as one
+    /// — from making this client allocate for a message it never expected.
+    /// Raise it to what your own data actually needs rather than to
+    /// `usize::MAX`, and remember that the figure applies per concurrent call.
+    ///
+    /// Unlike the endpoint settings, this applies to
+    /// [`build_with_channel`](Self::build_with_channel) as well: the limit
+    /// lives on the generated clients, not on the [`Channel`], so supplying
+    /// your own channel does not set it and cannot override it.
+    pub fn max_decoding_message_size(mut self, max_decoding_message_size: usize) -> Self {
+        self.max_decoding_message_size = Some(max_decoding_message_size);
         self
     }
 
@@ -1158,13 +1252,22 @@ impl RociaDbBuilder {
                 (interceptor, Some(token_manager), Some(Arc::new(guard)))
             }
         };
-        let upstream_document =
+        let mut upstream_document =
             DocumentServiceClient::with_interceptor(channel.clone(), interceptor.clone());
-        let upstream_graph =
+        let mut upstream_graph =
             GraphServiceClient::with_interceptor(channel.clone(), interceptor.clone());
-        let upstream_file =
+        let mut upstream_file =
             FileServiceClient::with_interceptor(channel.clone(), interceptor.clone());
-        let upstream_tenant = TenantServiceClient::with_interceptor(channel, interceptor);
+        let mut upstream_tenant = TenantServiceClient::with_interceptor(channel, interceptor);
+        // Applied to all four clients or to none: the ceiling is a property of
+        // the connection the caller configured, not of one service, and a limit
+        // that held for documents but not for graph reads would be a trap.
+        if let Some(limit) = self.max_decoding_message_size {
+            upstream_document = upstream_document.max_decoding_message_size(limit);
+            upstream_graph = upstream_graph.max_decoding_message_size(limit);
+            upstream_file = upstream_file.max_decoding_message_size(limit);
+            upstream_tenant = upstream_tenant.max_decoding_message_size(limit);
+        }
         Ok(RociaDbClient {
             upstream_document,
             upstream_graph,
@@ -2061,30 +2164,98 @@ mod tests {
         assert_eq!(client.request_timeout, Some(Duration::from_millis(250)));
     }
 
-    // `SecretString`'s own `Debug` redacts, which is what lets
-    // `BuilderAuthConfig` derive `Debug` instead of hand-writing one. Keep
-    // the assertion: it is the property that matters, whoever implements it.
+    // AGENTS.md's logging policy puts `token_url` and `client_id` on the
+    // never-log list alongside the secret, so `BuilderAuthConfig`'s `Debug` is
+    // hand-written and reports presence only. An earlier version of this test
+    // asserted the opposite — that the URL and the id stayed visible "for
+    // diagnostics" — which is why the leak survived: the test encoded it as
+    // intended behaviour. Assert the policy instead.
     #[test]
-    fn builder_debug_output_redacts_the_client_secret() {
+    fn builder_debug_output_redacts_every_credential_field() {
         let builder = RociaDbBuilder::new().auth_client_credentials(
             "https://idp.example.com/token",
             "client-123",
             "super-secret-value",
         );
         let debug_output = format!("{builder:?}");
+        for secret in [
+            "super-secret-value",
+            "https://idp.example.com/token",
+            "idp.example.com",
+            "client-123",
+        ] {
+            assert!(
+                !debug_output.contains(secret),
+                "{secret:?} must never appear in Debug output, got: {debug_output}"
+            );
+        }
+        // Presence still has to be reportable, or a half-configured builder
+        // becomes undebuggable — that is the whole reason this is not just an
+        // opaque `..`.
         assert!(
-            !debug_output.contains("super-secret-value"),
-            "the raw client_secret must never appear in Debug output, got: {debug_output}"
+            debug_output.contains("token_url") && debug_output.contains("<set>"),
+            "the field names and their set/unset state must survive, got: {debug_output}"
         );
+    }
+
+    #[test]
+    fn builder_debug_output_reports_unset_credential_fields_as_unset() {
+        let debug_output = format!("{:?}", RociaDbBuilder::new());
         assert!(
-            debug_output.to_ascii_lowercase().contains("redacted"),
-            "the redaction placeholder must appear, got: {debug_output}"
+            debug_output.contains("<unset>"),
+            "a builder with no credentials must say so, got: {debug_output}"
         );
-        // Non-sensitive fields must stay visible: only the secret is
-        // redacted, not the whole auth config (still useful for
-        // diagnostics).
-        assert!(debug_output.contains("https://idp.example.com/token"));
-        assert!(debug_output.contains("client-123"));
+    }
+
+    /// `RociaDbError::Connection` is documented as coming from the initial dial
+    /// and from nowhere else — so a transport failure on an *established*
+    /// client must arrive as a `Status`, with the `UNAVAILABLE` that
+    /// `RetryPolicy` retries on. Asserting it here keeps that doc claim from
+    /// drifting: a caller matching on `Connection` to decide whether to retry
+    /// is matching on a variant it will never see.
+    #[tokio::test]
+    async fn a_transport_failure_after_build_is_a_status_not_a_connection_error() {
+        // A lazily-connected client pointed at a port nothing listens on: the
+        // channel exists, so the failure happens at call time rather than at
+        // build time.
+        let client = crate::test_support::lazy_test_client();
+        let error = client
+            .list_tenants(None, None)
+            .await
+            .expect_err("nothing is listening on port 1");
+
+        assert!(
+            !matches!(error, RociaDbError::Connection { .. }),
+            "a failure on an established client must not be Connection, got: {error:?}"
+        );
+        assert_eq!(
+            error.code(),
+            Some(crate::Code::Unavailable),
+            "it must be the UNAVAILABLE that RetryPolicy retries on, got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn max_decoding_message_size_is_unset_by_default_and_chains() {
+        assert!(
+            RociaDbBuilder::new().max_decoding_message_size.is_none(),
+            "unset must mean \"leave tonic's own 4 MiB default alone\""
+        );
+        assert_eq!(
+            RociaDbBuilder::new()
+                .max_decoding_message_size(16 * 1024 * 1024)
+                .max_decoding_message_size,
+            Some(16 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn builder_debug_output_names_disabled_auth() {
+        let debug_output = format!("{:?}", RociaDbBuilder::new().disable_auth());
+        assert!(
+            debug_output.contains("Disabled"),
+            "a disabled-auth builder must say so, got: {debug_output}"
+        );
     }
 
     #[tokio::test]

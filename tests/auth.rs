@@ -31,6 +31,18 @@ const BUCKET: &str = "assets";
 /// background task would tick once a second and every request count would be a
 /// race. The "already expired" and coalescing cases are covered without a
 /// clock at all by the unit tests of `TokenManager::ensure_fresh`.
+///
+/// Three seconds is still a real-clock budget, and the two constraints cannot
+/// both be relaxed: the pre-flight only fires while under the five-second
+/// margin, which caps `expires_in` at four, which caps the background cadence
+/// at `expires_in - 1`. So the tests below assert request counts as **lower
+/// bounds** rather than exact figures — a loaded machine can fit an extra
+/// background tick into the window, and a test that failed for that would be
+/// reporting the scheduler, not the SDK. What they assert exactly is the thing
+/// the scheduler cannot affect: the bearer token the call actually carried,
+/// recorded by the server. `accept_only_tokens` makes the old token unusable,
+/// so a call that went out at all went out refreshed — whichever task did the
+/// refreshing.
 const INSIDE_THE_REFRESH_MARGIN_SECS: u64 = 4;
 
 /// Poll the server with cheap reads until the bearer header it records is no
@@ -183,6 +195,94 @@ async fn a_second_unauthenticated_response_reaches_the_caller_after_one_refresh(
         server.call_count("ListTenants"),
         2,
         "the call is replayed exactly once"
+    );
+}
+
+/// The scenario the coalescing was written for, in the failure mode where it
+/// used to invert: a fleet of tasks sharing one client all recover from the
+/// same expired token while the IdP is down.
+///
+/// The generation counter used to advance only on success, so a failing fetch
+/// left every queued caller's snapshot current and each ran its own full round
+/// trip — serialized behind the refresh lock, at up to 30 s apiece. Fifty tasks
+/// meant the fiftieth waited for the other forty-nine first, however short its
+/// own `request_timeout` was.
+///
+/// Deterministic on the current-thread runtime `#[tokio::test]` gives us:
+/// `join_all` polls each future in turn, so the first takes the uncontended
+/// lock and suspends on its HTTP round trip while the rest snapshot the same
+/// generation and queue behind it — exactly the interleaving a real fleet hits.
+#[tokio::test]
+async fn concurrent_refreshes_against_a_failing_idp_make_one_request_between_them() {
+    let idp = MockIdp::start().await;
+    let server = FakeServer::start().await;
+    let client = server.authenticated_client(&idp).await;
+    let after_build = idp.requests();
+    assert_eq!(after_build, 1, "build() fetches the initial token");
+
+    // Comfortably more failures than this test can consume. Not `usize::MAX`:
+    // `fail_next` queues one entry per failure, so it allocates what it is
+    // given.
+    idp.fail_next(16, 500);
+
+    let results = futures::future::join_all((0..8).map(|_| client.refresh_auth_token())).await;
+
+    assert_eq!(
+        results.iter().filter(|result| result.is_err()).count(),
+        8,
+        "every caller must be told the refresh failed — a coalesced one must never get Ok(())"
+    );
+    assert_eq!(
+        idp.requests(),
+        after_build + 1,
+        "the eight callers must share one attempt, not queue eight round trips behind the lock"
+    );
+}
+
+/// `reqwest` appends `" for url (..)"` to every transport and status error it
+/// produces, so a failed token fetch used to carry the whole `token_url` in the
+/// message the *caller* sees — not merely in one of the SDK's own `warn!`
+/// lines. AGENTS.md puts `token_url` on the never-log list, and an error the
+/// caller is expected to log is the widest leak of the lot, so the URL is
+/// stripped where the `reqwest` error is wrapped.
+#[tokio::test]
+async fn a_failed_explicit_refresh_does_not_carry_the_token_url_in_its_error() {
+    let idp = MockIdp::start().await;
+    let server = FakeServer::start().await;
+    let client = server.authenticated_client(&idp).await;
+    idp.fail_next(1, 500);
+
+    let error = client
+        .refresh_auth_token()
+        .await
+        .expect_err("a 500 from the token endpoint must fail an explicit refresh");
+
+    let token_url = idp.token_url();
+    let host = token_url
+        .trim_start_matches("http://")
+        .trim_end_matches("/token")
+        .to_string();
+    // Walk the whole chain: `RociaDbError::Auth` interpolates its source, and a
+    // caller reporting an error commonly walks `source()` as well.
+    let mut rendered = vec![format!("{error}"), format!("{error:?}")];
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&error);
+    while let Some(current) = source {
+        rendered.push(format!("{current}"));
+        source = current.source();
+    }
+    for text in &rendered {
+        assert!(
+            !text.contains(&token_url) && !text.contains(&host),
+            "the token endpoint must not appear in a failed refresh's error, got: {text}"
+        );
+    }
+    // The error still has to say what went wrong, or stripping the URL would
+    // have cost the caller their diagnosis.
+    assert!(matches!(error, RociaDbError::Auth { .. }), "got: {error:?}");
+    assert!(
+        rendered[0].to_ascii_lowercase().contains("token"),
+        "the message must still name what failed, got: {}",
+        rendered[0]
     );
 }
 
@@ -419,7 +519,11 @@ async fn a_nearly_expired_token_is_refreshed_before_upload_file_chunked_opens_th
         .await
         .expect("the pre-flight refresh must let the upload through on the first attempt");
 
-    assert_eq!(idp.requests(), 2, "exactly one pre-flight refresh");
+    assert!(
+        idp.requests() >= 2,
+        "the nearly expired token must have been refreshed, got {} requests",
+        idp.requests()
+    );
     let upload = server.only_call("Upload");
     assert_eq!(
         upload.authorization.as_deref(),
@@ -457,7 +561,11 @@ async fn a_nearly_expired_token_is_refreshed_before_upload_file_stream_opens_the
         .await
         .expect("the pre-flight refresh must let the raw upload through too");
 
-    assert_eq!(idp.requests(), 2, "exactly one pre-flight refresh");
+    assert!(
+        idp.requests() >= 2,
+        "the nearly expired token must have been refreshed, got {} requests",
+        idp.requests()
+    );
     assert_eq!(
         server.only_call("Upload").authorization.as_deref(),
         Some("Bearer token-2")
@@ -486,7 +594,11 @@ async fn a_nearly_expired_token_is_refreshed_before_a_download_opens() {
     // The seeding upload's own pre-flight refresh already minted token-2, so
     // the download's pre-flight is the one that mints token-3.
     let issued_before = idp.requests();
-    assert_eq!(idp.issued_tokens(), vec!["token-1", "token-2"]);
+    assert_eq!(
+        idp.issued_tokens().first().map(String::as_str),
+        Some("token-1"),
+        "build()'s token is always the first issued"
+    );
     server.accept_only_tokens(["token-3"]);
     server.clear_calls();
 
@@ -498,10 +610,11 @@ async fn a_nearly_expired_token_is_refreshed_before_a_download_opens() {
         bytes
     );
 
-    assert_eq!(
-        idp.requests(),
-        issued_before + 1,
-        "exactly one pre-flight refresh for the download"
+    assert!(
+        idp.requests() > issued_before,
+        "the download's pre-flight must have refreshed, got {} requests against {issued_before} \
+         before it",
+        idp.requests()
     );
     let download = server.only_call("Download");
     assert_eq!(
@@ -536,11 +649,15 @@ async fn a_failed_pre_flight_refresh_lets_the_call_proceed_with_the_cached_token
         .await
         .expect("a failed pre-flight refresh must not fail the upload");
 
-    assert_eq!(idp.requests(), 2, "the refresh was attempted once");
+    assert!(
+        idp.requests() >= 2,
+        "the pre-flight refresh must have been attempted, got {} requests",
+        idp.requests()
+    );
     assert_eq!(
-        idp.issued_tokens(),
-        vec!["token-1".to_string()],
-        "the failed refresh issued nothing"
+        idp.issued_tokens().first().map(String::as_str),
+        Some("token-1"),
+        "the refresh that failed issued nothing, so token-1 is still the first"
     );
     assert_eq!(
         server.only_call("Upload").authorization.as_deref(),

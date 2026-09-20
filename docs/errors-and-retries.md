@@ -64,6 +64,22 @@ says which:
   returned for the stream that then stopped early. Nothing is pulled from the
   stream after the error, and nothing is stored: the server only publishes a
   file once it has received and validated the whole stream.
+
+  **With one exception, and it is a success rather than an error.** The SDK
+  reads one item past your declared `size_bytes`, because that is how it
+  catches a source handing over more data than it promised. So a source that
+  fails *immediately after* its last declared byte — a socket that resets after
+  its final data frame, a file truncated concurrently — has already had every
+  byte **read**, so the upload finishes and the server has a complete, valid
+  stream it commits. That call returns `Ok(())`, not `Io`: the file is stored and
+  correct, and reporting the read failure would invite you to delete or re-queue
+  it. The failure is logged at `warn!` so it is not silent.
+
+  Read, not sent: a file smaller than one chunk has its whole content buffered
+  and nothing emitted when the failure arrives, and it is forgiven just the same.
+  The one `size_bytes` this does not cover is zero, where nothing was read at
+  all — a source that fails there is always reported, because publishing an empty
+  file would replace whatever is stored under that `file_id`.
 - `"writing the downloaded file"` — `download_file_verified_to` writes into a
   `tokio::io::AsyncWrite` of yours, and a chunk it refuses (or a failing final
   flush) abandons the download there. Whatever was already written is yours to
@@ -86,8 +102,8 @@ mismatch leaves bytes behind for you to discard.
 
 ## Reading a status
 
-For `Status`, three accessors return `Some`; for every other variant they
-return `None`.
+For `Status`, `code()` and `status()` return `Some`; for every other variant
+all three return `None`.
 
 - `code()` — the `tonic::Code`.
 - `status()` — the raw `tonic::Status`, for anything the other two do not
@@ -106,7 +122,10 @@ predict; the naming carries no extra meaning.
 
 `DEADLINE_EXCEEDED` is the one code the SDK itself can produce without the
 server saying anything: it is what a
-[`request_timeout`](transport.md#request-timeout) expiring looks like.
+[`request_timeout`](transport.md#request-timeout) expiring looks like. It is
+therefore the one `Status` whose `reason()` is `None` — there was no server
+trailer to read it from. Anything branching on `reason()` has to handle that,
+which is the second reason to prefer `code()` for control flow.
 
 ## Predicates
 

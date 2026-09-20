@@ -15,6 +15,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use support::{FakeServer, nth_write_time, payload, sha256};
 use tokio::io::AsyncWrite;
+use tonic::Code;
 
 const TENANT: &str = "tenant-1";
 const BUCKET: &str = "assets";
@@ -467,6 +468,244 @@ async fn a_failing_chunk_source_surfaces_as_an_io_error_not_a_size_mismatch() {
             .is_none(),
         "an upload abandoned mid-stream must store nothing"
     );
+}
+
+/// A download that opens and then dies part-way through. The documentation for
+/// `download_file_verified_to` warns that a failed verification has already
+/// written bytes, and this is the failure that gets there first — nothing could
+/// reach it before the harness could fail a stream mid-transfer, which is why
+/// the audit found this path documented but untested.
+#[tokio::test]
+async fn download_file_verified_to_surfaces_a_mid_stream_failure_over_partial_bytes() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let bytes = payload(4 * ONE_MIB);
+    client
+        .upload_file(
+            TENANT,
+            BUCKET,
+            "torn.bin",
+            bytes.clone(),
+            FileUploadOptions::new(),
+        )
+        .await
+        .expect("the file must upload");
+
+    server.fail_download_after_chunks(3, Code::Unavailable);
+    let mut sink: Vec<u8> = Vec::new();
+    let error = client
+        .download_file_verified_to(TENANT, BUCKET, "torn.bin", &mut sink)
+        .await
+        .expect_err("a stream that dies mid-transfer must fail the call");
+
+    // The server's status, not a checksum or size mismatch: verification never
+    // got the chance to run, and saying "the digest disagreed" would send the
+    // caller after the wrong problem.
+    assert_eq!(error.code(), Some(Code::Unavailable), "got: {error}");
+    assert!(
+        !sink.is_empty() && sink.len() < bytes.len(),
+        "the chunks delivered before the failure must already be written, and not all of \
+         them: got {} of {} bytes",
+        sink.len(),
+        bytes.len()
+    );
+    assert_eq!(
+        sink.as_slice(),
+        &bytes[..sink.len()],
+        "what did get written must be a prefix of the real file"
+    );
+}
+
+/// A server that answers before reading the request stream, which the harness
+/// could not express either: every other scripted upload failure arrives only
+/// once the whole stream has been drained, so the client's send side never saw
+/// an early refusal.
+#[tokio::test]
+async fn upload_file_chunked_surfaces_a_server_that_refuses_before_reading() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let bytes = payload(2 * ONE_MIB);
+    server.fail_upload_before_reading(Code::ResourceExhausted);
+
+    let error = client
+        .upload_file_chunked(
+            TENANT,
+            BUCKET,
+            "refused.bin",
+            futures::stream::iter(vec![
+                chunk(bytes[..ONE_MIB].to_vec()),
+                chunk(bytes[ONE_MIB..].to_vec()),
+            ]),
+            FileStreamUploadOptions::new((2 * ONE_MIB) as u64, sha256(&bytes)),
+        )
+        .await
+        .expect_err("a server that refuses up front must fail the call");
+
+    assert_eq!(
+        error.code(),
+        Some(Code::ResourceExhausted),
+        "the server's own refusal must be what surfaces, not a client-side size rule: {error}"
+    );
+    assert!(
+        server.stored_file(TENANT, BUCKET, "refused.bin").is_none(),
+        "a refused upload must store nothing"
+    );
+}
+
+/// The `request_id` contract on the upload path, which is the one that carries
+/// real weight: `upload_file` replays its own request under the *same* key after
+/// an `UNAUTHENTICATED`, and `RetryPolicy`'s documentation tells callers to reuse
+/// the key on a retried write for exactly this reason. An upload is also the
+/// write where re-applying would cost the most — publishing replaces whatever
+/// that `file_id` held.
+///
+/// Absorbed rather than overwritten: the replay carries different bytes, so the
+/// first upload's content surviving is what proves the second never ran.
+#[tokio::test]
+async fn a_replayed_upload_request_id_is_absorbed_rather_than_republished() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let first = payload(2048);
+    let second = payload(4096);
+
+    for bytes in [&first, &second] {
+        client
+            .upload_file(
+                TENANT,
+                BUCKET,
+                "written-once.bin",
+                bytes.clone(),
+                FileUploadOptions::new().with_request_id("upload-once"),
+            )
+            .await
+            .expect("a replay is absorbed and answered Ok, not rejected");
+    }
+
+    assert_eq!(
+        server
+            .stored_file(TENANT, BUCKET, "written-once.bin")
+            .expect("the file must exist")
+            .bytes,
+        first,
+        "the absorbed replay must not have replaced the published file"
+    );
+    assert_eq!(
+        server.call_count("Upload"),
+        2,
+        "both uploads reach the server — absorption happens there"
+    );
+}
+
+/// An over-declared upload must publish nothing, and the size class where that
+/// used to fail is the one an exact chunk multiple produces: the chunk that
+/// completed `size_bytes` was legal on its own, went out, and gave the server a
+/// whole stream to commit — so the caller got a `Validation` error for a
+/// truncated file stored under their own `file_id`. Worse than a wrong error,
+/// because a retry reusing the same `request_id` would be absorbed as a
+/// duplicate and never replace it.
+#[tokio::test]
+async fn an_over_declared_upload_at_a_chunk_multiple_stores_nothing() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    // Declares one chunk, hands over two.
+    let bytes = payload(2 * ONE_MIB);
+
+    let error = client
+        .upload_file_chunked(
+            TENANT,
+            BUCKET,
+            "over-declared.bin",
+            futures::stream::iter(vec![chunk(bytes.clone())]),
+            FileStreamUploadOptions::new(ONE_MIB as u64, sha256(&bytes[..ONE_MIB])),
+        )
+        .await
+        .expect_err("more data than declared must fail the upload");
+
+    match &error {
+        RociaDbError::Validation(message) => assert!(
+            message.contains("more data than size_bytes"),
+            "got: {message}"
+        ),
+        other => panic!("expected a Validation error, got: {other}"),
+    }
+    assert!(
+        server
+            .stored_file(TENANT, BUCKET, "over-declared.bin")
+            .is_none(),
+        "an upload the client refused must never leave a file behind"
+    );
+}
+
+/// The forgiveness of a source that fails after its last byte has to hold at
+/// every size, not only at an exact chunk multiple — a file smaller than one
+/// chunk has its whole content buffered and nothing emitted yet, and measuring
+/// against bytes already sent made the same failure fatal there.
+#[tokio::test]
+async fn a_sub_chunk_source_failing_after_its_last_byte_still_succeeds() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let bytes = payload(1500);
+
+    client
+        .upload_file_chunked(
+            TENANT,
+            BUCKET,
+            "small-then-reset.bin",
+            futures::stream::iter(vec![
+                chunk(bytes.clone()),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "the socket reset after its last data frame",
+                )),
+            ]),
+            FileStreamUploadOptions::new(bytes.len() as u64, sha256(&bytes)),
+        )
+        .await
+        .expect("every declared byte was read, so the server's Ok is the answer");
+
+    assert_eq!(
+        server
+            .stored_file(TENANT, BUCKET, "small-then-reset.bin")
+            .expect("the file must be stored")
+            .bytes,
+        bytes
+    );
+}
+
+/// The mirror image of the test above, and the case that used to be reported
+/// wrongly: a source that fails *after* its last declared byte. Every declared
+/// byte is already inside a request tonic has taken, so the server sees a
+/// complete stream and commits it — and a caller who read the failure as
+/// "nothing was written" would delete or re-queue a file that is there and
+/// correct.
+#[tokio::test]
+async fn a_source_failing_after_its_last_declared_byte_reports_the_servers_verdict() {
+    let server = FakeServer::start().await;
+    let client = server.client().await;
+    let bytes = payload(2 * ONE_MIB);
+
+    client
+        .upload_file_chunked(
+            TENANT,
+            BUCKET,
+            "reset-after-last-byte.bin",
+            futures::stream::iter(vec![
+                chunk(bytes[..ONE_MIB].to_vec()),
+                chunk(bytes[ONE_MIB..].to_vec()),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "the socket reset after its last data frame",
+                )),
+            ]),
+            FileStreamUploadOptions::new((2 * ONE_MIB) as u64, sha256(&bytes)),
+        )
+        .await
+        .expect("every declared byte was sent, so the server's Ok is the honest answer");
+
+    let stored = server
+        .stored_file(TENANT, BUCKET, "reset-after-last-byte.bin")
+        .expect("the file must be stored");
+    assert_eq!(stored.bytes, bytes, "the file must be stored whole");
 }
 
 #[tokio::test]
