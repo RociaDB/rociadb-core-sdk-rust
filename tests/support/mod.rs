@@ -41,11 +41,20 @@
 //! - A genuinely concurrent duplicate — a second call sharing a `request_id`
 //!   with one still in flight — gets **`ABORTED`, not `Ok`**, because the
 //!   original has not finished and the server cannot claim success on its
-//!   behalf. Here, two such calls simply race for the store under the same
-//!   `Mutex` and *both* are applied, since the marker only lands once the first
-//!   completes. That is not "unspecified"; it is the opposite of what a real
-//!   server does, so nothing a test asserts about concurrent duplicates here
-//!   transfers.
+//!   behalf. Here it is **absorbed and answered `Ok`**: every write handler runs
+//!   `absorbs_replay` → write → `mark_applied` under one `MutexGuard` with no
+//!   `.await` inside it, so the marker is published before the guard is released
+//!   and the second caller never sees a gap to race through. Measured, not
+//!   assumed: two concurrent `upload_file` calls sharing a key both return `Ok`,
+//!   both reach the server, and the store clock ticks once — the second payload
+//!   is discarded.
+//!
+//!   This is the divergence to be most careful of, because it runs the dangerous
+//!   way round: the harness reports success for a write that never happened,
+//!   where the real server refuses to. A test asserting that the SDK copes with
+//!   a concurrent duplicate would pass here and prove nothing about a real
+//!   deployment — the `ABORTED` such a caller must actually handle, and which
+//!   `RociaDbClient::retry` exists to replay, is never produced.
 //! - An in-flight call that is interrupted leaves a **reservation** held for
 //!   `gc.request_lease_secs` (300 seconds by default). Every replay before that
 //!   lease expires gets `ABORTED`, and the first one after it re-executes the
