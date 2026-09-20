@@ -666,6 +666,26 @@ impl TokenManager {
         self.inner.refresh_notify.notify_one();
     }
 
+    /// The period [`TokenManager::spawn_refresh`] actually ticks on, which is
+    /// `interval` with a one-second floor.
+    ///
+    /// `tokio::time::interval` panics on a zero period, and `spawn_refresh` is
+    /// public on a public type, so a caller could reach that panic — from
+    /// *inside the spawned task*, where it would not reach them at all. It
+    /// would abort the refresh task and leave the client with no background
+    /// refresh and nothing said about it, which is a good deal worse than a
+    /// visible crash.
+    ///
+    /// One second rather than [`MIN_REFRESH_INTERVAL`] because
+    /// [`TokenManager::refresh_interval`] legitimately returns one second for a
+    /// token that lives two, and flooring at five would schedule a refresh
+    /// three seconds after such a token had already expired. This matches the
+    /// `.max(1)` that method applies for the same reason, so it is a no-op for
+    /// every interval the SDK itself passes.
+    fn refresh_tick_period(interval: Duration) -> Duration {
+        interval.max(Duration::from_secs(1))
+    }
+
     /// Spawn a background refresh task. Returns a [`TokenRefreshGuard`]
     /// that stops the task on drop.
     ///
@@ -705,26 +725,6 @@ impl TokenManager {
     /// backoff governs the timer, and a requested refresh is selected on in
     /// parallel with it, so a caller that has just seen an
     /// `UNAUTHENTICATED` never has to wait out the remaining backoff.
-    /// The period [`TokenManager::spawn_refresh`] actually ticks on, which is
-    /// `interval` with a one-second floor.
-    ///
-    /// `tokio::time::interval` panics on a zero period, and `spawn_refresh` is
-    /// public on a public type, so a caller could reach that panic — from
-    /// *inside the spawned task*, where it would not reach them at all. It
-    /// would abort the refresh task and leave the client with no background
-    /// refresh and nothing said about it, which is a good deal worse than a
-    /// visible crash.
-    ///
-    /// One second rather than [`MIN_REFRESH_INTERVAL`] because
-    /// [`TokenManager::refresh_interval`] legitimately returns one second for a
-    /// token that lives two, and flooring at five would schedule a refresh
-    /// three seconds after such a token had already expired. This matches the
-    /// `.max(1)` that method applies for the same reason, so it is a no-op for
-    /// every interval the SDK itself passes.
-    fn refresh_tick_period(interval: Duration) -> Duration {
-        interval.max(Duration::from_secs(1))
-    }
-
     pub fn spawn_refresh(&self, interval: Duration) -> TokenRefreshGuard {
         let manager = self.clone();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();

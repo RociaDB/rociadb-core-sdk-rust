@@ -184,6 +184,19 @@ the 1.0 names are gone, and the table below maps every one of them.
 
 ### Added
 
+- **`RociaDbBuilder::max_decoding_message_size`**, which lifts tonic's 4 MiB
+  ceiling on a single decoded message. That ceiling was previously unreachable
+  from the public API — `build_with_channel` does not help, because the limit
+  lives on the generated clients rather than on the `Channel` — so one document
+  over 4 MiB, or a page of twenty averaging 210 KB, failed to decode with no
+  recourse, and the wire contract explicitly promises nothing about download
+  chunk sizes. Applies to all four services or to none. Leave it unset and
+  tonic's default stands.
+- **`Code` and `Status` are now re-exported at the crate root.** Both were
+  already public API — `RociaDbError::Status` carries a `Status` in a public
+  field and `RociaDbError::code` returns a `Code` — so branching on a gRPC code,
+  the most common thing a caller does with an error, required taking `tonic` as
+  a direct dependency. The same stability caveat as the other re-exports applies.
 - `WriteOptions` (`request_id`) and `DocumentWriteOptions` (`request_id`,
   `node_binding`): the per-call options every write now takes. Both are
   `#[non_exhaustive]`, `Debug + Clone + Default + PartialEq + Eq`, with
@@ -508,6 +521,57 @@ the 1.0 names are gone, and the table below maps every one of them.
 
 ### Fixed
 
+- **`upload_file_chunked` no longer reports a committed upload as a failure.**
+  The rechunker reads one item past the declared `size_bytes`, since that is how
+  it catches a source sending more than it promised — so a source that yielded
+  exactly `size_bytes` and *then* failed had already had every byte sent. The
+  server saw a complete, valid stream and committed it, and the call still
+  returned `RociaDbError::Io`. A caller reading that as "nothing was written"
+  would delete or re-queue a file that was stored and correct. Reachable
+  whenever `size_bytes` is an exact multiple of 1 MiB. The source failure is now
+  logged at `warn!` and the server's verdict is returned; every other case keeps
+  the previous precedence.
+- **Concurrent token refreshes now coalesce when the refresh fails, not only
+  when it succeeds.** The generation counter advanced only after a token was
+  installed, so a failing identity provider left every caller queued on the
+  refresh lock convinced its own snapshot was current — and the lock is held
+  across the HTTP round trip, so N callers waited behind one another at up to 30
+  seconds each. Fifty tasks recovering from one expired token meant the fiftieth
+  blocked for the sum of the other forty-nine, however short its
+  `request_timeout`. A coalesced caller now inherits the concurrent attempt's
+  outcome, including its error; one arriving after an attempt has settled still
+  makes its own, so a failure cannot wedge the client.
+- **`token_url` and `client_id` no longer reach any log line, error message or
+  `Debug` output.** Three paths leaked them, none through a secret-carrying
+  field, so `SecretString` could not help: the non-https warning logged the URL
+  outright; `reqwest`'s `Display` appends `" for url (..)"`, carrying the whole
+  endpoint into the error a *caller* sees and into the SDK's own warning on a
+  failed background refresh; and `RociaDbBuilder` derived `Debug`, printing both
+  values in cleartext. The builder's `Debug` now reports whether each credential
+  field is set, and nothing more.
+- **`upload_file` no longer blocks a runtime worker while hashing.** SHA-256 over
+  a multi-gigabyte buffer ran inline with no await point in it, starving every
+  other task on that worker. Buffers over 1 MiB are now hashed on the blocking
+  pool; a caller-supplied checksum and smaller buffers are unchanged.
+- **`TokenManager::spawn_refresh` no longer panics on a zero interval.**
+  `tokio::time::interval` rejects a zero period, and it did so inside the spawned
+  task, where the panic reached nobody: it aborted the refresh task and left the
+  client with no background refresh and no error. The period is now floored at
+  one second.
+- `RociaDbError::Io`'s message no longer calls every failure a read. The
+  download case rendered "failed to read writing the downloaded file", which is
+  both nonsense and the wrong direction — it writes to the caller's writer. It
+  now reads "writing the downloaded file failed: ...".
+- Documentation corrections where the text described a safer contract than the
+  code delivers: `Validation` is not always raised before a network call (a
+  chunk-stream size mismatch cannot be), `Config` is not always raised before a
+  connection is attempted (`build` dials before reading the `AUTH_*` variables
+  or validating `request_timeout`), `is_unauthenticated` does not mean streaming
+  calls were never retried (`upload_file` and the call that opens a download
+  are), `reason()` is `None` for the SDK's own client-side `DEADLINE_EXCEEDED`,
+  the `tls_config` guide's example left the client with no trust anchors at all,
+  and the crate's stability caveat omitted the `serde` and `serde_json` items in
+  its public API.
 - Updated `h2` to 0.4.19 in `Cargo.lock` for RUSTSEC-2026-0258 (unbounded empty
   DATA frames, reachable through both `tonic` and `reqwest`).
 - Updated `rustls` to 0.23.45 (and `rustls-webpki` to 0.103.15) in `Cargo.lock`

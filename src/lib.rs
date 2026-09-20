@@ -987,9 +987,9 @@ impl RociaDbBuilder {
     ///
     /// - one document larger than 4 MiB, from
     ///   [`get_document`](RociaDbClient::get_document);
-    /// - a *page* of documents that adds up past it — pages hold
-    ///   [`DEFAULT_PAGE_SIZE`] items unless you pass a `limit`, so twenty
-    ///   documents averaging 210 KB is already over;
+    /// - a *page* of documents that adds up past it. A listing returns twenty
+    ///   items unless you pass a `limit`, so documents averaging 210 KB are
+    ///   already over the ceiling in a default-sized page;
     /// - a server whose download chunks are larger than 4 MiB. The wire
     ///   contract makes no promise about that slicing (see
     ///   [`DownloadResponse`]), so a deployment is free to choose it.
