@@ -207,6 +207,25 @@ impl<'de> Deserialize<'de> for TokenResponse {
 /// line through a formatter, and neither is left behind in freed memory for
 /// a core dump or an attached debugger to recover.
 ///
+/// Drop the request URL from a `reqwest` error before it is wrapped into a
+/// [`RociaDbError::Auth`].
+///
+/// `reqwest`'s own `Display` appends `" for url (..)"` to every transport
+/// error, so a token-fetch failure carries the full `token_url` in its message
+/// — which then reaches any log line, `Debug` output or error report that
+/// renders the error, the SDK's own `warn!` on a failed background refresh
+/// included. AGENTS.md puts `token_url` on the never-log list, and the
+/// `SecretString` discipline around the credentials cannot help here because
+/// the leak rides the error chain rather than a secret-carrying field. Fixing
+/// it at the point of conversion covers every consumer, including the caller's
+/// own logging, rather than one `warn!` at a time.
+///
+/// Nothing diagnostic is lost that the caller does not already have: they
+/// configured the URL, and the error's kind, status and source all survive.
+fn redact_token_url(error: reqwest::Error) -> reqwest::Error {
+    error.without_url()
+}
+
 /// `http` is used as given. **A caller-supplied [`reqwest::Client`] should
 /// carry its own timeouts** (`Client::builder().connect_timeout(..).timeout(..)`):
 /// `reqwest::Client::new()` has none at all, so an IdP that accepts the TCP
@@ -233,8 +252,11 @@ pub async fn fetch_token(
         // the caller should still be told that `client_id`/`client_secret`
         // and the bearer token this returns are about to cross the wire
         // unencrypted.
+        // The URL itself is deliberately not a field here: the logging policy
+        // in AGENTS.md puts `token_url` on the same never-log list as the
+        // credentials, and the caller configured it, so naming it back at them
+        // buys nothing a log scraper could not also collect.
         warn!(
-            token_url = %token_url,
             "fetching an OAuth2 token over a non-https token_url; client credentials and the \
              access token will be sent in cleartext"
         );
@@ -251,12 +273,15 @@ pub async fn fetch_token(
         ])
         .send()
         .await
+        .map_err(redact_token_url)
         .auth_context("token request failed")?
         .error_for_status()
+        .map_err(redact_token_url)
         .auth_context("token endpoint returned error")?;
 
     res.json::<TokenResponse>()
         .await
+        .map_err(redact_token_url)
         .auth_context("failed to parse token response")
 }
 

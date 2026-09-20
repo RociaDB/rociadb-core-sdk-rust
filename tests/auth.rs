@@ -186,6 +186,53 @@ async fn a_second_unauthenticated_response_reaches_the_caller_after_one_refresh(
     );
 }
 
+/// `reqwest` appends `" for url (..)"` to every transport and status error it
+/// produces, so a failed token fetch used to carry the whole `token_url` in the
+/// message the *caller* sees — not merely in one of the SDK's own `warn!`
+/// lines. AGENTS.md puts `token_url` on the never-log list, and an error the
+/// caller is expected to log is the widest leak of the lot, so the URL is
+/// stripped where the `reqwest` error is wrapped.
+#[tokio::test]
+async fn a_failed_explicit_refresh_does_not_carry_the_token_url_in_its_error() {
+    let idp = MockIdp::start().await;
+    let server = FakeServer::start().await;
+    let client = server.authenticated_client(&idp).await;
+    idp.fail_next(1, 500);
+
+    let error = client
+        .refresh_auth_token()
+        .await
+        .expect_err("a 500 from the token endpoint must fail an explicit refresh");
+
+    let token_url = idp.token_url();
+    let host = token_url
+        .trim_start_matches("http://")
+        .trim_end_matches("/token")
+        .to_string();
+    // Walk the whole chain: `RociaDbError::Auth` interpolates its source, and a
+    // caller reporting an error commonly walks `source()` as well.
+    let mut rendered = vec![format!("{error}"), format!("{error:?}")];
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&error);
+    while let Some(current) = source {
+        rendered.push(format!("{current}"));
+        source = current.source();
+    }
+    for text in &rendered {
+        assert!(
+            !text.contains(&token_url) && !text.contains(&host),
+            "the token endpoint must not appear in a failed refresh's error, got: {text}"
+        );
+    }
+    // The error still has to say what went wrong, or stripping the URL would
+    // have cost the caller their diagnosis.
+    assert!(matches!(error, RociaDbError::Auth { .. }), "got: {error:?}");
+    assert!(
+        rendered[0].to_ascii_lowercase().contains("token"),
+        "the message must still name what failed, got: {}",
+        rendered[0]
+    );
+}
+
 #[tokio::test]
 async fn a_failed_refresh_returns_the_original_unauthenticated_error() {
     let idp = MockIdp::start().await;
