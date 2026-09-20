@@ -1,6 +1,6 @@
 [package]
 name = "rociadb-sdk"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
 description = "Rust client SDK for RociaDB document, graph, file, and tenant gRPC services"
 license = "Apache-2.0"
@@ -13,33 +13,139 @@ categories = ["api-bindings", "database", "network-programming", "asynchronous"]
 # `edition = "2024"` needs 1.85, but the real floor comes from the dependency
 # graph rather than the edition: tonic and tonic-prost 0.14.6 — which the
 # "0.14.2" requirement below already resolves to — declare `rust-version =
-# "1.88"`, and the icu_* crates reached through reqwest -> url -> idna declare
-# 1.86. Re-check this field after any `cargo update` that moves tonic,
-# tonic-prost, or reqwest.
+# "1.88"`, as does the `tonic-prost-build` used at build time, and the icu_*
+# crates reached through reqwest -> url -> idna declare 1.86. `protox` itself
+# asks for only 1.74, so it does not move this floor. Re-check this field after
+# any `cargo update` that moves tonic, tonic-prost, tonic-prost-build, or
+# reqwest.
 rust-version = "1.88"
 # Repository-only files that a consumer of the published crate has no use for.
-# Everything the build needs — `build.rs`, `proto/` and the vendored
-# `proto/google/protobuf/*.proto` — must stay in the package.
-exclude = ["AGENTS.md", "mise.toml"]
+# Everything the build needs — `build.rs` and `proto/` — must stay in the
+# package; the Google well-known types are not vendored, `protox` supplies them
+# (see `build.rs`). Two more directories deliberately stay in the package and
+# must never be added here: `CHANGELOG.md`, the one repository document a
+# consumer reads when upgrading, and `docs/`, the guides `README.md` links to —
+# which `src/lib.rs` also `include_str!`s as doctests, so dropping them would
+# make `cargo test` fail on an unpacked `.crate`.
+exclude = [".github", "AGENTS.md", "deny.toml", "mise.toml"]
 
 [dependencies]
+# `Bytes` is the item type of the chunk stream `upload_file_chunked` takes
+# (`Stream<Item = std::io::Result<Bytes>>`), so it appears in a public
+# signature and is re-exported at the crate root — a caller wrapping a file in
+# `tokio_util::io::ReaderStream` gets a stream of exactly that shape with no
+# adaptation. Not a new crate in the graph: `bytes` is already pulled in by
+# `tonic`, `prost`, `h2` and `reqwest`, so this only makes a direct dependency
+# out of something every build already compiled. MIT, on the `deny.toml`
+# allow-list.
+bytes = "1"
 futures = "0.3.31"
 http = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-pbjson-types = "0.8.0"
+# `rustls-tls-native-roots` (not the default `rustls-tls`, which bundles the
+# webpki/Mozilla root set) so reqwest trusts the same certificates as tonic's
+# `tls-native-roots` below. If these two ever disagree, a self-hosted
+# deployment whose gRPC and OAuth2 token endpoints both present a certificate
+# from an internally-installed CA gets a channel that connects fine and a
+# token fetch that fails TLS verification against that same CA — `build()`
+# then surfaces a confusing auth error even though the CA was provisioned
+# correctly at the OS level. Keep both crates reading from the OS trust store.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+# Nothing in `src/` names `prost` directly; the generated code does, for
+# `::prost::Message` and `::prost::alloc::*`, which is why it is a regular
+# dependency and not a build dependency. There is deliberately no
+# `prost-types`: `google.protobuf.Empty` is the only well-known type the
+# `.proto` imports and prost maps it to `()`, so no generated item names a
+# `prost_types` type.
 prost = "0.14.1"
+# `SecretString` for the OAuth2 client secret and the bearer token: it redacts
+# itself in `Debug` output and zeroizes its heap buffer on drop, which is what
+# lets `RociaDbBuilder`, `TokenManagerInner` and `TokenResponse` derive `Debug`
+# instead of carrying hand-written redacting impls. The `serde` feature is
+# needed because `TokenResponse::access_token` is deserialized straight from the
+# IdP's JSON into a `SecretString`. MSRV 1.60, well under this crate's 1.88, and
+# its only dependency is `zeroize` (already in the graph via rustls).
+secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time"] }
-tonic = { version = "0.14.2", features = ["transport", "tls-native-roots"] }
+# The library needs `rt` (the token-refresh task spawned in `src/auth.rs`),
+# `sync` (its `Mutex`/`Notify`/`oneshot`), `time` and `macros` (its
+# `tokio::select!`), and `io-util` for the `AsyncWriteExt::{write_all, flush}`
+# that `download_file_verified_to` drives the caller's writer with — the
+# `AsyncWrite` trait in its public signature is available without that feature,
+# but the two extension methods are not. `io-util = ["bytes"]` in tokio's own
+# manifest, so it adds no crate this build did not already compile. `rt-multi-thread`
+# is a test-only need — `#[tokio::main]` in the doctests defaults to the
+# multi-thread runtime — and lives in `[dev-dependencies]` so a consumer does
+# not pay for it.
+tokio = { version = "1", features = ["io-util", "macros", "rt", "sync", "time"] }
+# `default-features = false` drops tonic's default `router` and `server`
+# feature stack (axum, matchit, hyper's server support, hyper-util's
+# server-auto) — this SDK is a gRPC client only, build.rs disables server
+# codegen, and nothing in src/ uses a server API. `tls-native-roots` already
+# pulls in `channel`, which is all `tonic::transport::{Channel, Endpoint,
+# ClientTlsConfig}` need.
+tonic = { version = "0.14.2", default-features = false, features = ["codegen", "tls-native-roots"] }
 tonic-prost = "0.14.2"
 tracing = "0.1"
 uuid = { version = "1.19.0", features = ["v4"] }
 
-# `build.rs` only calls `tonic_prost_build::configure()`. The prost and tonic
-# runtime crates the generated code links against are regular dependencies
-# above, not build dependencies.
+[dev-dependencies]
+# The mock OAuth2 identity provider in `tests/support/` is a hundred lines of
+# hyper rather than a mock-HTTP-server crate, because it needs to script a
+# sequence of responses (fail once with 500, then hand out a *different*
+# token), count requests, and record the form bodies it received — and because
+# `hyper`, `hyper-util` and `http-body-util` are already in the dependency
+# graph through `reqwest` and `tonic`, so this adds features to the lock file
+# rather than crates. `http1` + `server` serve the connection, `hyper-util`'s
+# `tokio` supplies the `TokioIo` adapter, and `http-body-util`'s `Full` is the
+# fixed-size response body.
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+# `#[tokio::main]` in the crate documentation's examples defaults to the
+# multi-thread runtime, and `tests/` spawns tasks, so the test and doctest
+# builds need `rt-multi-thread` on top of the library's own feature set.
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs: the retry and
+# token-refresh backoff tests advance a paused clock instead of sleeping for
+# real, so a schedule measured in seconds is still tested in microseconds. `net`
+# is for the integration tests' own listeners — the mock IdP binds one directly.
+# `fs` is for `tokio::fs::File`, which `tests/files.rs` hands to a
+# `tokio_util::io::ReaderStream` to upload a real file off disk.
+tokio = { version = "1", features = ["rt-multi-thread", "test-util", "net", "fs"] }
+# The `io` feature is `ReaderStream`, the whole reason `upload_file_chunked`
+# takes `Stream<Item = std::io::Result<Bytes>>`: `tests/files.rs` wraps a real
+# `tokio::fs::File` in one and passes it straight in, so the no-adaptation claim
+# is tested against the actual type rather than a hand-rolled look-alike. The
+# feature pulls in no crate that is not already in the graph (`io = []` in
+# `tokio-util`, whose own dependencies — `bytes`, `futures-core`,
+# `futures-sink`, `pin-project-lite`, `tokio` — are all present), and
+# `tokio-util` itself already arrives through `h2`.
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
+# The integration tests run all four services in-process over a loopback
+# socket: `server` is tonic's server stack and `router` the `add_service`
+# router the four generated services are assembled into. Both are test-only —
+# the library's own `tonic` entry above stays client-only, and `build.rs`
+# generates the server stubs into a separate directory for exactly that reason
+# (see its second codegen pass). Because Cargo unifies features per crate,
+# naming `tonic` here enables `server`/`router` when tests are built and never
+# when a consumer builds the library.
+tonic = { version = "0.14.2", default-features = false, features = [
+    "codegen",
+    "router",
+    "server",
+] }
+
+# `build.rs` reaches for exactly two crates: `protox`, a pure-Rust protobuf
+# compiler that replaces the `protoc` binary (and bundles the Google well-known
+# types, so none are vendored in `proto/`), and `tonic_prost_build` — including
+# the `prost_build::Config` it re-exports, which is why `prost-build` itself
+# does not need to be listed here. Both must agree on the `prost-types` major
+# version, since the `FileDescriptorSet` protox produces is handed straight to
+# `tonic_prost_build`: protox 0.9 and tonic-prost-build 0.14 both use
+# `prost-types` 0.14. The prost and tonic runtime crates the generated code
+# links against are regular dependencies above, not build dependencies.
 [build-dependencies]
+protox = "0.9.1"
 tonic-prost-build = { version = "0.14.2" }

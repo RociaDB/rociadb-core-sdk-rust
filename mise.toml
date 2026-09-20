@@ -1,3 +1,2 @@
 [tools]
 rust = { version = "1.96.0", profile = "default", components = "rust-analyzer,rust-src,llvm-tools" }
-protoc = "35.0"

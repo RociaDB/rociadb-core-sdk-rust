@@ -1,0 +1,53 @@
+# cargo-deny configuration. Run `cargo deny check` locally; CI runs the same
+# thing (see .github/workflows/ci.yml).
+
+[graph]
+# The published crate has no optional features, but keep the graph maximal so
+# a feature added later is covered without touching this file.
+all-features = true
+
+[advisories]
+# Every RustSec advisory that matches the lock file fails the check. There is
+# no `ignore` list on purpose: an advisory that cannot be fixed by an upgrade
+# should be added here with a comment explaining why, not silently tolerated.
+ignore = []
+
+[licenses]
+# Licences actually present in the dependency graph — development dependencies
+# included, since cargo-deny walks those too — all permissive. A dual or
+# multi-licensed crate only needs one side of its SPDX expression allowed
+# (an `OR`), while an `AND` needs both, so this list is the minimum that
+# satisfies every crate:
+#   - Apache-2.0 / MIT: the overwhelming majority, and this crate's own licence
+#   - BSD-3-Clause: `subtle`, which offers nothing else, and one side of
+#     `matchit`'s "MIT AND BSD-3-Clause" (a dev-only crate, reached through the
+#     `tonic` server/router feature stack the integration tests build with)
+#   - ISC: `ring` (Apache-2.0 AND ISC), `untrusted`, `rustls-webpki`
+#   - Unicode-3.0: the `icu_*` crates reached through reqwest -> url -> idna
+#   - Zlib: `foldhash`, which offers nothing else
+# Adding a licence here is a deliberate decision: a copyleft licence must never
+# be added without checking what it implies for consumers of this SDK.
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Warn rather than deny: duplicate versions in a transitive graph this size are
+# routine and outside this crate's control, but they are worth seeing in the CI
+# log so a duplicate this crate *did* introduce gets noticed.
+multiple-versions = "warn"
+# A `*` version requirement would let a breaking release in silently.
+wildcards = "warn"
+
+[sources]
+# Everything must come from crates.io: no git dependencies, no alternative
+# registries, in the SDK or anywhere below it.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
