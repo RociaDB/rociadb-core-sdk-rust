@@ -186,6 +186,47 @@ async fn a_second_unauthenticated_response_reaches_the_caller_after_one_refresh(
     );
 }
 
+/// The scenario the coalescing was written for, in the failure mode where it
+/// used to invert: a fleet of tasks sharing one client all recover from the
+/// same expired token while the IdP is down.
+///
+/// The generation counter used to advance only on success, so a failing fetch
+/// left every queued caller's snapshot current and each ran its own full round
+/// trip — serialized behind the refresh lock, at up to 30 s apiece. Fifty tasks
+/// meant the fiftieth waited for the other forty-nine first, however short its
+/// own `request_timeout` was.
+///
+/// Deterministic on the current-thread runtime `#[tokio::test]` gives us:
+/// `join_all` polls each future in turn, so the first takes the uncontended
+/// lock and suspends on its HTTP round trip while the rest snapshot the same
+/// generation and queue behind it — exactly the interleaving a real fleet hits.
+#[tokio::test]
+async fn concurrent_refreshes_against_a_failing_idp_make_one_request_between_them() {
+    let idp = MockIdp::start().await;
+    let server = FakeServer::start().await;
+    let client = server.authenticated_client(&idp).await;
+    let after_build = idp.requests();
+    assert_eq!(after_build, 1, "build() fetches the initial token");
+
+    // Comfortably more failures than this test can consume. Not `usize::MAX`:
+    // `fail_next` queues one entry per failure, so it allocates what it is
+    // given.
+    idp.fail_next(16, 500);
+
+    let results = futures::future::join_all((0..8).map(|_| client.refresh_auth_token())).await;
+
+    assert_eq!(
+        results.iter().filter(|result| result.is_err()).count(),
+        8,
+        "every caller must be told the refresh failed — a coalesced one must never get Ok(())"
+    );
+    assert_eq!(
+        idp.requests(),
+        after_build + 1,
+        "the eight callers must share one attempt, not queue eight round trips behind the lock"
+    );
+}
+
 /// `reqwest` appends `" for url (..)"` to every transport and status error it
 /// produces, so a failed token fetch used to carry the whole `token_url` in the
 /// message the *caller* sees — not merely in one of the SDK's own `warn!`
